@@ -1,0 +1,15 @@
+<idea-plugin>
+  <id>dev.codex.kotlinls.jetbrains-bridge</id>
+  <name>Kotlin LS JetBrains Bridge</name>
+  <vendor>OpenAI</vendor>
+  <depends>com.intellij.modules.platform</depends>
+  <depends>org.jetbrains.kotlin</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <appStarter implementation="dev.codex.kotlinls.jetbrainsbridge.KotlinLsBridgeStarter"/>
+  </extensions>
+
+  <extensions defaultExtensionNs="org.jetbrains.kotlin">
+    <supportsKotlinPluginMode supportsK1="true" supportsK2="true"/>
+  </extensions>
+</idea-plugin>

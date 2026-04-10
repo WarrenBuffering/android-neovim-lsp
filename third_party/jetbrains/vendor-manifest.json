@@ -1,0 +1,22 @@
+{
+  "sources": [
+    {
+      "name": "intellij-community",
+      "repo": "JetBrains/intellij-community",
+      "ref": "7c515dac060695def66446c8abadbaa01bd98203",
+      "license": "Apache-2.0",
+      "files": [
+        "LICENSE.txt",
+        "plugins/kotlin/base/code-insight/src/org/jetbrains/kotlin/idea/base/codeInsight/KotlinOptimizeImportsFacility.kt",
+        "plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/KotlinDocumentationProvider.kt",
+        "plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/KotlinImportOptimizer.kt",
+        "plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/OptimizedImportsBuilder.kt",
+        "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinCodeStyleGenerationConfigurable.kt",
+        "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinObsoleteCodeStyle.kt",
+        "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinPredefinedCodeStyle.kt",
+        "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinStyleGuideCodeStyle.kt",
+        "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/ProjectCodeStyleImporter.kt"
+      ]
+    }
+  ]
+}

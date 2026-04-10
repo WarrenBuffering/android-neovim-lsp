@@ -1,0 +1,84 @@
+{
+  "generated_at_utc": "2026-04-09T04:43:14.268996+00:00",
+  "manifest_path": "third_party/jetbrains/vendor-manifest.json",
+  "sources": [
+    {
+      "name": "intellij-community",
+      "repo": "JetBrains/intellij-community",
+      "ref": "7c515dac060695def66446c8abadbaa01bd98203",
+      "license": "Apache-2.0",
+      "files": [
+        {
+          "path": "LICENSE.txt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/LICENSE.txt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/LICENSE.txt",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+          "bytes": 11358
+        },
+        {
+          "path": "plugins/kotlin/base/code-insight/src/org/jetbrains/kotlin/idea/base/codeInsight/KotlinOptimizeImportsFacility.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/base/code-insight/src/org/jetbrains/kotlin/idea/base/codeInsight/KotlinOptimizeImportsFacility.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/base/code-insight/src/org/jetbrains/kotlin/idea/base/codeInsight/KotlinOptimizeImportsFacility.kt",
+          "sha256": "c0812c5b678b0fe836b1935d7f4f64d8d93519764457b2eff2ebd54996e89681",
+          "bytes": 1909
+        },
+        {
+          "path": "plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/KotlinDocumentationProvider.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/KotlinDocumentationProvider.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/KotlinDocumentationProvider.kt",
+          "sha256": "bb6b368960f6b2ea1c7345fbd4be4c2d5ff90e98a65094226274736cf00b20a1",
+          "bytes": 34199
+        },
+        {
+          "path": "plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/KotlinImportOptimizer.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/KotlinImportOptimizer.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/KotlinImportOptimizer.kt",
+          "sha256": "d729ff700fd57711e918f29f564a6fa3bd8df6cdcf54828ddd3689dbaf7f675f",
+          "bytes": 15633
+        },
+        {
+          "path": "plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/OptimizedImportsBuilder.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/OptimizedImportsBuilder.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/idea/src/org/jetbrains/kotlin/idea/imports/OptimizedImportsBuilder.kt",
+          "sha256": "b08fbf369a2d110d9cb2b8e6c0b83af4855d791b049ef7beecae870aadc228d3",
+          "bytes": 19236
+        },
+        {
+          "path": "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinCodeStyleGenerationConfigurable.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinCodeStyleGenerationConfigurable.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinCodeStyleGenerationConfigurable.kt",
+          "sha256": "e3ec4f6649ee4b890220566a272f423b772b7778c85b45461505b4341b48a419",
+          "bytes": 2316
+        },
+        {
+          "path": "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinObsoleteCodeStyle.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinObsoleteCodeStyle.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinObsoleteCodeStyle.kt",
+          "sha256": "4d6edb73580ee0c94b88bb1ec07f72a0a9ec0e45c887eb3523c80e6796c7162f",
+          "bytes": 703
+        },
+        {
+          "path": "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinPredefinedCodeStyle.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinPredefinedCodeStyle.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinPredefinedCodeStyle.kt",
+          "sha256": "71576998852ea7bc137dad9d688cc6bc796c12fe87a5f4ddee0cfcc81b612df8",
+          "bytes": 514
+        },
+        {
+          "path": "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinStyleGuideCodeStyle.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinStyleGuideCodeStyle.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/KotlinStyleGuideCodeStyle.kt",
+          "sha256": "498f0458261d6760c3007692f4ccefd26c0a2f9a67adc63c5f55b97c931f5cf9",
+          "bytes": 722
+        },
+        {
+          "path": "plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/ProjectCodeStyleImporter.kt",
+          "destination": "third_party/jetbrains/upstream/intellij-community/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/ProjectCodeStyleImporter.kt",
+          "source_url": "https://raw.githubusercontent.com/JetBrains/intellij-community/7c515dac060695def66446c8abadbaa01bd98203/plugins/kotlin/formatter/src/org/jetbrains/kotlin/idea/formatter/ProjectCodeStyleImporter.kt",
+          "sha256": "c079e947750326a42a045d29b765225e4adb6db2d35f1dee551a8646660dddeb",
+          "bytes": 1688
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+# Repository Tree
+
+```text
+kotlin-neovim-lsp/
+  analysis/
+  benchmarks/
+  code-actions/
+  completion/
+  diagnostics/
+  docs/
+  fixtures/
+    dependency-heavy/
+    large-workspace/
+    mixed-kotlin-java/
+    multi-module/
+    simple-jvm-app/
+  formatting/
+  hover/
+  index/
+  lazyvim_example/
+  navigation/
+  nvim/
+  packaging/
+  project-import/
+  protocol/
+  refactor/
+  scripts/
+  server/
+  symbols/
+  tests/
+  workspace/
+```

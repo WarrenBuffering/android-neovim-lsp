@@ -1,0 +1,38 @@
+# Capability Matrix
+
+| Feature | Target parity level | Certainty | Source of truth | Implementation plan | Known risks | Validation strategy | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| JSON-RPC framing | Full | EXACT | LSP spec | Manual stdio framing/dispatch | None | Protocol golden tests | Implemented |
+| `initialize` / capabilities | Full | EXACT | LSP spec | Typed request/response handlers | Capability drift | Client handshake tests | Implemented |
+| Incremental document sync | Full | EXACT | LSP spec | Range-based buffer store with line index | Off-by-one edits | Unit tests with multi-edit fixtures | Implemented |
+| Root detection | High | EXACT | Gradle/settings conventions | Gradle/settings/git marker detector | Monorepo edge cases | Fixture roots and nested root tests | Implemented |
+| Gradle module discovery | High | INFERRED | Observable IDE behavior, Gradle file structure | Parse settings/build files, infer source sets and modules | Complex DSL cases | Multi-module fixtures | Implemented |
+| Compiler diagnostics | High | EXACT | Kotlin compiler behavior | Kotlin compiler embeddable analysis | Classpath incompleteness | Golden diagnostics fixtures | Implemented |
+| Unresolved/import diagnostics | High | INFERRED | JetBrains UX, Kotlin semantics | Compiler diagnostics plus import suggestions from index | Ambiguous imports | Code-action tests | Implemented |
+| Completion keywords | High | EXACT | Kotlin grammar | Keyword completion provider | Ranking noise | Completion snapshots | Implemented |
+| Completion locals/members | High | INFERRED | JetBrains UX | Direct JetBrains IDE completion bridge when a compatible local JetBrains IDE is available; otherwise PSI scope walk, descriptor hints, external source indexing, and JDK reflective member fallback | Bridge still depends on a compatible local IDE and fallback remains weaker for deep smart-cast/control-flow cases | Fixture completion tests | Implemented |
+| Completion ranking | High | INFERRED | Observable IDE ordering | JetBrains IDE ranking when bridge is active; otherwise prefix, locality, scope, kind, import cost, expected type heuristics, stdlib injection, and receiver-aware fallback ranking | Bridge startup/import cost is higher than pure local heuristics; fallback ordering can still differ from IDE | Golden ranking tests | Implemented |
+| Hover docs | High | INFERRED | JetBrains hover behavior, vendored `KotlinDocumentationProvider.kt` | Signature renderer plus structured KDoc markdown sections and type info | Rich HTML/Javadoc parity still lower than IntelliJ | Hover golden tests | Implemented |
+| Signature help | Medium-high | INFERRED | IDE call info behavior | Parse call site, resolve candidates, mark active parameter | Named-argument and generic-rendering nuances | Fixture tests | Implemented |
+| Go to definition | High | INFERRED | IDE navigation behavior | Binding context target lookup with index fallback | Library navigation gaps | Navigation integration tests | Implemented |
+| Type definition | Medium-high | INFERRED | Kotlin semantics | Infer expression type and map to declaration | Typealias and smart-cast nuances | Type navigation tests | Implemented |
+| References | High | INFERRED | IDE search expectations | Index-backed symbol usage search with semantic fallback | False positives in text matches | Cross-module reference tests | Implemented |
+| Implementations | Medium-high | INFERRED | IDE behavior | Hierarchy graph on inheritance edges plus override-aware member lookup | External library inheritance | Inheritance fixtures | Implemented |
+| Call hierarchy | Medium | EMULATED | LSP + IDE workflow | Index outbound/inbound call edges | Dynamic dispatch ambiguity | Hierarchy snapshots | Planned |
+| Type hierarchy | Medium | INFERRED | Kotlin inheritance semantics | Super/subtype graph from declarations | Sealed/external boundaries | Hierarchy snapshots | Planned |
+| Document/workspace symbols | High | EXACT | LSP + PSI | PSI symbol tree/index | Anonymous/local declaration naming | Symbol golden tests | Implemented |
+| Semantic tokens | High | INFERRED | LSP token model, IDE semantics | PSI token classification with symbol-aware refinement | Token over/under-classification | Snapshot tests | Implemented |
+| Inlay hints | Medium | EMULATED | IDE ergonomics | Parameter-name hints from resolved calls plus inferred local-property type hints where confidence is high | Hint noise and missing broader hint classes | Visual snapshots | Implemented |
+| Rename symbol | High | INFERRED | IDE rename semantics | Symbol graph rename with workspace edit generation | Dynamic/reflective cases | Rename integration tests | Implemented |
+| Rename file/package | Medium-high | INFERRED | JetBrains package/file maintenance | Package declaration and path sync edits | Multi-package file edge cases | Fixture tests | Planned |
+| Move declaration/file/package | Medium | EMULATED | IDE workflow | Command-driven workspace edits and import repair | Scope-sensitive moves | Refactor scenario tests | Planned |
+| Change signature | Medium | EMULATED | IDE workflow | Command-based edits for function declarations and call sites | Default args and named args | Scenario tests | Planned |
+| Organize imports | High | INFERRED | Kotlin style + JetBrains behavior, vendored `KotlinImportOptimizer.kt` / `OptimizedImportsBuilder.kt` | Unused import pruning, alias preservation, IntelliJ `.idea/codeStyles` star-import thresholds, package-list seeding, and deterministic sorting | Full IntelliJ import layout tables and conflict checking are still partial | Golden formatting tests | Implemented |
+| Formatting | High | EMULATED | Kotlin style expectations, public formatter tooling | Direct JetBrains formatter bridge when a local JetBrains IDE is available, otherwise KtLint-backed formatting with IntelliJ-style defaults, project `.editorconfig` awareness, IntelliJ `.idea/codeStyles` boolean-option seeding, star-import threshold seeding, PSI-scoped range formatting, external formatter fallback, and minimal diff edits | Still not exact IntelliJ formatter in edge cases or full custom IntelliJ scheme parity | Golden edit tests | Implemented |
+| Folding ranges | High | EXACT | PSI + LSP | Declaration/comment/import folding providers | Region-style comments not supported | Folding snapshots | Implemented |
+| Selection ranges | High | EXACT | PSI tree | Parent chain selection provider | None | Selection range tests | Implemented |
+| Document highlights | High | INFERRED | IDE behavior | Symbol usage and write/read role highlights | Semantic ambiguity | Highlight tests | Implemented |
+| Mixed Kotlin + Java workspace | Medium-high | INFERRED | JVM project norms | Source-root scanning, compiler Java integration, and Java source indexing for navigation | Java-only resolution depth and richer override semantics | Fixture project tests | Implemented |
+| Dependency source/doc awareness | Medium-high | EMULATED | IDE navigation UX | Gradle-cache source-jar discovery, extracted-source indexing, and source-backed hover/definition fallback | Limited to jars/sources present in local cache; no full decompiler parity | Fixture and cache tests | Implemented |
+| Intention-style code actions | Medium-high | EMULATED | IDE ergonomics | Organize imports, import fixes, explicit type annotation, and explicit return type edits | Smaller intention catalog than IntelliJ | Editor workflow tests | Implemented |
+| Neovim/LazyVim drop-in setup | Full | EXACT | nvim-lspconfig/LazyVim conventions | Lua setup modules and health checks | Environment path issues | Manual and scripted attach tests | Implemented |
