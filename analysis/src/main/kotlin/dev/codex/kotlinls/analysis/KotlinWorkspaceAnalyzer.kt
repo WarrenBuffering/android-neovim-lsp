@@ -172,79 +172,79 @@ class KotlinWorkspaceAnalyzer(
         val originalToMirror = linkedMapOf<Path, Path>()
         val textByOriginal = linkedMapOf<Path, String>()
         val liveFiles = linkedSetOf<Path>()
-        val sourceFiles = buildList {
-            project.modules.forEach { module ->
-                (module.sourceRoots + module.javaSourceRoots).forEach { sourceRoot ->
-                    if (!Files.exists(sourceRoot)) return@forEach
-                    sourceRoot.walk().forEach { path ->
-                        if (!Files.isRegularFile(path)) return@forEach
-                        if (path.extension !in setOf("kt", "kts", "java")) return@forEach
-                        val normalized = path.normalize()
-                        if (normalizedIncludedPaths != null && normalized !in normalizedIncludedPaths) return@forEach
-                        add(normalized)
+        val sourceFiles = if (normalizedIncludedPaths != null) {
+            normalizedIncludedPaths
+                .asSequence()
+                .map(Path::normalize)
+                .filter(Files::isRegularFile)
+                .filter { path -> path.extension in setOf("kt", "kts", "java") }
+                .filter { path -> project.moduleForPath(path) != null }
+                .sortedBy(Path::toString)
+                .toList()
+        } else {
+            buildList {
+                project.modules.forEach { module ->
+                    (module.sourceRoots + module.javaSourceRoots).forEach { sourceRoot ->
+                        if (!Files.exists(sourceRoot)) return@forEach
+                        sourceRoot.walk().forEach { path ->
+                            if (!Files.isRegularFile(path)) return@forEach
+                            if (path.extension !in setOf("kt", "kts", "java")) return@forEach
+                            add(path.normalize())
+                        }
                     }
                 }
             }
         }
         val totalFiles = sourceFiles.size.coerceAtLeast(1)
-        var processedFiles = 0
-
-        project.modules.forEach { module ->
-            (module.sourceRoots + module.javaSourceRoots).forEach { sourceRoot ->
-                if (!Files.exists(sourceRoot)) return@forEach
-                sourceRoot.walk().forEach { path ->
-                    if (!Files.isRegularFile(path)) return@forEach
-                    if (path.extension !in setOf("kt", "kts", "java")) return@forEach
-                    val originalPath = path.normalize()
-                    if (normalizedIncludedPaths != null && originalPath !in normalizedIncludedPaths) return@forEach
-                    liveFiles.add(originalPath)
-                    val relative = originalPath.relativeTo(project.root)
-                    val mirrorPath = snapshotRoot.resolve(relative.toString()).normalize()
-                    val document = documents.get(originalPath.toUri().toString())
-                    val sourceFingerprint = document?.let { openDocumentFingerprint(it.version, it.text) }
-                        ?: fileFingerprint(originalPath)
-                    val cached = synchronized(mirrorCacheLock) { workspaceCache.files[originalPath] }
-                    val current = if (
-                        cached == null ||
-                        cached.sourceFingerprint != sourceFingerprint ||
-                        !Files.exists(mirrorPath)
-                    ) {
-                        mirrorPath.parent?.createDirectories()
-                        val fileText = document?.text ?: path.readText()
-                        Files.writeString(
-                            mirrorPath,
-                            fileText,
-                            StandardOpenOption.CREATE,
-                            StandardOpenOption.TRUNCATE_EXISTING,
-                            StandardOpenOption.WRITE,
-                        )
-                        MirroredFileState(
-                            mirrorPath = mirrorPath,
-                            text = fileText,
-                            sourceFingerprint = sourceFingerprint,
-                        ).also { state ->
-                            synchronized(mirrorCacheLock) {
-                                workspaceCache.files[originalPath] = state
-                            }
-                        }
-                    } else {
-                        cached
-                    }
-                    mirrorToOriginal[current.mirrorPath] = originalPath
-                    originalToMirror[originalPath] = current.mirrorPath
-                    textByOriginal[originalPath] = current.text
-                    processedFiles += 1
-                    if (shouldReportProgress(processedFiles, totalFiles)) {
-                        progress?.invoke("Prepared ${originalPath.fileName}", processedFiles, totalFiles)
+        sourceFiles.forEachIndexed { index, originalPath ->
+            if (project.moduleForPath(originalPath) == null) return@forEachIndexed
+            liveFiles.add(originalPath)
+            val relative = originalPath.relativeTo(project.root)
+            val mirrorPath = snapshotRoot.resolve(relative.toString()).normalize()
+            val document = documents.get(originalPath.toUri().toString())
+            val sourceFingerprint = document?.let { openDocumentFingerprint(it.version, it.text) }
+                ?: fileFingerprint(originalPath)
+            val cached = synchronized(mirrorCacheLock) { workspaceCache.files[originalPath] }
+            val current = if (
+                cached == null ||
+                cached.sourceFingerprint != sourceFingerprint ||
+                !Files.exists(mirrorPath)
+            ) {
+                mirrorPath.parent?.createDirectories()
+                val fileText = document?.text ?: originalPath.readText()
+                Files.writeString(
+                    mirrorPath,
+                    fileText,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING,
+                    StandardOpenOption.WRITE,
+                )
+                MirroredFileState(
+                    mirrorPath = mirrorPath,
+                    text = fileText,
+                    sourceFingerprint = sourceFingerprint,
+                ).also { state ->
+                    synchronized(mirrorCacheLock) {
+                        workspaceCache.files[originalPath] = state
                     }
                 }
+            } else {
+                cached
+            }
+            mirrorToOriginal[current.mirrorPath] = originalPath
+            originalToMirror[originalPath] = current.mirrorPath
+            textByOriginal[originalPath] = current.text
+            if (shouldReportProgress(index + 1, totalFiles)) {
+                progress?.invoke("Prepared ${originalPath.fileName}", index + 1, totalFiles)
             }
         }
-        synchronized(mirrorCacheLock) {
-            val staleFiles = workspaceCache.files.keys - liveFiles
-            staleFiles.forEach { stale ->
-                workspaceCache.files.remove(stale)?.mirrorPath?.let { mirrorPath ->
-                    runCatching { Files.deleteIfExists(mirrorPath) }
+        if (normalizedIncludedPaths == null) {
+            synchronized(mirrorCacheLock) {
+                val staleFiles = workspaceCache.files.keys - liveFiles
+                staleFiles.forEach { stale ->
+                    workspaceCache.files.remove(stale)?.mirrorPath?.let { mirrorPath ->
+                        runCatching { Files.deleteIfExists(mirrorPath) }
+                    }
                 }
             }
         }

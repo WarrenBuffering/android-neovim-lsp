@@ -179,7 +179,307 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 }
             }
         },
-        TestCase("loads semantic state lazily for unopened modules on demand") {
+        TestCase("eventually serves semantic hover and definition for local variables when backend is enabled") {
+            val projectRoot = createSemanticRequestFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf("mode" to "off"),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                var hoverText = ""
+                var definitionCount = 0
+                repeat(10) { attempt ->
+                    val requestId = 200 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to requestId,
+                            "method" to "textDocument/hover",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 4, "character" to 11),
+                            ),
+                        ),
+                    )
+                    val hoverResponse = readUntil(server.reader, maxMessages = 120) { message ->
+                        message.id?.asInt() == requestId
+                    }
+                    hoverText = hoverResponse?.result?.toString().orEmpty()
+                    if ("Int" in hoverText) {
+                        return@repeat
+                    }
+                    Thread.sleep(150)
+                }
+                assertContains(hoverText, "Int")
+
+                repeat(10) { attempt ->
+                    val requestId = 300 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to requestId,
+                            "method" to "textDocument/definition",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 4, "character" to 11),
+                            ),
+                        ),
+                    )
+                    val definitionResponse = readUntil(server.reader, maxMessages = 120) { message ->
+                        message.id?.asInt() == requestId
+                    }
+                    definitionCount = definitionResponse?.result?.size() ?: 0
+                    if (definitionCount > 0) {
+                        return@repeat
+                    }
+                    Thread.sleep(150)
+                }
+                assertTrue(definitionCount > 0) { "Expected semantic definition for local variable once snapshot was ready" }
+            }
+        },
+        TestCase("serves first semantic hover and definition on cold request when focused analysis fits timeout") {
+            val projectRoot = createSemanticRequestFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf("mode" to "off"),
+                        "semantic" to mapOf(
+                            "request_timeout_ms" to 600,
+                        ),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 600,
+                        "method" to "textDocument/hover",
+                        "params" to mapOf(
+                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                            "position" to mapOf("line" to 4, "character" to 11),
+                        ),
+                    ),
+                )
+                val hoverResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                    message.id?.asInt() == 600
+                }
+                assertContains(hoverResponse?.result?.toString().orEmpty(), "Int")
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 601,
+                        "method" to "textDocument/definition",
+                        "params" to mapOf(
+                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                            "position" to mapOf("line" to 4, "character" to 11),
+                        ),
+                    ),
+                )
+                val definitionResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                    message.id?.asInt() == 601
+                }
+                assertTrue((definitionResponse?.result?.size() ?: 0) > 0) {
+                    "Expected first cold definition request to succeed once focused analysis completed inside timeout"
+                }
+            }
+        },
+        TestCase("reuses current semantic state for repeated hover requests after edits") {
+            val projectRoot = createSemanticRequestFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf("mode" to "minimal"),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                val editedText = """
+                    package demo.app
+
+                    fun app(): Int {
+                        val count = 42
+                        return count + 0
+                    }
+                """.trimIndent() + "\n"
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "method" to "textDocument/didChange",
+                        "params" to mapOf(
+                            "textDocument" to mapOf(
+                                "uri" to appFile.toUri().toString(),
+                                "version" to 2,
+                            ),
+                            "contentChanges" to listOf(
+                                mapOf("text" to editedText),
+                            ),
+                        ),
+                    ),
+                )
+
+                var primedHoverText = ""
+                repeat(12) { attempt ->
+                    val requestId = 400 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to requestId,
+                            "method" to "textDocument/hover",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 4, "character" to 11),
+                            ),
+                        ),
+                    )
+                    val hoverResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                        message.id?.asInt() == requestId
+                    }
+                    primedHoverText = hoverResponse?.result?.toString().orEmpty()
+                    if ("Int" in primedHoverText) {
+                        return@repeat
+                    }
+                    Thread.sleep(150)
+                }
+                assertContains(primedHoverText, "Int")
+
+                val secondRequestId = 500
+                var sawSecondSemanticAnalysis = false
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to secondRequestId,
+                        "method" to "textDocument/hover",
+                        "params" to mapOf(
+                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                            "position" to mapOf("line" to 4, "character" to 11),
+                        ),
+                    ),
+                )
+                val secondHoverResponse = readUntil(server.reader, maxMessages = 80) { message ->
+                    if (progressTitle(message) == "Semantic Analysis") {
+                        sawSecondSemanticAnalysis = true
+                    }
+                    message.id?.asInt() == secondRequestId
+                }
+                val secondHoverText = secondHoverResponse?.result?.toString().orEmpty()
+                assertContains(secondHoverText, "Int")
+                assertTrue(!sawSecondSemanticAnalysis) {
+                    "Expected repeated hover on unchanged version to reuse semantic state instead of re-running analysis"
+                }
+            }
+        },
+        TestCase("waits for current semantic state after edits instead of returning stale hover") {
+            val projectRoot = createSemanticRequestFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf("mode" to "off"),
+                        "semantic" to mapOf(
+                            "request_timeout_ms" to 1200,
+                        ),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                repeat(12) { attempt ->
+                    val requestId = 700 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to requestId,
+                            "method" to "textDocument/hover",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 4, "character" to 11),
+                            ),
+                        ),
+                    )
+                    val hoverResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                        message.id?.asInt() == requestId
+                    }
+                    if ("Int" in hoverResponse?.result?.toString().orEmpty()) {
+                        return@repeat
+                    }
+                    Thread.sleep(150)
+                }
+
+                val editedText = """
+                    package demo.app
+
+                    fun app(): String {
+                        val count = "forty-two"
+                        return count
+                    }
+                """.trimIndent() + "\n"
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "method" to "textDocument/didChange",
+                        "params" to mapOf(
+                            "textDocument" to mapOf(
+                                "uri" to appFile.toUri().toString(),
+                                "version" to 2,
+                            ),
+                            "contentChanges" to listOf(
+                                mapOf("text" to editedText),
+                            ),
+                        ),
+                    ),
+                )
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 800,
+                        "method" to "textDocument/hover",
+                        "params" to mapOf(
+                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                            "position" to mapOf("line" to 4, "character" to 11),
+                        ),
+                    ),
+                )
+                val hoverResponse = readUntil(server.reader, maxMessages = 200) { message ->
+                    message.id?.asInt() == 800
+                }
+                val hoverText = hoverResponse?.result?.toString().orEmpty()
+                assertContains(hoverText, "String")
+                assertTrue("Int" !in hoverText) {
+                    "Expected post-edit hover to wait for current semantic state, got stale response: $hoverText"
+                }
+            }
+        },
+        TestCase("returns disabled semantic responses without custom progress spam") {
             val projectRoot = FixtureSupport.fixture("multi-module")
             val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/Main.kt")
             val libFile = projectRoot.resolve("lib/src/main/kotlin/demo/lib/Greeting.kt")
@@ -189,13 +489,6 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 readUntil(server.reader, maxMessages = 80) { message ->
                     diagnosticUri(message) == appFile.toUri().toString()
                 }
-                readUntil(server.reader, maxMessages = 120) { message ->
-                    progressTitle(message) == "Fast Source Index" &&
-                        message.method == "kotlinls/progress" &&
-                        message.params?.get("event")?.asText() == "end"
-                }
-
-                val progressSubtitles = mutableListOf<String>()
                 writePayload(
                     server.clientOut,
                     mapOf(
@@ -209,11 +502,18 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                         ),
                     ),
                 )
+                val observedMethods = mutableListOf<String>()
                 val renameOutcome = readUntil(server.reader, maxMessages = 120, predicate = { message ->
-                    progressSubtitle(message)?.let(progressSubtitles::add)
-                    progressSubtitles.any { it.contains("lib", ignoreCase = true) } || message.id?.asInt() == 2
+                    message.method?.let(observedMethods::add)
+                    message.id?.asInt() == 2
                 })
-                assertTrue(renameOutcome != null) { "Expected lazy semantic work for unopened lib file" }
+                val resultNode = renameOutcome?.result
+                assertTrue(renameOutcome != null && (resultNode == null || resultNode.isNull)) {
+                    "Expected disabled semantic rename to return null, got $resultNode"
+                }
+                assertTrue("kotlinls/progress" !in observedMethods) {
+                    "Expected custom progress notifications to stay disabled, got $observedMethods"
+                }
             }
         },
     ),
@@ -261,14 +561,25 @@ private fun startServer(): RunningServer {
     )
 }
 
-private fun initializeServer(server: RunningServer, root: Path) {
+private fun initializeServer(
+    server: RunningServer,
+    root: Path,
+    initializationOptions: Map<String, Any?> = mapOf(
+        "semantic" to mapOf(
+            "backend" to "disabled",
+        ),
+    ),
+) {
     writePayload(
         server.clientOut,
         mapOf(
             "jsonrpc" to "2.0",
             "id" to 1,
             "method" to "initialize",
-            "params" to mapOf("rootUri" to root.toUri().toString()),
+            "params" to mapOf(
+                "rootUri" to root.toUri().toString(),
+                "initializationOptions" to initializationOptions,
+            ),
         ),
     )
     val initResponse = readUntil(server.reader, maxMessages = 20) { it.id?.asInt() == 1 }
@@ -425,6 +736,43 @@ private fun createLiveIndexFixture(): Path {
         package demo.app
 
         fun oldName(): String = "ok"
+        """.trimIndent() + "\n",
+    )
+    return root
+}
+
+private fun createSemanticRequestFixture(): Path {
+    val root = Files.createTempDirectory("kotlinls-semantic-request")
+    root.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "semantic-request"
+        include(":app")
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app").createDirectories()
+    root.resolve("app/build.gradle.kts").writeText(
+        """
+        plugins {
+            kotlin("jvm")
+        }
+
+        repositories {
+            mavenCentral()
+        }
+
+        kotlin {
+            jvmToolchain(21)
+        }
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app/App.kt").writeText(
+        """
+        package demo.app
+
+        fun app(): Int {
+            val count = 42
+            return count
+        }
         """.trimIndent() + "\n",
     )
     return root

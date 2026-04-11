@@ -216,7 +216,7 @@ fun editorParitySuite(): TestSuite {
                     CodeActionParams(
                         textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
                         range = Range(Position(functionLine, 4), Position(functionLine, 10)),
-                        context = CodeActionContext(),
+                        context = CodeActionContext(only = listOf("refactor.rewrite")),
                     ),
                 )
                 assertTrue(functionActions.any { it.title.contains("Add explicit return type: Int") }) {
@@ -229,11 +229,23 @@ fun editorParitySuite(): TestSuite {
                     CodeActionParams(
                         textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
                         range = Range(Position(propertyLine, 8), Position(propertyLine, 12)),
-                        context = CodeActionContext(),
+                        context = CodeActionContext(only = listOf("refactor.rewrite")),
                     ),
                 )
                 assertTrue(propertyActions.any { it.title.contains("Add explicit type annotation: String") }) {
                     "Expected explicit type annotation action, got ${propertyActions.map { it.title }}"
+                }
+                val unfiltered = codeActionService.codeActions(
+                    snapshot,
+                    index,
+                    CodeActionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        range = Range(Position(functionLine, 4), Position(functionLine, 10)),
+                        context = CodeActionContext(),
+                    ),
+                )
+                assertTrue(unfiltered.none { it.kind == "refactor.rewrite" }) {
+                    "Expected unfiltered requests to omit rewrite intentions, got ${unfiltered.map { it.kind to it.title }}"
                 }
             },
             TestCase("shows inferred local variable type inlay hints") {

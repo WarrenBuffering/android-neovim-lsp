@@ -14,7 +14,7 @@ import kotlin.concurrent.thread
 fun protocolSmokeSuite(): TestSuite = TestSuite(
     name = "protocol-smoke",
     cases = listOf(
-        TestCase("initializes, opens a document, and answers hover") {
+        TestCase("initializes, opens a document, and answers workspace symbol") {
             val fixtureRoot = FixtureSupport.fixture("simple-jvm-app")
             val serverIn = PipedInputStream()
             val clientOut = PipedOutputStream(serverIn)
@@ -31,7 +31,14 @@ fun protocolSmokeSuite(): TestSuite = TestSuite(
                     "jsonrpc" to "2.0",
                     "id" to 1,
                     "method" to "initialize",
-                    "params" to mapOf("rootUri" to fixtureRoot.toUri().toString()),
+                    "params" to mapOf(
+                        "rootUri" to fixtureRoot.toUri().toString(),
+                        "initializationOptions" to mapOf(
+                            "semantic" to mapOf(
+                                "backend" to "disabled",
+                            ),
+                        ),
+                    ),
                 ),
             )
             val initResponse = readUntil(reader) { message -> message.id?.asInt() == 1 }
@@ -70,16 +77,13 @@ fun protocolSmokeSuite(): TestSuite = TestSuite(
                 mapOf(
                     "jsonrpc" to "2.0",
                     "id" to 2,
-                    "method" to "textDocument/hover",
-                    "params" to mapOf(
-                        "textDocument" to mapOf("uri" to appFile.toUri().toString()),
-                        "position" to mapOf("line" to 5, "character" to 14),
-                    ),
+                    "method" to "workspace/symbol",
+                    "params" to mapOf("query" to "greet"),
                 ),
             )
-            val hoverResponse = readUntil(reader, maxMessages = 80) { message -> message.id?.asInt() == 2 }
-            val hoverText = hoverResponse?.result?.toString().orEmpty()
-            assertContains(hoverText, "greet")
+            val symbolResponse = readUntil(reader, maxMessages = 80) { message -> message.id?.asInt() == 2 }
+            val symbolText = symbolResponse?.result?.toString().orEmpty()
+            assertContains(symbolText, "greet")
 
             writePayload(clientOut, mapOf("jsonrpc" to "2.0", "id" to 3, "method" to "shutdown"))
             readUntil(reader, maxMessages = 20) { message -> message.id?.asInt() == 3 }

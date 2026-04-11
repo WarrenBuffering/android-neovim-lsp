@@ -3,8 +3,14 @@ package dev.codex.kotlinls.tests
 import dev.codex.kotlinls.index.CallEdge
 import dev.codex.kotlinls.index.IndexedReference
 import dev.codex.kotlinls.index.IndexedSymbol
+import dev.codex.kotlinls.index.LightweightWorkspaceIndexBuilder
 import dev.codex.kotlinls.index.PersistentSemanticIndexCache
+import dev.codex.kotlinls.index.PersistentSupportSymbolCache
+import dev.codex.kotlinls.index.SupportSymbolLayer
 import dev.codex.kotlinls.index.WorkspaceIndex
+import dev.codex.kotlinls.projectimport.CompilerOptions
+import dev.codex.kotlinls.projectimport.ImportedModule
+import dev.codex.kotlinls.projectimport.ImportedProject
 import dev.codex.kotlinls.protocol.Json
 import dev.codex.kotlinls.protocol.JsonRpcInboundMessage
 import dev.codex.kotlinls.protocol.JsonRpcTransport
@@ -12,6 +18,7 @@ import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
 import dev.codex.kotlinls.protocol.SymbolKind
 import dev.codex.kotlinls.server.KotlinLanguageServer
+import dev.codex.kotlinls.workspace.TextDocumentStore
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.PipedInputStream
@@ -25,7 +32,7 @@ import kotlin.io.path.readText
 import kotlin.io.path.writeText
 
 fun semanticPersistenceSuite(): TestSuite = TestSuite(
-    name = "semantic-persistence",
+    name = "runtime-caches",
     cases = listOf(
         TestCase("roundtrips semantic index cache") {
             val cacheRoot = Files.createTempDirectory("kotlinls-semantic-cache")
@@ -109,72 +116,167 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
 
             assertEquals(index, loaded[":app"]) { "Expected loadAll to recover module semantic index" }
         },
-        TestCase("reuses persisted semantic index on restart") {
+        TestCase("roundtrips support symbol cache and invalidates on fingerprint change") {
+            val cacheRoot = Files.createTempDirectory("kotlinls-support-cache")
+            val cache = PersistentSupportSymbolCache(cacheRoot)
+            val projectRoot = Files.createTempDirectory("kotlinls-support-project")
+            val sourceFile = projectRoot.resolve("deps/demo/lib/SampleLib.kt").also {
+                it.parent.createDirectories()
+                it.writeText(
+                    """
+                    package demo.lib
+
+                    /** Greets from cached docs. */
+                    class SampleLib
+                    """.trimIndent() + "\n",
+                )
+            }
+            val layer = SupportSymbolLayer(
+                fingerprint = "fingerprint-1",
+                symbols = listOf(
+                    IndexedSymbol(
+                        id = "demo.lib.SampleLib",
+                        name = "SampleLib",
+                        fqName = "demo.lib.SampleLib",
+                        kind = SymbolKind.CLASS,
+                        path = sourceFile,
+                        uri = sourceFile.toUri().toString(),
+                        range = Range(Position(3, 0), Position(3, 15)),
+                        selectionRange = Range(Position(3, 6), Position(3, 15)),
+                        signature = "class SampleLib",
+                        documentation = "Greets from cached docs.",
+                        packageName = "demo.lib",
+                        moduleName = "deps",
+                        importable = true,
+                    ),
+                ),
+            )
+
+            cache.save(projectRoot, layer)
+
+            val loaded = cache.load(projectRoot, "fingerprint-1")
+            assertEquals(layer, loaded) { "Expected support symbol cache roundtrip to preserve dependency docs and symbols" }
+
+            val changed = cache.load(projectRoot, "fingerprint-2")
+            assertEquals(null, changed) { "Expected support symbol cache to invalidate when artifact fingerprint changes" }
+        },
+        TestCase("loads lightweight workspace index from root manifests without a recrawl") {
+            val cacheRoot = Files.createTempDirectory("kotlinls-lightweight-cache")
+            val builder = LightweightWorkspaceIndexBuilder(cacheRoot = cacheRoot)
+            val projectRoot = Files.createTempDirectory("kotlinls-lightweight-project")
+            val sourceRoot = projectRoot.resolve("src/main/kotlin/demo/app").also { it.createDirectories() }
+            val sourceFile = sourceRoot.resolve("Foo.kt").also {
+                it.writeText("package demo.app\n\nclass Foo\n")
+            }
+            val project = importedProject(projectRoot, sourceRoot.parent.parent)
+
+            val built = builder.build(project, TextDocumentStore())
+            assertTrue(built.symbols.any { it.name == "Foo" }) { "Expected initial build to index Foo" }
+            assertTrue(!builder.requiresBackgroundRefresh(project)) {
+                "Expected root manifests to make the cached workspace view immediately reusable"
+            }
+
+            val reloaded = LightweightWorkspaceIndexBuilder(cacheRoot = cacheRoot).load(project)
+            assertTrue(reloaded?.symbols?.any { it.name == "Foo" } == true) {
+                "Expected manifest-backed cache load to recover Foo without rescanning roots"
+            }
+
+            Files.delete(sourceFile)
+        },
+        TestCase("marks lightweight workspace cache stale when project roots change") {
+            val cacheRoot = Files.createTempDirectory("kotlinls-lightweight-root-change")
+            val builder = LightweightWorkspaceIndexBuilder(cacheRoot = cacheRoot)
+            val projectRoot = Files.createTempDirectory("kotlinls-lightweight-project-roots")
+            val mainRoot = projectRoot.resolve("src/main/kotlin/demo/app").also { it.createDirectories() }
+            mainRoot.resolve("Foo.kt").writeText("package demo.app\n\nclass Foo\n")
+            val baseProject = importedProject(projectRoot, mainRoot.parent.parent)
+            builder.build(baseProject, TextDocumentStore())
+
+            val debugRoot = projectRoot.resolve("src/debug/kotlin/demo/app").also { it.createDirectories() }
+            debugRoot.resolve("DebugOnly.kt").writeText("package demo.app\n\nclass DebugOnly\n")
+            val expandedProject = importedProject(
+                projectRoot = projectRoot,
+                sourceRoots = listOf(
+                    mainRoot.parent.parent,
+                    debugRoot.parent.parent,
+                ),
+            )
+
+            assertTrue(builder.requiresBackgroundRefresh(expandedProject)) {
+                "Expected a new source root to invalidate the manifest-backed workspace cache"
+            }
+        },
+        TestCase("persists saved documents into the lightweight workspace cache") {
+            val cacheRoot = Files.createTempDirectory("kotlinls-lightweight-persist")
+            val builder = LightweightWorkspaceIndexBuilder(cacheRoot = cacheRoot)
+            val projectRoot = Files.createTempDirectory("kotlinls-lightweight-project-persist")
+            val sourceRoot = projectRoot.resolve("src/main/kotlin/demo/app").also { it.createDirectories() }
+            val project = importedProject(projectRoot, sourceRoot.parent.parent)
+
+            val savedFile = sourceRoot.resolve("SavedLater.kt")
+            val savedText = "package demo.app\n\nclass SavedLater\n"
+            savedFile.writeText(savedText)
+            builder.persistDocument(project, savedFile, savedText)
+
+            val reloaded = LightweightWorkspaceIndexBuilder(cacheRoot = cacheRoot).load(project)
+            assertTrue(reloaded?.symbols?.any { it.name == "SavedLater" } == true) {
+                "Expected save-time persistence to surface new files from the lightweight cache"
+            }
+        },
+        TestCase("initializes with bridge-first capability gating and no custom progress channel") {
             val projectRoot = createSemanticPersistenceFixture()
             val sourceFile = projectRoot.resolve("app/src/main/kotlin/demo/app/Caller.kt")
-            val cacheRoot = Files.createTempDirectory("kotlinls-semantic-restart")
-
             withRunningServer(
                 serverFactory = { transport ->
                     KotlinLanguageServer(
                         transport = transport,
-                        semanticIndexCache = PersistentSemanticIndexCache(cacheRoot),
                         refreshDebounceMillis = 0L,
                         warmupStartDelayMillis = 1_000L,
                     )
                 },
             ) { server ->
-                initializeServer(server, projectRoot)
-                openDocument(server, sourceFile)
-                val warmupComplete = readUntil(server.reader, maxMessages = 160) { message ->
-                    progressTitle(message) == "Semantic Warmup Index" &&
-                        progressEvent(message) == "end" &&
-                        progressSubtitle(message)?.contains("semantic warm index ready", ignoreCase = true) == true
-                }
-                assertTrue(warmupComplete != null) { "Expected a persisted full-module semantic warmup before restart" }
-            }
-
-            val cacheFileCount = Files.walk(cacheRoot).use { stream ->
-                stream.filter { it.fileName?.toString() == "semantic-index.json" }.count()
-            }
-            assertTrue(cacheFileCount > 0) { "Expected semantic cache files to be written under $cacheRoot" }
-
-            withRunningServer(
-                serverFactory = { transport ->
-                    KotlinLanguageServer(
-                        transport = transport,
-                        semanticIndexCache = PersistentSemanticIndexCache(cacheRoot),
-                        refreshDebounceMillis = 0L,
-                        warmupStartDelayMillis = 1_000L,
-                    )
-                },
-            ) { server ->
-                initializeServer(server, projectRoot)
-                openDocument(server, sourceFile)
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 1,
+                        "method" to "initialize",
+                        "params" to mapOf(
+                            "rootUri" to projectRoot.toUri().toString(),
+                            "initializationOptions" to mapOf(
+                                "semantic" to mapOf(
+                                    "backend" to "disabled",
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                val initResponse = readUntil(server.reader, maxMessages = 20) { it.id?.asInt() == 1 }
+                val capabilities = initResponse?.result?.get("capabilities")
+                assertTrue(capabilities != null) { "Expected initialize capabilities" }
+                assertEquals(false, capabilities?.get("selectionRangeProvider")?.asBoolean())
+                assertEquals(false, capabilities?.get("documentHighlightProvider")?.asBoolean())
+                assertEquals(false, capabilities?.get("inlayHintProvider")?.asBoolean())
+                assertEquals(false, capabilities?.get("callHierarchyProvider")?.asBoolean())
+                assertEquals(false, capabilities?.get("typeHierarchyProvider")?.asBoolean())
 
                 writePayload(
                     server.clientOut,
                     mapOf(
                         "jsonrpc" to "2.0",
-                        "id" to 2,
-                        "method" to "textDocument/definition",
-                        "params" to mapOf(
-                            "textDocument" to mapOf("uri" to sourceFile.toUri().toString()),
-                            "position" to mapOf("line" to 2, "character" to 27),
-                        ),
+                        "method" to "initialized",
+                        "params" to emptyMap<String, Any>(),
                     ),
                 )
 
-                val progressTitles = mutableListOf<String>()
-                val progressEvents = mutableListOf<String>()
-                val definitionResponse = readUntil(server.reader, maxMessages = 60) { message ->
-                    progressTitle(message)?.let(progressTitles::add)
-                    progressEvent(message)?.let(progressEvents::add)
-                    message.id?.asInt() == 2
+                openDocument(server, sourceFile)
+                val observedMethods = mutableListOf<String>()
+                readUntil(server.reader, maxMessages = 20) { message ->
+                    message.method?.let(observedMethods::add)
+                    diagnosticUri(message) == sourceFile.toUri().toString()
                 }
-                val result = definitionResponse?.result
-                assertTrue(result != null && result.isArray && result.size() > 0) {
-                    "Expected definition data from persisted caches, got $result"
+                assertTrue("kotlinls/progress" !in observedMethods) {
+                    "Expected server to stop using custom kotlinls/progress notifications, got $observedMethods"
                 }
             }
         },
@@ -231,7 +333,14 @@ private fun initializeServer(server: PersistenceRunningServer, root: Path) {
             "jsonrpc" to "2.0",
             "id" to 1,
             "method" to "initialize",
-            "params" to mapOf("rootUri" to root.toUri().toString()),
+            "params" to mapOf(
+                "rootUri" to root.toUri().toString(),
+                "initializationOptions" to mapOf(
+                    "semantic" to mapOf(
+                        "backend" to "disabled",
+                    ),
+                ),
+            ),
         ),
     )
     val initResponse = readUntil(server.reader, maxMessages = 20) { it.id?.asInt() == 1 }
@@ -328,20 +437,36 @@ private fun readUntil(
     return null
 }
 
-private fun progressTitle(message: JsonRpcInboundMessage): String? =
-    message.takeIf { it.method == "kotlinls/progress" }
+private fun diagnosticUri(message: JsonRpcInboundMessage): String? =
+    message.takeIf { it.method == "textDocument/publishDiagnostics" }
         ?.params
-        ?.get("title")
+        ?.get("uri")
         ?.asText()
 
-private fun progressSubtitle(message: JsonRpcInboundMessage): String? =
-    message.takeIf { it.method == "kotlinls/progress" }
-        ?.params
-        ?.get("subtitle")
-        ?.asText()
+private fun importedProject(
+    projectRoot: Path,
+    sourceRoot: Path,
+): ImportedProject = importedProject(projectRoot, listOf(sourceRoot))
 
-private fun progressEvent(message: JsonRpcInboundMessage): String? =
-    message.takeIf { it.method == "kotlinls/progress" }
-        ?.params
-        ?.get("event")
-        ?.asText()
+private fun importedProject(
+    projectRoot: Path,
+    sourceRoots: List<Path>,
+): ImportedProject =
+    ImportedProject(
+        root = projectRoot,
+        modules = listOf(
+            ImportedModule(
+                name = "app",
+                gradlePath = ":app",
+                dir = projectRoot,
+                buildFile = null,
+                sourceRoots = sourceRoots,
+                javaSourceRoots = emptyList(),
+                testRoots = emptyList(),
+                compilerOptions = CompilerOptions(),
+                externalDependencies = emptyList(),
+                projectDependencies = emptyList(),
+                classpathJars = emptyList(),
+            ),
+        ),
+    )

@@ -32,6 +32,8 @@ import org.jetbrains.kotlin.psi.psiUtil.containingClassOrObject
 import org.jetbrains.kotlin.psi.psiUtil.parentsWithSelf
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.DescriptorUtils
+import java.nio.file.Path
+import java.nio.file.Files
 import kotlin.io.path.extension
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.name
@@ -40,10 +42,14 @@ import kotlin.io.path.walk
 
 class WorkspaceIndexBuilder(
     private val externalSourceMirror: ExternalSourceMirror = ExternalSourceMirror(),
+    private val persistentSupportCache: PersistentSupportSymbolCache = PersistentSupportSymbolCache(),
 ) {
+    private val cacheLock = Any()
+    private val supportSymbolLayers = linkedMapOf<Path, SupportSymbolLayer>()
+
     fun build(
         snapshot: WorkspaceAnalysisSnapshot,
-        targetPaths: Set<java.nio.file.Path>? = null,
+        targetPaths: Set<Path>? = null,
         progress: ((String, Int, Int) -> Unit)? = null,
     ): WorkspaceIndex {
         val filteredFiles = snapshot.files.filter { file ->
@@ -66,9 +72,8 @@ class WorkspaceIndexBuilder(
                 progress?.invoke("Indexed ${file.originalPath.fileName}", index + 1, totalFiles)
             }
         }
-        symbolAccumulator += javaSourceSymbols(snapshot)
-        symbolAccumulator += externalLibrarySymbols(snapshot)
-        symbolAccumulator += jdkSourceSymbols()
+        val supportSymbols = supportSymbols(snapshot, allowCached = targetPaths != null)
+        symbolAccumulator += supportSymbols.symbols
 
         val references = mutableListOf<IndexedReference>()
         val callEdges = mutableListOf<CallEdge>()
@@ -111,6 +116,82 @@ class WorkspaceIndexBuilder(
     private fun shouldReportProgress(current: Int, total: Int): Boolean =
         current == 1 || current == total || current % 25 == 0
 
+    private fun supportSymbols(
+        snapshot: WorkspaceAnalysisSnapshot,
+        allowCached: Boolean,
+    ): SupportSymbolLayer {
+        val projectRoot = snapshot.project.root.normalize()
+        val fingerprint = supportLayerFingerprint(snapshot.project)
+        if (allowCached) {
+            synchronized(cacheLock) {
+                supportSymbolLayers[projectRoot]
+                    ?.takeIf { it.fingerprint == fingerprint }
+                    ?.let { return it }
+            }
+        }
+        persistentSupportCache.load(projectRoot, fingerprint)?.let { cached ->
+            synchronized(cacheLock) {
+                supportSymbolLayers[projectRoot] = cached
+            }
+            return cached
+        }
+
+        val computed = SupportSymbolLayer(
+            fingerprint = fingerprint,
+            symbols = buildJavaSourceSymbols(snapshot.project) +
+                buildExternalLibrarySymbols(snapshot) +
+                buildJdkSourceSymbols(),
+        )
+        synchronized(cacheLock) {
+            supportSymbolLayers[projectRoot] = computed
+        }
+        persistentSupportCache.save(projectRoot, computed)
+        return computed
+    }
+
+    private fun supportLayerFingerprint(project: dev.codex.kotlinls.projectimport.ImportedProject): String =
+        buildString {
+            project.modules.sortedBy { it.gradlePath }.forEach { module ->
+                append(module.gradlePath)
+                append('|')
+                module.javaSourceRoots.sortedBy(Path::toString).forEach { root ->
+                    appendTreeFingerprint(this, "java", root.normalize())
+                }
+                append('|')
+                module.classpathSourceJars.sortedBy(Path::toString).forEach { jar ->
+                    appendFileFingerprint(this, "sourceJar", jar.normalize())
+                }
+                append('\n')
+            }
+            defaultJdkSourceArchive()?.let { srcZip ->
+                appendFileFingerprint(this, "jdk", srcZip.normalize())
+            }
+        }
+
+    private fun appendTreeFingerprint(builder: StringBuilder, label: String, root: Path) {
+        val normalizedRoot = root.normalize()
+        builder.append(label).append('=').append(normalizedRoot).append('|')
+        if (!Files.exists(normalizedRoot)) {
+            builder.append("missing").append(';')
+            return
+        }
+        normalizedRoot.walk()
+            .filter { it.isRegularFile() && it.extension == "java" }
+            .sortedBy(Path::toString)
+            .forEach { path ->
+                appendFileFingerprint(builder, label, path.normalize())
+            }
+    }
+
+    private fun appendFileFingerprint(builder: StringBuilder, label: String, path: Path) {
+        val normalized = path.normalize()
+        builder.append(label).append(':').append(normalized).append(':')
+        builder.append(runCatching { Files.size(normalized) }.getOrDefault(0L))
+        builder.append(':')
+        builder.append(runCatching { Files.getLastModifiedTime(normalized).toMillis() }.getOrDefault(0L))
+        builder.append(';')
+    }
+
     private fun KtNamedDeclaration.toIndexedSymbol(
         file: AnalyzedFile,
         bindingContext: BindingContext,
@@ -152,8 +233,8 @@ class WorkspaceIndexBuilder(
         )
     }
 
-    private fun javaSourceSymbols(snapshot: WorkspaceAnalysisSnapshot): List<IndexedSymbol> =
-        snapshot.project.modules.flatMap { module ->
+    private fun buildJavaSourceSymbols(project: dev.codex.kotlinls.projectimport.ImportedProject): List<IndexedSymbol> =
+        project.modules.flatMap { module ->
             module.javaSourceRoots.flatMap { root ->
                 if (!root.toFile().exists()) return@flatMap emptyList()
                 root.walk()
@@ -163,7 +244,7 @@ class WorkspaceIndexBuilder(
             }
         }
 
-    private fun externalLibrarySymbols(snapshot: WorkspaceAnalysisSnapshot): List<IndexedSymbol> {
+    private fun buildExternalLibrarySymbols(snapshot: WorkspaceAnalysisSnapshot): List<IndexedSymbol> {
         val project = snapshot.files.firstOrNull()?.ktFile?.project ?: return emptyList()
         val psiFactory = KtPsiFactory(project, false)
         return snapshot.project.modules
@@ -295,7 +376,7 @@ class WorkspaceIndexBuilder(
     private fun parameterCount(descriptor: DeclarationDescriptor?): Int =
         (descriptor as? CallableDescriptor)?.valueParameters?.size ?: 0
 
-    private fun jdkSourceSymbols(): List<IndexedSymbol> {
+    private fun buildJdkSourceSymbols(): List<IndexedSymbol> {
         val srcZip = defaultJdkSourceArchive() ?: return emptyList()
         val extractedRoot = runCatching { externalSourceMirror.materialize(srcZip) }.getOrNull() ?: return emptyList()
         return extractedRoot.walk()
@@ -330,7 +411,13 @@ class WorkspaceIndexBuilder(
             "/java.base/java/math/",
         ).any(normalized::contains)
     }
+
 }
+
+data class SupportSymbolLayer(
+    val fingerprint: String,
+    val symbols: List<IndexedSymbol>,
+)
 
 private fun externalDeclarationName(declaration: KtNamedDeclaration): String? =
     declaration.name ?: (declaration as? KtConstructor<*>)?.containingClassOrObject?.name

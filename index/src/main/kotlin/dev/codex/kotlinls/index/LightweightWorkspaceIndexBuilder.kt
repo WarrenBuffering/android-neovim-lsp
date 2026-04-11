@@ -8,8 +8,8 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import kotlin.io.path.createDirectories
-import kotlin.io.path.extension
 import kotlin.io.path.exists
+import kotlin.io.path.extension
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.readText
 import kotlin.io.path.walk
@@ -30,82 +30,40 @@ class LightweightWorkspaceIndexBuilder(
         val projectCache = synchronized(cacheLock) {
             projectCaches.getOrPut(projectRoot) { loadProjectCache(projectRoot) }
         }
+        val rootEntries = projectRoots(project)
+        var dirty = pruneStaleRootManifests(projectCache, rootEntries)
+        val manifestReady = hasCompleteRootManifests(projectCache, rootEntries)
+        val (workItems, manifestDirty) = if (manifestReady) {
+            workItemsFromManifests(projectCache, rootEntries)
+        } else {
+            scanProjectRoots(rootEntries, projectCache)
+        }
+        dirty = dirty || manifestDirty
+
         val liveFiles = linkedSetOf<Path>()
         val symbols = mutableListOf<IndexedSymbol>()
-        var dirty = false
-        val workItems = buildList {
-            project.modules.forEach { module ->
-                (module.sourceRoots + module.javaSourceRoots).forEach { root ->
-                    if (!Files.exists(root)) return@forEach
-                    root.walk().forEach { path ->
-                        if (!path.isRegularFile() || path.extension !in setOf("kt", "kts", "java")) return@forEach
-                        add(module to path.normalize())
-                    }
-                }
-            }
-        }
         val totalFiles = workItems.size.coerceAtLeast(1)
-        workItems.forEachIndexed { index, (module, normalized) ->
-            liveFiles.add(normalized)
-            val document = documents.get(normalized.toUri().toString())
-            val cached = synchronized(cacheLock) { projectCache.files[normalized] }
-            val indexedSymbols = if (document != null) {
-                val parsed = parseSymbols(normalized, module.name, document.text)
-                synchronized(cacheLock) {
-                    projectCache.files[normalized] = (cached ?: CachedIndexedFile(moduleName = module.name))
-                        .copy(openDocumentVersion = document.version, symbols = parsed)
-                }
-                parsed
-            } else {
-                val fileState = fileState(normalized)
-                val reused = if (
-                    cached != null &&
-                    cached.moduleName == module.name &&
-                    cached.lastModifiedMillis == fileState.lastModifiedMillis &&
-                    cached.fileSize == fileState.fileSize
-                ) {
-                    cached.symbols
-                } else {
-                    null
-                }
-                if (reused != null) {
-                    reused
-                } else {
-                    val text = runCatching { normalized.readText() }.getOrDefault("")
-                    val contentHash = sha256(text)
-                    val parsed = if (
-                        cached != null &&
-                        cached.moduleName == module.name &&
-                        cached.contentHash == contentHash
-                    ) {
-                        cached.symbols
-                    } else {
-                        parseSymbols(normalized, module.name, text)
-                    }
-                    synchronized(cacheLock) {
-                        projectCache.files[normalized] = CachedIndexedFile(
-                            moduleName = module.name,
-                            lastModifiedMillis = fileState.lastModifiedMillis,
-                            fileSize = fileState.fileSize,
-                            contentHash = contentHash,
-                            openDocumentVersion = null,
-                            symbols = parsed,
-                        )
-                    }
-                    dirty = true
-                    parsed
-                }
-            }
+        workItems.forEachIndexed { index, workItem ->
+            liveFiles.add(workItem.path)
+            val (indexedSymbols, fileDirty) = indexSymbols(projectCache, workItem, documents)
             symbols += indexedSymbols
+            dirty = dirty || fileDirty
             if (shouldReportProgress(index + 1, totalFiles)) {
-                progress?.invoke("Indexed ${normalized.fileName}", index + 1, totalFiles)
+                progress?.invoke("Indexed ${workItem.path.fileName}", index + 1, totalFiles)
             }
         }
+
         synchronized(cacheLock) {
             val stale = projectCache.files.keys - liveFiles
             if (stale.isNotEmpty()) dirty = true
             stale.forEach(projectCache.files::remove)
+            projectCache.roots.values.forEach { manifest ->
+                if (manifest.filePaths.removeIf { candidate -> candidate !in liveFiles }) {
+                    dirty = true
+                }
+            }
         }
+
         if (dirty) {
             saveProjectCache(projectRoot, projectCache)
         }
@@ -116,20 +74,46 @@ class LightweightWorkspaceIndexBuilder(
         )
     }
 
-    fun load(projectRoot: Path): WorkspaceIndex? {
-        val normalizedRoot = projectRoot.normalize()
+    fun load(project: ImportedProject): WorkspaceIndex? {
+        val projectRoot = project.root.normalize()
         val projectCache = synchronized(cacheLock) {
-            projectCaches.getOrPut(normalizedRoot) { loadProjectCache(normalizedRoot) }
+            projectCaches.getOrPut(projectRoot) { loadProjectCache(projectRoot) }
         }
-        if (projectCache.files.isEmpty()) return null
+        val rootEntries = projectRoots(project)
+        val files = when {
+            projectCache.files.isEmpty() -> return null
+            hasCompleteRootManifests(projectCache, rootEntries) -> rootEntries.flatMap { entry ->
+                projectCache.roots[entry.root]?.filePaths.orEmpty()
+            }
+
+            else -> projectCache.files.keys.toList()
+        }
+        if (files.isEmpty()) return null
         return WorkspaceIndex(
-            symbols = projectCache.files.values
-                .flatMap { it.symbols }
+            symbols = files.asSequence()
+                .distinct()
+                .mapNotNull { path -> projectCache.files[path.normalize()] }
+                .flatMap { it.symbols.asSequence() }
                 .distinctBy { it.id }
-                .sortedWith(compareBy({ it.name }, { it.path.toString() })),
+                .sortedWith(compareBy({ it.name }, { it.path.toString() }))
+                .toList(),
             references = emptyList(),
             callEdges = emptyList(),
         )
+    }
+
+    fun requiresBackgroundRefresh(project: ImportedProject): Boolean {
+        val projectRoot = project.root.normalize()
+        val projectCache = synchronized(cacheLock) {
+            projectCaches.getOrPut(projectRoot) { loadProjectCache(projectRoot) }
+        }
+        if (projectCache.files.isEmpty()) return true
+        val rootEntries = projectRoots(project)
+        if (!hasCompleteRootManifests(projectCache, rootEntries)) return true
+        return rootEntries.any { entry ->
+            val manifest = projectCache.roots[entry.root] ?: return@any true
+            manifest.filePaths.any { candidate -> candidate !in projectCache.files }
+        }
     }
 
     fun updateOpenDocument(
@@ -151,6 +135,206 @@ class LightweightWorkspaceIndexBuilder(
             callEdges = currentIndex.callEdges,
         )
     }
+
+    fun persistDocument(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+    ) {
+        val normalized = path.normalize()
+        val module = project.moduleForPath(normalized) ?: return
+        val projectRoot = project.root.normalize()
+        val parsed = parseSymbols(normalized, module.name, text)
+        val fileState = fileState(normalized)
+        val contentHash = sha256(text)
+        val projectCache = synchronized(cacheLock) {
+            projectCaches.getOrPut(projectRoot) { loadProjectCache(projectRoot) }.also { cache ->
+                cache.files[normalized] = CachedIndexedFile(
+                    moduleName = module.name,
+                    lastModifiedMillis = fileState.lastModifiedMillis,
+                    fileSize = fileState.fileSize,
+                    contentHash = contentHash,
+                    openDocumentVersion = null,
+                    symbols = parsed,
+                )
+                updateRootManifestsForPath(cache, project, module.name, normalized)
+            }
+        }
+        saveProjectCache(projectRoot, projectCache)
+    }
+
+    private fun indexSymbols(
+        projectCache: CachedProjectIndex,
+        workItem: IndexedWorkItem,
+        documents: TextDocumentStore,
+    ): Pair<List<IndexedSymbol>, Boolean> {
+        val normalized = workItem.path.normalize()
+        val document = documents.get(normalized.toUri().toString())
+        val cached = synchronized(cacheLock) { projectCache.files[normalized] }
+        if (document != null) {
+            val parsed = parseSymbols(normalized, workItem.moduleName, document.text)
+            synchronized(cacheLock) {
+                projectCache.files[normalized] = (cached ?: CachedIndexedFile(moduleName = workItem.moduleName))
+                    .copy(openDocumentVersion = document.version, symbols = parsed)
+            }
+            return parsed to false
+        }
+
+        val fileState = fileState(normalized)
+        val reused = if (
+            cached != null &&
+            cached.moduleName == workItem.moduleName &&
+            cached.lastModifiedMillis == fileState.lastModifiedMillis &&
+            cached.fileSize == fileState.fileSize
+        ) {
+            cached.symbols
+        } else {
+            null
+        }
+        if (reused != null) {
+            return reused to false
+        }
+
+        val text = runCatching { normalized.readText() }.getOrDefault("")
+        val contentHash = sha256(text)
+        val parsed = if (
+            cached != null &&
+            cached.moduleName == workItem.moduleName &&
+            cached.contentHash == contentHash
+        ) {
+            cached.symbols
+        } else {
+            parseSymbols(normalized, workItem.moduleName, text)
+        }
+        synchronized(cacheLock) {
+            projectCache.files[normalized] = CachedIndexedFile(
+                moduleName = workItem.moduleName,
+                lastModifiedMillis = fileState.lastModifiedMillis,
+                fileSize = fileState.fileSize,
+                contentHash = contentHash,
+                openDocumentVersion = null,
+                symbols = parsed,
+            )
+        }
+        return parsed to true
+    }
+
+    private fun workItemsFromManifests(
+        projectCache: CachedProjectIndex,
+        rootEntries: List<RootEntry>,
+    ): Pair<List<IndexedWorkItem>, Boolean> {
+        var dirty = false
+        val workItems = buildList {
+            rootEntries.forEach { entry ->
+                val manifest = projectCache.roots[entry.root] ?: return@forEach
+                val existingPaths = manifest.filePaths
+                    .map(Path::normalize)
+                    .filter { path ->
+                        val exists = Files.exists(path)
+                        if (!exists) dirty = true
+                        exists
+                    }
+                    .distinct()
+                    .sortedBy(Path::toString)
+                existingPaths.forEach { path ->
+                    add(IndexedWorkItem(moduleName = entry.moduleName, path = path))
+                }
+            }
+        }
+        return workItems to dirty
+    }
+
+    private fun scanProjectRoots(
+        rootEntries: List<RootEntry>,
+        projectCache: CachedProjectIndex,
+    ): Pair<List<IndexedWorkItem>, Boolean> {
+        val workItems = buildList {
+            rootEntries.forEach { entry ->
+                val files = if (!Files.exists(entry.root)) {
+                    emptyList()
+                } else {
+                    entry.root.walk()
+                        .filter { path -> path.isRegularFile() && path.extension in setOf("kt", "kts", "java") }
+                        .map(Path::normalize)
+                        .sortedBy(Path::toString)
+                        .toList()
+                }
+                synchronized(cacheLock) {
+                    projectCache.roots[entry.root] = CachedRootManifest(
+                        moduleName = entry.moduleName,
+                        rootKind = entry.rootKind,
+                        filePaths = files.toMutableList(),
+                    )
+                }
+                files.forEach { path ->
+                    add(IndexedWorkItem(moduleName = entry.moduleName, path = path))
+                }
+            }
+        }
+        return workItems to true
+    }
+
+    private fun updateRootManifestsForPath(
+        projectCache: CachedProjectIndex,
+        project: ImportedProject,
+        moduleName: String,
+        path: Path,
+    ) {
+        projectRoots(project)
+            .filter { entry -> entry.moduleName == moduleName && path.startsWith(entry.root) }
+            .forEach { entry ->
+                val manifest = projectCache.roots.getOrPut(entry.root) {
+                    CachedRootManifest(
+                        moduleName = entry.moduleName,
+                        rootKind = entry.rootKind,
+                        filePaths = mutableListOf(),
+                    )
+                }
+                if (path !in manifest.filePaths) {
+                    manifest.filePaths.add(path)
+                    manifest.filePaths.sortBy(Path::toString)
+                }
+            }
+    }
+
+    private fun pruneStaleRootManifests(
+        projectCache: CachedProjectIndex,
+        rootEntries: List<RootEntry>,
+    ): Boolean {
+        val validRoots = rootEntries.associateBy { it.root }
+        var dirty = false
+        synchronized(cacheLock) {
+            val staleRoots = projectCache.roots.keys.filter { root ->
+                val entry = validRoots[root] ?: return@filter true
+                val manifest = projectCache.roots[root] ?: return@filter true
+                manifest.moduleName != entry.moduleName || manifest.rootKind != entry.rootKind
+            }
+            if (staleRoots.isNotEmpty()) dirty = true
+            staleRoots.forEach(projectCache.roots::remove)
+        }
+        return dirty
+    }
+
+    private fun hasCompleteRootManifests(
+        projectCache: CachedProjectIndex,
+        rootEntries: List<RootEntry>,
+    ): Boolean =
+        rootEntries.isNotEmpty() && rootEntries.all { entry ->
+            val manifest = projectCache.roots[entry.root] ?: return@all false
+            manifest.moduleName == entry.moduleName && manifest.rootKind == entry.rootKind
+        }
+
+    private fun projectRoots(project: ImportedProject): List<RootEntry> =
+        buildList {
+            project.modules.forEach { module ->
+                module.sourceRoots.forEach { root ->
+                    add(RootEntry(module.name, "kotlin", root.normalize()))
+                }
+                module.javaSourceRoots.forEach { root ->
+                    add(RootEntry(module.name, "java", root.normalize()))
+                }
+            }
+        }.distinctBy { entry -> entry.root }
 
     private fun parseSymbols(path: Path, moduleName: String, text: String): List<IndexedSymbol> =
         when (path.extension) {
@@ -197,6 +381,13 @@ class LightweightWorkspaceIndexBuilder(
                         },
                     )
                 }.toMutableMap(),
+                roots = persisted.roots.associate { root ->
+                    Path.of(root.root).normalize() to CachedRootManifest(
+                        moduleName = root.moduleName,
+                        rootKind = root.rootKind,
+                        filePaths = root.filePaths.map(Path::of).map(Path::normalize).toMutableList(),
+                    )
+                }.toMutableMap(),
             )
         }.getOrDefault(CachedProjectIndex())
     }
@@ -208,6 +399,16 @@ class LightweightWorkspaceIndexBuilder(
             val tempFile = cacheFile.resolveSibling("${cacheFile.fileName}.tmp")
             val payload = PersistedProjectIndex(
                 schemaVersion = SCHEMA_VERSION,
+                roots = projectCache.roots
+                    .map { (root, manifest) ->
+                        PersistedRootManifest(
+                            root = root.toString(),
+                            moduleName = manifest.moduleName,
+                            rootKind = manifest.rootKind,
+                            filePaths = manifest.filePaths.map(Path::toString).sorted(),
+                        )
+                    }
+                    .sortedBy { it.root },
                 files = projectCache.files
                     .filterValues { it.contentHash != null }
                     .map { (path, file) ->
@@ -269,7 +470,7 @@ class LightweightWorkspaceIndexBuilder(
         current == 1 || current == total || current % 50 == 0
 
     companion object {
-        private const val SCHEMA_VERSION = 1
+        private const val SCHEMA_VERSION = 2
 
         private fun defaultIndexCacheRoot(): Path {
             val userHome = Path.of(System.getProperty("user.home"))
@@ -282,6 +483,17 @@ class LightweightWorkspaceIndexBuilder(
     }
 }
 
+private data class RootEntry(
+    val moduleName: String,
+    val rootKind: String,
+    val root: Path,
+)
+
+private data class IndexedWorkItem(
+    val moduleName: String,
+    val path: Path,
+)
+
 private data class CachedIndexedFile(
     val moduleName: String,
     val lastModifiedMillis: Long? = null,
@@ -291,8 +503,15 @@ private data class CachedIndexedFile(
     val symbols: List<IndexedSymbol> = emptyList(),
 )
 
+private data class CachedRootManifest(
+    val moduleName: String,
+    val rootKind: String,
+    val filePaths: MutableList<Path> = mutableListOf(),
+)
+
 private data class CachedProjectIndex(
     val files: MutableMap<Path, CachedIndexedFile> = linkedMapOf(),
+    val roots: MutableMap<Path, CachedRootManifest> = linkedMapOf(),
 )
 
 private data class FileState(
@@ -302,7 +521,15 @@ private data class FileState(
 
 private data class PersistedProjectIndex(
     val schemaVersion: Int,
-    val files: List<PersistedIndexedFile>,
+    val roots: List<PersistedRootManifest> = emptyList(),
+    val files: List<PersistedIndexedFile> = emptyList(),
+)
+
+private data class PersistedRootManifest(
+    val root: String,
+    val moduleName: String,
+    val rootKind: String,
+    val filePaths: List<String>,
 )
 
 private data class PersistedIndexedFile(
