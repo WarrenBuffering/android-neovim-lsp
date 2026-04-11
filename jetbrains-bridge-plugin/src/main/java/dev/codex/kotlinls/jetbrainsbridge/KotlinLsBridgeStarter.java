@@ -15,7 +15,6 @@ import com.intellij.openapi.application.Application;
 import com.intellij.openapi.application.ApplicationManager;
 import com.intellij.openapi.application.ApplicationStarterBase;
 import com.intellij.openapi.application.ModalityState;
-import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.command.WriteCommandAction;
 import com.intellij.openapi.editor.Document;
 import com.intellij.openapi.editor.Editor;
@@ -23,8 +22,10 @@ import com.intellij.openapi.editor.EditorFactory;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.project.DumbService;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
+import com.intellij.openapi.wm.ex.WindowManagerEx;
 import com.intellij.psi.PsiClass;
 import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiField;
@@ -101,6 +102,10 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
                 try {
                     if ("complete".equals(request.method())) {
                         response = handleCompletion(request);
+                    } else if ("sync".equals(request.method())) {
+                        response = handleSync(request);
+                    } else if ("prime".equals(request.method())) {
+                        response = handleSync(request);
                     } else if ("ping".equals(request.method())) {
                         response = new BridgeResponse(request.id(), true, "pong", List.of(), null);
                     } else {
@@ -132,25 +137,36 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             return new BridgeResponse(request.id(), false, null, List.of(), "Missing completion payload");
         }
         Project project = openProject(payload.projectRoot());
-        DumbService.getInstance(project).waitForSmartMode();
-        VirtualFile virtualFile = ApplicationManager.getApplication().runReadAction(
-            (Computable<VirtualFile>) () -> LocalFileSystem.getInstance().refreshAndFindFileByNioFile(Path.of(payload.filePath()))
-        );
-        if (virtualFile == null) {
+        DocumentHandle handle = loadDocumentHandle(payload.filePath());
+        if (handle == null) {
             return new BridgeResponse(request.id(), false, null, List.of(), "Unable to open file: " + payload.filePath());
         }
-        Document document = ApplicationManager.getApplication().runReadAction(
-            (Computable<Document>) () -> FileDocumentManager.getInstance().getDocument(virtualFile)
-        );
-        if (document == null) {
-            return new BridgeResponse(request.id(), false, null, List.of(), "Unable to load document: " + payload.filePath());
-        }
-        replaceDocumentText(project, document, payload.text());
-        List<BridgeCompletionItem> smartItems = collectCompletionItems(project, virtualFile, document, payload.offset(), CompletionType.SMART, payload.limit());
-        replaceDocumentText(project, document, payload.text());
-        List<BridgeCompletionItem> basicItems = collectCompletionItems(project, virtualFile, document, payload.offset(), CompletionType.BASIC, payload.limit());
+        String currentText = payload.text() == null ? handle.document().getText() : payload.text();
+        replaceDocumentText(project, handle.document(), currentText);
+        DumbService.getInstance(project).waitForSmartMode();
+        replaceDocumentText(project, handle.document(), currentText);
+        List<BridgeCompletionItem> smartItems = collectCompletionItems(project, handle.virtualFile(), handle.document(), payload.offset(), CompletionType.SMART, payload.limit());
+        replaceDocumentText(project, handle.document(), currentText);
+        List<BridgeCompletionItem> basicItems = collectCompletionItems(project, handle.virtualFile(), handle.document(), payload.offset(), CompletionType.BASIC, payload.limit());
         List<BridgeCompletionItem> merged = mergeCompletions(smartItems, basicItems, payload.limit());
         return new BridgeResponse(request.id(), true, null, merged, null);
+    }
+
+    private BridgeResponse handleSync(BridgeRequest request) {
+        CompletionPayload payload = request.payload();
+        if (payload == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), "Missing sync payload");
+        }
+        Project project = openProject(payload.projectRoot());
+        if (payload.filePath() == null || payload.filePath().isBlank()) {
+            return new BridgeResponse(request.id(), true, "synced", List.of(), null);
+        }
+        DocumentHandle handle = loadDocumentHandle(payload.filePath());
+        if (handle == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), "Unable to open file: " + payload.filePath());
+        }
+        replaceDocumentText(project, handle.document(), payload.text() == null ? handle.document().getText() : payload.text());
+        return new BridgeResponse(request.id(), true, "synced", List.of(), null);
     }
 
     private Project openProject(String projectRoot) {
@@ -165,11 +181,24 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
                 throw new IllegalStateException("Unable to open project: " + projectRoot);
             }
             TrustedProjects.setProjectTrusted(project, true);
+            hideProjectFrame(project);
             return project;
         });
     }
 
+    private void hideProjectFrame(Project project) {
+        ApplicationManager.getApplication().invokeLater(() -> {
+            var frame = WindowManagerEx.getInstanceEx().getFrame(project);
+            if (frame != null) {
+                frame.setVisible(false);
+            }
+        }, ModalityState.nonModal());
+    }
+
     private void replaceDocumentText(Project project, Document document, String text) {
+        if (text.equals(document.getText())) {
+            return;
+        }
         ApplicationManager.getApplication().invokeAndWait(
             () -> WriteCommandAction.runWriteCommandAction(
                 project,
@@ -180,6 +209,22 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             ),
             ModalityState.nonModal()
         );
+    }
+
+    private DocumentHandle loadDocumentHandle(String filePath) {
+        VirtualFile virtualFile = ApplicationManager.getApplication().runReadAction(
+            (Computable<VirtualFile>) () -> LocalFileSystem.getInstance().refreshAndFindFileByNioFile(Path.of(filePath))
+        );
+        if (virtualFile == null) {
+            return null;
+        }
+        Document document = ApplicationManager.getApplication().runReadAction(
+            (Computable<Document>) () -> FileDocumentManager.getInstance().getDocument(virtualFile)
+        );
+        if (document == null) {
+            return null;
+        }
+        return new DocumentHandle(virtualFile, document);
     }
 
     private List<BridgeCompletionItem> collectCompletionItems(
@@ -388,6 +433,8 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
     private record CompletionPayload(String projectRoot, String filePath, String text, int offset, int limit) {}
 
     private record BridgeResponse(long id, boolean success, String message, List<BridgeCompletionItem> items, String error) {}
+
+    private record DocumentHandle(VirtualFile virtualFile, Document document) {}
 
     private record BridgeCompletionItem(
         String label,

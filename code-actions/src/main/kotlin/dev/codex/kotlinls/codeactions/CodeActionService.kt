@@ -32,7 +32,7 @@ class CodeActionService(
         val file = snapshot.filesByUri[uri]
         val requestedKinds = params.context.only.orEmpty()
         val wantsQuickFixes = wantsKind("quickfix", requestedKinds)
-        val wantsIntentions = wantsKind("refactor.rewrite", requestedKinds)
+        val wantsIntentions = requestedKinds.isNotEmpty() && wantsKind("refactor.rewrite", requestedKinds)
         val wantsOrganizeImports = wantsKind("source.organizeImports", requestedKinds)
         val organized = if (wantsOrganizeImports) formattingService.organizeImportsText(snapshot, uri) else null
         if (file != null && organized != null && organized != file.text) {
@@ -67,6 +67,25 @@ class CodeActionService(
             .distinctBy { action ->
             listOf(action.title, action.kind, action.edit?.changes?.toString(), action.command?.command).joinToString("::")
         }
+    }
+
+    fun lightweightCodeActions(
+        index: WorkspaceIndex,
+        uri: String,
+        text: String,
+        params: CodeActionParams,
+    ): List<CodeAction> {
+        val requestedKinds = params.context.only.orEmpty()
+        val wantsQuickFixes = wantsKind("quickfix", requestedKinds)
+        if (!wantsQuickFixes) {
+            return emptyList()
+        }
+        return params.context.diagnostics
+            .flatMap { diagnostic -> diagnosticFixesFromText(index, uri, text, diagnostic) }
+            .filter { action -> wantsKind(action.kind ?: "quickfix", requestedKinds) }
+            .distinctBy { action ->
+                listOf(action.title, action.kind, action.edit?.changes?.toString(), action.command?.command).joinToString("::")
+            }
     }
 
     private fun diagnosticFixes(
@@ -124,6 +143,59 @@ class CodeActionService(
         return actions
     }
 
+    private fun diagnosticFixesFromText(
+        index: WorkspaceIndex,
+        uri: String,
+        text: String,
+        diagnostic: Diagnostic,
+    ): List<CodeAction> {
+        val actions = mutableListOf<CodeAction>()
+        when {
+            diagnostic.code == "package-mismatch" -> {
+                val expected = Regex("""Expected `([^`]+)`""").find(diagnostic.message)?.groupValues?.get(1) ?: return emptyList()
+                actions += CodeAction(
+                    title = "Fix package declaration to $expected",
+                    kind = "quickfix",
+                    diagnostics = listOf(diagnostic),
+                    edit = WorkspaceEdit(
+                        changes = mapOf(
+                            uri to listOf(
+                                TextEdit(
+                                    range = diagnostic.range,
+                                    newText = "package $expected",
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                return actions
+            }
+        }
+        if (diagnostic.message.contains("Unused import", ignoreCase = true)) {
+            unusedImportAction(text, uri, diagnostic)?.let(actions::add)
+        }
+        if (diagnostic.message.contains("opt-in", ignoreCase = true) || diagnostic.message.contains("@OptIn(", ignoreCase = true)) {
+            addFileOptInAction(text, uri, diagnostic)?.let(actions::add)
+        }
+        if (
+            diagnostic.message.contains("module classpath", ignoreCase = true) ||
+            diagnostic.message.contains("missing or conflicting dependencies", ignoreCase = true)
+        ) {
+            actions += CodeAction(
+                title = "Reimport Gradle project model",
+                kind = "quickfix",
+                diagnostics = listOf(diagnostic),
+                command = Command(
+                    title = "Reimport Gradle project model",
+                    command = "kotlinls.reimport",
+                    arguments = emptyList(),
+                ),
+            )
+        }
+        actions += unresolvedReferenceActions(index, uri, diagnostic)
+        return actions
+    }
+
     private fun unresolvedReferenceActions(
         index: WorkspaceIndex,
         uri: String,
@@ -157,10 +229,16 @@ class CodeActionService(
         snapshot: WorkspaceAnalysisSnapshot,
         uri: String,
         diagnostic: Diagnostic,
+    ): CodeAction? =
+        snapshot.filesByUri[uri]?.let { file -> unusedImportAction(file.text, uri, diagnostic) }
+
+    private fun unusedImportAction(
+        text: String,
+        uri: String,
+        diagnostic: Diagnostic,
     ): CodeAction? {
-        val file = snapshot.filesByUri[uri] ?: return null
         val line = diagnostic.range.start.line.coerceAtLeast(0)
-        val lines = file.text.lines()
+        val lines = text.lines()
         if (line >= lines.size) return null
         val end = if (line + 1 < lines.size) {
             Position(line + 1, 0)
@@ -188,8 +266,14 @@ class CodeActionService(
         snapshot: WorkspaceAnalysisSnapshot,
         uri: String,
         diagnostic: Diagnostic,
+    ): CodeAction? =
+        snapshot.filesByUri[uri]?.let { file -> addFileOptInAction(file.text, uri, diagnostic) }
+
+    private fun addFileOptInAction(
+        text: String,
+        uri: String,
+        diagnostic: Diagnostic,
     ): CodeAction? {
-        val file = snapshot.filesByUri[uri] ?: return null
         val annotationClass = Regex("""@OptIn\(([^)]+)::class\)""")
             .find(diagnostic.message)
             ?.groupValues
@@ -200,7 +284,7 @@ class CodeActionService(
                 ?.get(1)
             ?: return null
         val marker = "@file:OptIn($annotationClass::class)"
-        if (file.text.contains(marker)) return null
+        if (text.contains(marker)) return null
         return CodeAction(
             title = "Add file opt-in for ${annotationClass.substringAfterLast('.')}",
             kind = "quickfix",

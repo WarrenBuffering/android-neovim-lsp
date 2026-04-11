@@ -20,7 +20,7 @@ import kotlin.concurrent.thread
 import kotlin.io.path.name
 import kotlin.io.path.readLines
 
-internal class JetBrainsCompletionBridge private constructor(
+class JetBrainsCompletionBridge private constructor(
     private val javaBinary: Path,
     private val vmOptions: List<String>,
     private val jvmArgs: List<String>,
@@ -51,6 +51,7 @@ internal class JetBrainsCompletionBridge private constructor(
                 add("-Didea.config.path=${sandboxRoot.resolve("config")}")
                 add("-Didea.system.path=${sandboxRoot.resolve("system")}")
                 add("-Didea.log.path=${sandboxRoot.resolve("log")}")
+                add("-Dapple.awt.UIElement=true")
                 add("-Didea.kotlin.plugin.use.k2=true")
                 add("-Didea.load.plugins.id=org.jetbrains.kotlin,com.intellij.java,dev.codex.kotlinls.jetbrains-bridge")
                 add("-Didea.required.plugins.id=org.jetbrains.kotlin,com.intellij.java,dev.codex.kotlinls.jetbrains-bridge")
@@ -84,6 +85,35 @@ internal class JetBrainsCompletionBridge private constructor(
         )
     }
 
+    val detectedIdeaHome: Path
+        get() = ideaHome
+
+    @Synchronized
+    fun syncDocument(
+        projectRoot: Path,
+        filePath: Path? = null,
+        text: String? = null,
+    ): Boolean {
+        return sendRequest(
+            method = "sync",
+            payload = payloadFor(projectRoot, filePath, text, offset = 0, limit = 0),
+        ).success
+    }
+
+    @Synchronized
+    fun prime(
+        projectRoot: Path,
+        filePath: Path? = null,
+        text: String? = null,
+    ): Boolean = syncDocument(projectRoot, filePath, text)
+
+    @Synchronized
+    fun ensureProject(projectRoot: Path): Boolean =
+        sendRequest(
+            method = "sync",
+            payload = payloadFor(projectRoot, filePath = null, text = null, offset = 0, limit = 0),
+        ).success
+
     @Synchronized
     fun complete(
         projectRoot: Path,
@@ -92,21 +122,10 @@ internal class JetBrainsCompletionBridge private constructor(
         offset: Int,
         limit: Int = 100,
     ): List<JetBrainsBridgeCompletion>? {
-        val request = BridgeRequest(
-            id = requestIds.getAndIncrement(),
+        val response = sendRequest(
             method = "complete",
-            payload = CompletionPayload(
-                projectRoot = projectRoot.toString(),
-                filePath = filePath.toString(),
-                text = text,
-                offset = offset,
-                limit = limit,
-            ),
+            payload = payloadFor(projectRoot, filePath, text, offset, limit),
         )
-        writer.write(Json.mapper.writeValueAsString(request))
-        writer.write('\n'.code)
-        writer.flush()
-        val response = readResponse()
         if (!response.success) return null
         return response.items
     }
@@ -123,6 +142,46 @@ internal class JetBrainsCompletionBridge private constructor(
             }
         }
         sandboxRoot.deleteRecursivelyIfExists()
+    }
+
+    private fun payloadFor(
+        projectRoot: Path,
+        filePath: Path?,
+        text: String?,
+        offset: Int,
+        limit: Int,
+    ): CompletionPayload =
+        if (filePath != null && text != null) {
+            CompletionPayload(
+                projectRoot = projectRoot.toString(),
+                filePath = filePath.toString(),
+                text = text,
+                offset = offset,
+                limit = limit,
+            )
+        } else {
+            CompletionPayload(
+                projectRoot = projectRoot.toString(),
+                filePath = "",
+                text = "",
+                offset = offset,
+                limit = limit,
+            )
+        }
+
+    private fun sendRequest(
+        method: String,
+        payload: CompletionPayload,
+    ): BridgeResponse {
+        val request = BridgeRequest(
+            id = requestIds.getAndIncrement(),
+            method = method,
+            payload = payload,
+        )
+        writer.write(Json.mapper.writeValueAsString(request))
+        writer.write('\n'.code)
+        writer.flush()
+        return readResponse()
     }
 
     private fun preparePluginDir(): Path {
@@ -153,7 +212,7 @@ internal class JetBrainsCompletionBridge private constructor(
     }
 
     companion object {
-        fun detect(): JetBrainsCompletionBridge? {
+        fun detect(forceEnable: Boolean = false): JetBrainsCompletionBridge? {
             val configured = System.getProperty("kotlinls.intellijHome")
                 ?: System.getenv("KOTLINLS_INTELLIJ_HOME")
             if (!configured.isNullOrBlank()) {
@@ -161,7 +220,7 @@ internal class JetBrainsCompletionBridge private constructor(
                 val extraPluginJars = locateSupplementalPluginJars()
                 return fromIdeaHome(Path.of(configured), pluginJar, extraPluginJars)
             }
-            if (!intellijBridgeEnabled()) {
+            if (!forceEnable && !intellijBridgeEnabled()) {
                 return null
             }
             if ((System.getProperty("kotlinls.disableIntellijCompletionBridge")
@@ -299,7 +358,7 @@ internal class JetBrainsCompletionBridge private constructor(
     }
 }
 
-internal data class JetBrainsBridgeCompletion(
+data class JetBrainsBridgeCompletion(
     val label: String,
     val lookupString: String,
     val allLookupStrings: List<String> = emptyList(),

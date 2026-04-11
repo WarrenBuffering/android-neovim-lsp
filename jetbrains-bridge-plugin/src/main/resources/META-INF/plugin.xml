@@ -6,7 +6,7 @@
   <depends>org.jetbrains.kotlin</depends>
 
   <extensions defaultExtensionNs="com.intellij">
-    <appStarter implementation="dev.codex.kotlinls.jetbrainsbridge.KotlinLsBridgeStarter"/>
+    <appStarter id="kotlinls-bridge" implementation="dev.codex.kotlinls.jetbrainsbridge.KotlinLsBridgeStarter"/>
   </extensions>
 
   <extensions defaultExtensionNs="org.jetbrains.kotlin">

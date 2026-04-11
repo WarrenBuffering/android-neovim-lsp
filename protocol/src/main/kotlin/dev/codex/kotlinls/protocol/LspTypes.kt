@@ -168,7 +168,7 @@ data class ServerCapabilities(
     val workspaceSymbolProvider: Boolean = true,
     val documentFormattingProvider: Boolean = true,
     val documentRangeFormattingProvider: Boolean = true,
-    val renameProvider: RenameOptions = RenameOptions(),
+    val renameProvider: Any? = RenameOptions(),
     val codeActionProvider: CodeActionOptions? = null,
     val completionProvider: CompletionOptions? = null,
     val signatureHelpProvider: SignatureHelpOptions? = null,

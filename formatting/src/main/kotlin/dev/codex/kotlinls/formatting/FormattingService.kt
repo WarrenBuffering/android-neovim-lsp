@@ -51,6 +51,35 @@ class FormattingService(
         intellijFormatterCommand ?: detectExternalFormatterCommand()
     }
 
+    fun formatDocumentText(
+        path: Path,
+        text: String,
+        params: DocumentFormattingParams,
+        requireExternalFormatter: Boolean = false,
+    ): List<TextEdit> {
+        val formatted = if (requireExternalFormatter) {
+            commandLineFormat(path, text) ?: bridgeFormat(path, text) ?: return emptyList()
+        } else {
+            formatText(
+                path = path,
+                text = text,
+                options = params.options,
+                imports = emptyList(),
+                usedImports = UsedImportInfo(emptySet(), emptySet()),
+            )
+        }
+        return diffEdits(text, formatted)
+    }
+
+    fun formatRangeText(
+        path: Path,
+        text: String,
+        params: DocumentRangeFormattingParams,
+        requireExternalFormatter: Boolean = false,
+    ): List<TextEdit> {
+        return emptyList()
+    }
+
     fun formatDocument(snapshot: WorkspaceAnalysisSnapshot, params: DocumentFormattingParams): List<TextEdit> {
         val file = snapshot.filesByUri[params.textDocument.uri] ?: return emptyList()
         val formatted = formatText(
