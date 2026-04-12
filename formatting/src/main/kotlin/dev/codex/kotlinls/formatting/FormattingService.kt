@@ -58,7 +58,7 @@ class FormattingService(
         requireExternalFormatter: Boolean = false,
     ): List<TextEdit> {
         val formatted = if (requireExternalFormatter) {
-            commandLineFormat(path, text) ?: bridgeFormat(path, text) ?: return emptyList()
+            requireExternalFormatterText(path, text)
         } else {
             formatText(
                 path = path,
@@ -77,8 +77,17 @@ class FormattingService(
         params: DocumentRangeFormattingParams,
         requireExternalFormatter: Boolean = false,
     ): List<TextEdit> {
+        if (requireExternalFormatter) {
+            val formatted = requireExternalFormatterText(path, text)
+            return diffEdits(text, formatted)
+        }
         return emptyList()
     }
+
+    fun editsForFormattedText(
+        original: String,
+        formatted: String,
+    ): List<TextEdit> = diffEdits(original, formatted)
 
     fun formatDocument(snapshot: WorkspaceAnalysisSnapshot, params: DocumentFormattingParams): List<TextEdit> {
         val file = snapshot.filesByUri[params.textDocument.uri] ?: return emptyList()
@@ -132,8 +141,8 @@ class FormattingService(
         imports: List<KtImportDirective>,
         usedImports: UsedImportInfo,
     ): String =
-        commandLineFormat(path, text)
-            ?: bridgeFormat(path, text)
+        commandLineFormat(path, text).formattedText
+            ?: bridgeFormat(path, text).formattedText
             ?: normalizeWhitespace(organizeImports(path, text, imports, usedImports))
 
     private fun formatScopeText(
@@ -193,8 +202,26 @@ class FormattingService(
         return formattedWithMarkers.substring(formattedStart + startMarker.length, formattedEnd)
     }
 
-    private fun bridgeFormat(path: Path, text: String): String? {
-        val bridge = preferredFormatterBridge(path) ?: return null
+    private fun requireExternalFormatterText(path: Path, text: String): String {
+        val commandResult = commandLineFormat(path, text)
+        if (commandResult.formattedText != null) {
+            return commandResult.formattedText
+        }
+
+        val bridgeResult = bridgeFormat(path, text)
+        if (bridgeResult.formattedText != null) {
+            return bridgeResult.formattedText
+        }
+
+        val error = listOfNotNull(commandResult.error, bridgeResult.error).joinToString("; ")
+        if (error.isNotBlank()) {
+            throw IllegalStateException(error)
+        }
+        throw IllegalStateException("Kotlin formatter unavailable")
+    }
+
+    private fun bridgeFormat(path: Path, text: String): FormatterInvocationResult {
+        val bridge = preferredFormatterBridge(path) ?: return FormatterInvocationResult()
         return runCatching {
             val tempFile = createFormatterTempFile(path)
             try {
@@ -204,11 +231,22 @@ class FormattingService(
             } finally {
                 Files.deleteIfExists(tempFile)
             }
-        }.getOrNull()
+        }.fold(
+            onSuccess = { formatted ->
+                if (formatted != null) {
+                    FormatterInvocationResult(formattedText = formatted)
+                } else {
+                    FormatterInvocationResult(error = "JetBrains formatter bridge returned no result")
+                }
+            },
+            onFailure = { error ->
+                FormatterInvocationResult(error = "JetBrains formatter bridge failed: ${error.message ?: error::class.java.simpleName}")
+            },
+        )
     }
 
-    private fun commandLineFormat(path: Path, text: String): String? {
-        val command = resolvedIntellijFormatterCommand ?: return null
+    private fun commandLineFormat(path: Path, text: String): FormatterInvocationResult {
+        val command = resolvedIntellijFormatterCommand ?: return FormatterInvocationResult()
         return runCatching {
             val tempFile = createFormatterTempFile(path)
             try {
@@ -219,17 +257,29 @@ class FormattingService(
                     .start()
                 if (!process.waitFor(formatterTimeoutMillis, TimeUnit.MILLISECONDS)) {
                     process.destroyForcibly()
-                    return@runCatching null
+                    return@runCatching FormatterInvocationResult(error = "Kotlin formatter command timed out after ${formatterTimeoutMillis}ms")
                 }
-                process.inputStream.readAllBytes()
+                val output = process.inputStream.readAllBytes().toString(StandardCharsets.UTF_8)
                 if (process.exitValue() != 0) {
-                    return@runCatching null
+                    val summary = output.lineSequence().map(String::trim).firstOrNull { it.isNotEmpty() }
+                    return@runCatching FormatterInvocationResult(
+                        error = buildString {
+                            append("Kotlin formatter command exited with ")
+                            append(process.exitValue())
+                            if (!summary.isNullOrBlank()) {
+                                append(": ")
+                                append(summary)
+                            }
+                        },
+                    )
                 }
-                Files.readString(tempFile, StandardCharsets.UTF_8)
+                FormatterInvocationResult(formattedText = Files.readString(tempFile, StandardCharsets.UTF_8))
             } finally {
                 Files.deleteIfExists(tempFile)
             }
-        }.getOrNull()
+        }.getOrElse { error ->
+            FormatterInvocationResult(error = "Kotlin formatter command failed: ${error.message ?: error::class.java.simpleName}")
+        }
     }
 
     private fun hasEditorConfig(path: Path): Boolean =
@@ -616,9 +666,8 @@ class FormattingService(
         val fileName = path.fileName.toString()
         val extension = fileName.substringAfterLast('.', "")
         val tempName = buildString {
-            append(".")
             append(fileName.substringBeforeLast('.', fileName))
-            append(".kls-format.")
+            append(".kls-format-")
             append(UUID.randomUUID().toString().replace("-", ""))
             if (extension.isNotEmpty()) {
                 append(".")
@@ -655,6 +704,11 @@ class FormattingService(
 private data class TextSpan(
     val start: Int,
     val endExclusive: Int,
+)
+
+private data class FormatterInvocationResult(
+    val formattedText: String? = null,
+    val error: String? = null,
 )
 
 private data class StructuralStep(

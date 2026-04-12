@@ -40,13 +40,7 @@ import kotlin.io.path.name
 import kotlin.io.path.readText
 import kotlin.io.path.walk
 
-class WorkspaceIndexBuilder(
-    private val externalSourceMirror: ExternalSourceMirror = ExternalSourceMirror(),
-    private val persistentSupportCache: PersistentSupportSymbolCache = PersistentSupportSymbolCache(),
-) {
-    private val cacheLock = Any()
-    private val supportSymbolLayers = linkedMapOf<Path, SupportSymbolLayer>()
-
+class WorkspaceIndexBuilder {
     fun build(
         snapshot: WorkspaceAnalysisSnapshot,
         targetPaths: Set<Path>? = null,
@@ -72,9 +66,6 @@ class WorkspaceIndexBuilder(
                 progress?.invoke("Indexed ${file.originalPath.fileName}", index + 1, totalFiles)
             }
         }
-        val supportSymbols = supportSymbols(snapshot, allowCached = targetPaths != null)
-        symbolAccumulator += supportSymbols.symbols
-
         val references = mutableListOf<IndexedReference>()
         val callEdges = mutableListOf<CallEdge>()
 
@@ -116,82 +107,6 @@ class WorkspaceIndexBuilder(
     private fun shouldReportProgress(current: Int, total: Int): Boolean =
         current == 1 || current == total || current % 25 == 0
 
-    private fun supportSymbols(
-        snapshot: WorkspaceAnalysisSnapshot,
-        allowCached: Boolean,
-    ): SupportSymbolLayer {
-        val projectRoot = snapshot.project.root.normalize()
-        val fingerprint = supportLayerFingerprint(snapshot.project)
-        if (allowCached) {
-            synchronized(cacheLock) {
-                supportSymbolLayers[projectRoot]
-                    ?.takeIf { it.fingerprint == fingerprint }
-                    ?.let { return it }
-            }
-        }
-        persistentSupportCache.load(projectRoot, fingerprint)?.let { cached ->
-            synchronized(cacheLock) {
-                supportSymbolLayers[projectRoot] = cached
-            }
-            return cached
-        }
-
-        val computed = SupportSymbolLayer(
-            fingerprint = fingerprint,
-            symbols = buildJavaSourceSymbols(snapshot.project) +
-                buildExternalLibrarySymbols(snapshot) +
-                buildJdkSourceSymbols(),
-        )
-        synchronized(cacheLock) {
-            supportSymbolLayers[projectRoot] = computed
-        }
-        persistentSupportCache.save(projectRoot, computed)
-        return computed
-    }
-
-    private fun supportLayerFingerprint(project: dev.codex.kotlinls.projectimport.ImportedProject): String =
-        buildString {
-            project.modules.sortedBy { it.gradlePath }.forEach { module ->
-                append(module.gradlePath)
-                append('|')
-                module.javaSourceRoots.sortedBy(Path::toString).forEach { root ->
-                    appendTreeFingerprint(this, "java", root.normalize())
-                }
-                append('|')
-                module.classpathSourceJars.sortedBy(Path::toString).forEach { jar ->
-                    appendFileFingerprint(this, "sourceJar", jar.normalize())
-                }
-                append('\n')
-            }
-            defaultJdkSourceArchive()?.let { srcZip ->
-                appendFileFingerprint(this, "jdk", srcZip.normalize())
-            }
-        }
-
-    private fun appendTreeFingerprint(builder: StringBuilder, label: String, root: Path) {
-        val normalizedRoot = root.normalize()
-        builder.append(label).append('=').append(normalizedRoot).append('|')
-        if (!Files.exists(normalizedRoot)) {
-            builder.append("missing").append(';')
-            return
-        }
-        normalizedRoot.walk()
-            .filter { it.isRegularFile() && it.extension == "java" }
-            .sortedBy(Path::toString)
-            .forEach { path ->
-                appendFileFingerprint(builder, label, path.normalize())
-            }
-    }
-
-    private fun appendFileFingerprint(builder: StringBuilder, label: String, path: Path) {
-        val normalized = path.normalize()
-        builder.append(label).append(':').append(normalized).append(':')
-        builder.append(runCatching { Files.size(normalized) }.getOrDefault(0L))
-        builder.append(':')
-        builder.append(runCatching { Files.getLastModifiedTime(normalized).toMillis() }.getOrDefault(0L))
-        builder.append(';')
-    }
-
     private fun KtNamedDeclaration.toIndexedSymbol(
         file: AnalyzedFile,
         bindingContext: BindingContext,
@@ -231,80 +146,6 @@ class WorkspaceIndexBuilder(
             parameterCount = parameterCount(descriptor?.descriptor),
             supertypes = supertypes,
         )
-    }
-
-    private fun buildJavaSourceSymbols(project: dev.codex.kotlinls.projectimport.ImportedProject): List<IndexedSymbol> =
-        project.modules.flatMap { module ->
-            module.javaSourceRoots.flatMap { root ->
-                if (!root.toFile().exists()) return@flatMap emptyList()
-                root.walk()
-                    .filter { it.isRegularFile() && it.extension == "java" }
-                    .flatMap { path -> JavaSourceIndexer.index(path, module.name) }
-                    .toList()
-            }
-        }
-
-    private fun buildExternalLibrarySymbols(snapshot: WorkspaceAnalysisSnapshot): List<IndexedSymbol> {
-        val project = snapshot.files.firstOrNull()?.ktFile?.project ?: return emptyList()
-        val psiFactory = KtPsiFactory(project, false)
-        return snapshot.project.modules
-            .flatMap { module -> module.classpathSourceJars.map { jar -> module.name to jar } }
-            .distinctBy { (_, jar) -> jar.normalize() }
-            .flatMap { (moduleName, jar) ->
-                val extractedRoot = runCatching { externalSourceMirror.materialize(jar) }.getOrNull() ?: return@flatMap emptyList()
-                extractedRoot.walk()
-                    .filter { it.isRegularFile() && it.extension in setOf("kt", "kts", "java") }
-                    .flatMap { path ->
-                        when (path.extension) {
-                            "java" -> JavaSourceIndexer.index(path, moduleName)
-                            else -> kotlinSourceSymbols(path, moduleName, psiFactory)
-                        }
-                    }
-                    .toList()
-            }
-    }
-
-    private fun kotlinSourceSymbols(
-        path: java.nio.file.Path,
-        moduleName: String,
-        psiFactory: KtPsiFactory,
-    ): List<IndexedSymbol> {
-        val text = runCatching { path.readText() }.getOrNull() ?: return emptyList()
-        val ktFile = psiFactory.createFile(path.fileName.toString(), text)
-        val packageName = ktFile.packageFqName.asString()
-        return ktFile.collectDescendantsOfType<KtNamedDeclaration>()
-            .mapNotNull { declaration ->
-                if (!declaration.isExternalIndexCandidate()) return@mapNotNull null
-                val name = externalDeclarationName(declaration) ?: return@mapNotNull null
-                val fqName = externalFqName(packageName, declaration, name)
-                val selectionTarget = declaration.nameIdentifier ?: declaration
-                IndexedSymbol(
-                    id = fqName ?: "${path.toUri()}#$name@${declaration.textRange.startOffset}",
-                    name = name,
-                    fqName = fqName,
-                    kind = externalSymbolKind(declaration),
-                    path = path,
-                    uri = path.toUri().toString(),
-                    range = ktFile.rangeOf(declaration.textRange.startOffset, declaration.textRange.endOffset),
-                    selectionRange = ktFile.rangeOf(selectionTarget.textRange.startOffset, selectionTarget.textRange.endOffset),
-                    containerName = declaration.containingClassOrObject?.name,
-                    containerFqName = declaration.containingClassOrObject?.let { owner ->
-                        externalFqName(packageName, owner, owner.name)
-                    },
-                    signature = declaration.signatureText(),
-                    documentation = KDocMarkdownRenderer.render(declaration.docComment),
-                    packageName = packageName,
-                    moduleName = moduleName,
-                    importable = declaration.parent is KtFile,
-                    receiverType = (declaration as? KtCallableDeclaration)?.receiverTypeReference?.text,
-                    resultType = externalResultType(packageName, declaration, fqName),
-                    parameterCount = externalParameterCount(declaration),
-                    supertypes = (declaration as? KtClassOrObject)
-                        ?.superTypeListEntries
-                        ?.mapNotNull { it.typeReference?.text }
-                        .orEmpty(),
-                )
-            }
     }
 
     private fun symbolKind(
@@ -376,106 +217,6 @@ class WorkspaceIndexBuilder(
     private fun parameterCount(descriptor: DeclarationDescriptor?): Int =
         (descriptor as? CallableDescriptor)?.valueParameters?.size ?: 0
 
-    private fun buildJdkSourceSymbols(): List<IndexedSymbol> {
-        val srcZip = defaultJdkSourceArchive() ?: return emptyList()
-        val extractedRoot = runCatching { externalSourceMirror.materialize(srcZip) }.getOrNull() ?: return emptyList()
-        return extractedRoot.walk()
-            .filter { path ->
-                path.isRegularFile() &&
-                    path.extension == "java" &&
-                    path.toString().contains("/java.base/java/") &&
-                    jdkPackageAllowed(path)
-            }
-            .flatMap { path -> JavaSourceIndexer.index(path, "jdk") }
-            .toList()
-    }
-
-    private fun defaultJdkSourceArchive(): java.nio.file.Path? {
-        val javaHome = java.nio.file.Path.of(System.getProperty("java.home"))
-        val candidates = listOf(
-            javaHome.resolve("lib/src.zip"),
-            javaHome.resolve("../lib/src.zip").normalize(),
-            javaHome.resolve("../../lib/src.zip").normalize(),
-        )
-        return candidates.firstOrNull { it.isRegularFile() }
-    }
-
-    private fun jdkPackageAllowed(path: java.nio.file.Path): Boolean {
-        val normalized = path.toString().replace('\\', '/')
-        return listOf(
-            "/java.base/java/lang/",
-            "/java.base/java/util/",
-            "/java.base/java/io/",
-            "/java.base/java/nio/",
-            "/java.base/java/time/",
-            "/java.base/java/math/",
-        ).any(normalized::contains)
-    }
-
-}
-
-data class SupportSymbolLayer(
-    val fingerprint: String,
-    val symbols: List<IndexedSymbol>,
-)
-
-private fun externalDeclarationName(declaration: KtNamedDeclaration): String? =
-    declaration.name ?: (declaration as? KtConstructor<*>)?.containingClassOrObject?.name
-
-private fun externalFqName(
-    packageName: String,
-    declaration: KtNamedDeclaration,
-    resolvedName: String?,
-): String? {
-    val name = resolvedName ?: return null
-    val owners = declaration.parentsWithSelf
-        .filterIsInstance<KtNamedDeclaration>()
-        .drop(1)
-        .mapNotNull { it.name }
-        .toList()
-        .asReversed()
-    return (listOfNotNull(packageName.takeIf { it.isNotBlank() }) + owners + name).joinToString(".")
-}
-
-private fun externalSymbolKind(declaration: KtNamedDeclaration): Int = when {
-    declaration is KtClass && declaration.isInterface() -> SymbolKind.INTERFACE
-    declaration is KtClass && declaration.isEnum() -> SymbolKind.ENUM
-    declaration is KtClassOrObject -> SymbolKind.CLASS
-    declaration is KtObjectDeclaration -> SymbolKind.OBJECT
-    declaration is KtEnumEntry -> SymbolKind.ENUM_MEMBER
-    declaration is KtNamedFunction -> SymbolKind.FUNCTION
-    declaration is KtConstructor<*> -> SymbolKind.CONSTRUCTOR
-    declaration is KtProperty -> SymbolKind.PROPERTY
-    declaration is KtParameter -> SymbolKind.VARIABLE
-    declaration is KtTypeAlias -> SymbolKind.TYPE_PARAMETER
-    else -> SymbolKind.VARIABLE
-}
-
-private fun externalResultType(
-    packageName: String,
-    declaration: KtNamedDeclaration,
-    fqName: String?,
-): String? = when (declaration) {
-    is KtConstructor<*> -> declaration.containingClassOrObject?.let { owner ->
-        externalFqName(packageName, owner, owner.name)
-    }
-
-    is KtNamedFunction -> declaration.typeReference?.text
-    is KtProperty -> declaration.typeReference?.text
-    is KtClassOrObject -> fqName
-    else -> null
-}
-
-private fun externalParameterCount(declaration: KtNamedDeclaration): Int = when (declaration) {
-    is KtNamedFunction -> declaration.valueParameters.size
-    is KtConstructor<*> -> declaration.valueParameters.size
-    else -> 0
-}
-
-private fun KtNamedDeclaration.isExternalIndexCandidate(): Boolean {
-    if (this is KtProperty && isLocal) return false
-    val parent = parent
-    return parent is KtFile || parent is KtClassOrObject || this is KtConstructor<*>
 }
 
 private fun KtDeclaration.signatureText(): String =

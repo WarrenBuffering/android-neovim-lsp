@@ -94,9 +94,9 @@ class LightweightWorkspaceIndexBuilder(
                 .distinct()
                 .mapNotNull { path -> projectCache.files[path.normalize()] }
                 .flatMap { it.symbols.asSequence() }
+                .toList()
                 .distinctBy { it.id }
-                .sortedWith(compareBy({ it.name }, { it.path.toString() }))
-                .toList(),
+                .sortedWith(compareBy({ it.name }, { it.path.toString() })),
             references = emptyList(),
             callEdges = emptyList(),
         )

@@ -11,6 +11,7 @@ import dev.codex.kotlinls.hover.HoverAndSignatureService
 import dev.codex.kotlinls.index.LightweightWorkspaceIndexBuilder
 import dev.codex.kotlinls.index.PersistentSemanticIndexCache
 import dev.codex.kotlinls.index.SourceIndexLookup
+import dev.codex.kotlinls.index.SupportSymbolIndexBuilder
 import dev.codex.kotlinls.index.WorkspaceIndex
 import dev.codex.kotlinls.index.WorkspaceIndexBuilder
 import dev.codex.kotlinls.navigation.NavigationService
@@ -56,6 +57,7 @@ import dev.codex.kotlinls.protocol.WorkspaceSymbolParams
 import dev.codex.kotlinls.refactor.RenameService
 import dev.codex.kotlinls.symbols.SymbolAndSemanticService
 import dev.codex.kotlinls.workspace.ProjectRootDetector
+import dev.codex.kotlinls.workspace.TextDocumentSnapshot
 import dev.codex.kotlinls.workspace.TextDocumentStore
 import dev.codex.kotlinls.workspace.documentUriToPath
 import java.nio.file.Files
@@ -74,6 +76,7 @@ class KotlinLanguageServer(
     private val importer: GradleProjectImporter = GradleProjectImporter(rootDetector),
     private val analyzer: KotlinWorkspaceAnalyzer = KotlinWorkspaceAnalyzer(),
     private val lightweightIndexBuilder: LightweightWorkspaceIndexBuilder = LightweightWorkspaceIndexBuilder(),
+    private val supportSymbolIndexBuilder: SupportSymbolIndexBuilder = SupportSymbolIndexBuilder(),
     private val indexBuilder: WorkspaceIndexBuilder = WorkspaceIndexBuilder(),
     private val semanticIndexCache: PersistentSemanticIndexCache = PersistentSemanticIndexCache(),
     private val diagnosticsService: DiagnosticsService = DiagnosticsService(),
@@ -84,7 +87,7 @@ class KotlinLanguageServer(
     private val renameService: RenameService = RenameService(),
     private val formattingService: FormattingService = FormattingService(),
     private val codeActionService: CodeActionService = CodeActionService(formattingService),
-    private val refreshDebounceMillis: Long = 75L,
+    private val refreshDebounceMillis: Long = 150L,
     private val warmupStartDelayMillis: Long = 3_000L,
 ) {
     private var config: KotlinLsConfig = KotlinLsConfig()
@@ -106,6 +109,9 @@ class KotlinLanguageServer(
     private var lightweightIndex: WorkspaceIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
 
     @Volatile
+    private var supportIndex: WorkspaceIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+
+    @Volatile
     private var combinedIndex: WorkspaceIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
 
     @Volatile
@@ -117,18 +123,24 @@ class KotlinLanguageServer(
     private val warmupExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "kotlin-neovim-lsp-warmup").apply { isDaemon = true }
     }
+    private val supportExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "kotlin-neovim-lsp-support").apply { isDaemon = true }
+    }
     private val persistExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "kotlin-neovim-lsp-persist").apply { isDaemon = true }
     }
     private val refreshLock = Any()
     private val semanticStateLock = Any()
     private val warmupLock = Any()
+    private val supportRefreshLock = Any()
     private var refreshRunning = false
     private var refreshRequested = false
     private var refreshReimportRequested = false
     private var refreshFastIndexRequested = false
     private val pendingSemanticUris = linkedSetOf<String>()
     private var warmupRunning = false
+    private var supportRefreshRunning = false
+    private var pendingSupportRefresh: SupportRefreshRequest? = null
     private var warmupGeneration = 0
     private val warmupQueuedModules = linkedSetOf<String>()
     private val warmupAllowedOpenModules = linkedSetOf<String>()
@@ -158,6 +170,7 @@ class KotlinLanguageServer(
             semanticEngine.close()
             refreshExecutor.shutdownNow()
             warmupExecutor.shutdownNow()
+            supportExecutor.shutdownNow()
             persistExecutor.shutdownNow()
         }
     }
@@ -175,7 +188,14 @@ class KotlinLanguageServer(
                             if (lightweightIndexBuilder.requiresBackgroundRefresh(currentProject)) {
                                 scheduleRefresh(reimportProject = false, rebuildFastIndex = true)
                             }
-                            semanticEngine.onProjectChanged(currentProject)
+                            if (supportIndex.symbols.isEmpty()) {
+                                scheduleSupportRefresh(
+                                    project = currentProject,
+                                    projectGeneration = currentProjectGeneration,
+                                    packageNames = supportPackagesForDocuments(documents.openDocuments()),
+                                    ensureCache = true,
+                                )
+                            }
                             semanticEngine.prefetch(
                                 project = currentProject,
                                 activeDocument = documents.openDocuments().firstOrNull(),
@@ -213,6 +233,11 @@ class KotlinLanguageServer(
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
                     project?.let { currentProject ->
+                        scheduleSupportRefresh(
+                            project = currentProject,
+                            projectGeneration = currentProjectGeneration,
+                            packageNames = supportPackagesForText(params.textDocument.text),
+                        )
                         semanticEngine.prefetch(
                             project = currentProject,
                             activeDocument = documents.get(params.textDocument.uri),
@@ -229,6 +254,13 @@ class KotlinLanguageServer(
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
                     project?.let { currentProject ->
+                        documents.get(params.textDocument.uri)?.text?.let { currentText ->
+                            scheduleSupportRefresh(
+                                project = currentProject,
+                                projectGeneration = currentProjectGeneration,
+                                packageNames = supportPackagesForText(currentText),
+                            )
+                        }
                         semanticEngine.prefetch(
                             project = currentProject,
                             activeDocument = documents.get(params.textDocument.uri),
@@ -236,7 +268,6 @@ class KotlinLanguageServer(
                             projectGeneration = currentProjectGeneration,
                         )
                     }
-                    scheduleSemanticRefresh(params.textDocument.uri)
                 }
                 "textDocument/didClose" -> {
                     val uri = read(message.params, DidCloseTextDocumentParams::class.java).textDocument.uri
@@ -290,7 +321,13 @@ class KotlinLanguageServer(
                             projectGeneration = currentProjectGeneration,
                         )
                         if (semanticItems != null && semanticItems.items.isNotEmpty()) {
-                            return@respond semanticItems
+                            return@respond completionService.mergeSemanticAndIndexCompletions(
+                                index = currentIndex(),
+                                path = source.first,
+                                text = source.second,
+                                params = params,
+                                semantic = semanticItems,
+                            )
                         }
                     }
                     if (source != null) {
@@ -311,19 +348,26 @@ class KotlinLanguageServer(
                     val source = sourceView(params.textDocument.uri) ?: return@respond null
                     hoverService.hoverFromIndex(currentIndex(), source.first, source.second, params)
                         ?.let { fallback ->
-                            scheduleSemanticRefresh(params.textDocument.uri)
                             return@respond fallback
                         }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond hoverService.hover(current.first, current.second, params) }
+                    val currentProject = project
+                    if (currentProject != null) {
+                        semanticEngine.hover(
+                            project = currentProject,
+                            path = source.first,
+                            text = source.second,
+                            version = documents.get(params.textDocument.uri)?.version,
+                            params = params,
+                            projectGeneration = currentProjectGeneration,
+                        )?.let { return@respond it }
+                    }
                     null
                 }
                 "textDocument/signatureHelp" -> respond(message) {
                     val params = read(message.params, TextDocumentPositionParams::class.java)
                     availableSemanticState(params.textDocument.uri)
                         ?.let { current -> return@respond hoverService.signatureHelp(current.first, current.second, params) }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond hoverService.signatureHelp(current.first, current.second, params) }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     null
                 }
                 "textDocument/definition" -> respond(message) {
@@ -338,16 +382,20 @@ class KotlinLanguageServer(
                     navigationService.definitionFromIndex(currentIndex(), source.first, source.second, params)
                         .takeIf { it.isNotEmpty() }
                         ?.let { fallback ->
-                            scheduleSemanticRefresh(params.textDocument.uri)
                             return@respond fallback
                         }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current ->
-                            val semantic = navigationService.definition(current.first, current.second, params)
-                            if (semantic.isNotEmpty()) {
-                                return@respond semantic
-                            }
-                        }
+                    val currentProject = project
+                    if (currentProject != null) {
+                        semanticEngine.definition(
+                            project = currentProject,
+                            path = source.first,
+                            text = source.second,
+                            version = documents.get(params.textDocument.uri)?.version,
+                            params = params,
+                            projectGeneration = currentProjectGeneration,
+                        )?.takeIf { it.isNotEmpty() }
+                            ?.let { return@respond it }
+                    }
                     emptyList<dev.codex.kotlinls.protocol.Location>()
                 }
                 "textDocument/typeDefinition" -> respond(message) {
@@ -365,29 +413,21 @@ class KotlinLanguageServer(
                             scheduleSemanticRefresh(params.textDocument.uri)
                             return@respond fallback
                         }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current ->
-                            val semantic = navigationService.typeDefinition(current.first, current.second, params)
-                            if (semantic.isNotEmpty()) {
-                                return@respond semantic
-                            }
-                        }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     emptyList<dev.codex.kotlinls.protocol.Location>()
                 }
                 "textDocument/references" -> respond(message) {
                     val params = read(message.params, TextDocumentPositionParams::class.java)
                     availableSemanticState(params.textDocument.uri)
                         ?.let { current -> return@respond navigationService.references(current.first, current.second, params) }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond navigationService.references(current.first, current.second, params) }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     emptyList<dev.codex.kotlinls.protocol.Location>()
                 }
                 "textDocument/implementation" -> respond(message) {
                     val params = read(message.params, TextDocumentPositionParams::class.java)
                     availableSemanticState(params.textDocument.uri)
                         ?.let { current -> return@respond navigationService.implementations(current.first, current.second, params) }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond navigationService.implementations(current.first, current.second, params) }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     emptyList<dev.codex.kotlinls.protocol.Location>()
                 }
                 "textDocument/documentSymbol" -> respond(message) {
@@ -407,8 +447,7 @@ class KotlinLanguageServer(
                     val params = read(message.params, DocumentHighlightParams::class.java)
                     availableSemanticState(params.textDocument.uri)
                         ?.let { current -> return@respond navigationService.documentHighlights(current.first, current.second, params) }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond navigationService.documentHighlights(current.first, current.second, params) }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     emptyList<dev.codex.kotlinls.protocol.DocumentHighlight>()
                 }
                 "textDocument/foldingRange" -> respond(message) {
@@ -429,30 +468,28 @@ class KotlinLanguageServer(
                     val params = read(message.params, InlayHintParams::class.java)
                     availableSemanticState(params.textDocument.uri)
                         ?.let { current -> return@respond hoverService.inlayHints(current.first, current.second, params) }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond hoverService.inlayHints(current.first, current.second, params) }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     emptyList<dev.codex.kotlinls.protocol.InlayHint>()
                 }
                 "textDocument/prepareRename" -> respond(message) {
                     val params = read(message.params, TextDocumentPositionParams::class.java)
                     availableSemanticState(params.textDocument.uri)
                         ?.let { current -> return@respond renameService.prepareRename(current.first, current.second, params) }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond renameService.prepareRename(current.first, current.second, params) }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     null
                 }
                 "textDocument/rename" -> respond(message) {
                     val params = read(message.params, RenameParams::class.java)
                     availableSemanticState(params.textDocument.uri)
                         ?.let { current -> return@respond renameService.rename(current.first, current.second, params) }
-                    requestSemanticState(params.textDocument.uri)
-                        ?.let { current -> return@respond renameService.rename(current.first, current.second, params) }
+                    scheduleSemanticRefresh(params.textDocument.uri)
                     null
                 }
                 "textDocument/formatting" -> respond(message) {
                     val params = read(message.params, DocumentFormattingParams::class.java)
                     val source = sourceView(params.textDocument.uri) ?: return@respond emptyList<dev.codex.kotlinls.protocol.TextEdit>()
                     semanticEngine.formatDocument(
+                        projectRoot = project?.root,
                         path = source.first,
                         text = source.second,
                         version = documents.get(params.textDocument.uri)?.version,
@@ -465,6 +502,7 @@ class KotlinLanguageServer(
                     val params = read(message.params, DocumentRangeFormattingParams::class.java)
                     val source = sourceView(params.textDocument.uri) ?: return@respond emptyList<dev.codex.kotlinls.protocol.TextEdit>()
                     semanticEngine.formatRange(
+                        projectRoot = project?.root,
                         path = source.first,
                         text = source.second,
                         version = documents.get(params.textDocument.uri)?.version,
@@ -644,6 +682,7 @@ class KotlinLanguageServer(
         lightweightIndexBuilder.load(cachedProject)?.let { cachedIndex ->
             lightweightIndex = cachedIndex
         }
+        supportIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
         if (usesLocalSemanticRuntime()) {
             moduleSemanticFingerprints = computeSemanticFingerprints(cachedProject)
             replaceSemanticStates(loadPersistedSemanticStates(cachedProject))
@@ -736,12 +775,98 @@ class KotlinLanguageServer(
         }
     }
 
+    private fun scheduleSupportRefresh(
+        project: ImportedProject,
+        projectGeneration: Int,
+        packageNames: Set<String> = emptySet(),
+        ensureCache: Boolean = false,
+    ) {
+        synchronized(supportRefreshLock) {
+            pendingSupportRefresh = pendingSupportRefresh
+                ?.merge(project, projectGeneration, packageNames, ensureCache)
+                ?: SupportRefreshRequest(project, projectGeneration, packageNames, ensureCache)
+            if (supportRefreshRunning) {
+                return
+            }
+            supportRefreshRunning = true
+        }
+        try {
+            supportExecutor.execute {
+                while (true) {
+                    val request = synchronized(supportRefreshLock) {
+                        pendingSupportRefresh?.also { pendingSupportRefresh = null }
+                    } ?: run {
+                        synchronized(supportRefreshLock) {
+                            supportRefreshRunning = false
+                        }
+                        return@execute
+                    }
+                    runCatching {
+                        refreshSupportIndexNow(request)
+                    }.onFailure { error ->
+                        if (isBenignCancellation(error)) {
+                            return@onFailure
+                        }
+                        System.err.println("[kotlin-neovim-lsp] support index refresh failed: ${error.message}")
+                        error.printStackTrace(System.err)
+                    }
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            synchronized(supportRefreshLock) {
+                supportRefreshRunning = false
+            }
+        }
+    }
+
+    private fun refreshSupportIndexNow(request: SupportRefreshRequest) {
+        val activeProject = project ?: return
+        if (request.projectGeneration != currentProjectGeneration) return
+        if (activeProject.root.normalize() != request.project.root.normalize()) return
+        val requestedPackages = request.packageNames
+        val partialLayer = requestedPackages.takeIf { it.isNotEmpty() }
+            ?.let { supportSymbolIndexBuilder.loadPackages(request.project, it) }
+        if (partialLayer != null && partialLayer.symbols.isNotEmpty()) {
+            if (request.projectGeneration != currentProjectGeneration) return
+            supportIndex = mergeIndices(listOf(supportIndex, partialLayer.toWorkspaceIndex()))
+            rebuildCombinedIndex()
+        }
+        if (!request.ensureCache) return
+
+        val hasCache = partialLayer != null || supportSymbolIndexBuilder.loadPackages(request.project, emptySet()) != null
+        if (hasCache) return
+
+        val supportProgress = beginProgress(
+            title = "Dependency Index",
+            subtitle = "Building library symbol cache",
+            showImmediately = true,
+            minTotalToShow = 1,
+        )
+        try {
+            val layer = supportSymbolIndexBuilder.build(request.project)
+            if (request.projectGeneration != currentProjectGeneration) return
+            val readyLayer = requestedPackages.takeIf { it.isNotEmpty() }
+                ?.let { packages ->
+                    layer.copy(symbols = layer.symbols.filter { symbol -> symbol.packageName in packages })
+                }
+                ?: layer
+            supportIndex = mergeIndices(listOf(supportIndex, readyLayer.toWorkspaceIndex()))
+            rebuildCombinedIndex()
+            supportProgress.report("Cached ${layer.symbols.size} library symbols", 1, 1)
+            supportProgress.complete("Dependency index ready")
+        } catch (t: Throwable) {
+            supportProgress.fail(t.message ?: t::class.java.simpleName)
+            throw t
+        }
+    }
+
     private fun refreshWorkspaceNow(
         reimportProject: Boolean = true,
         rebuildFastIndex: Boolean = true,
         requestedSemanticUris: Set<String> = emptySet(),
     ) {
         val rootPath = root ?: return
+        val previousProject = project
         val requiresImport = reimportProject || project == null
         val nextProject = if (requiresImport) {
             val importProgress = beginProgress(title = "Project Import", subtitle = "Scanning Gradle modules")
@@ -791,8 +916,19 @@ class KotlinLanguageServer(
             }
         }
 
+        if (requiresImport || previousProject?.root?.normalize() != nextProject.root.normalize()) {
+            supportIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        }
         project = nextProject
-        semanticEngine.onProjectChanged(nextProject)
+        if (requiresImport || previousProject !== nextProject) {
+            semanticEngine.onProjectChanged(nextProject)
+        }
+        scheduleSupportRefresh(
+            project = nextProject,
+            projectGeneration = currentProjectGeneration,
+            packageNames = supportPackagesForDocuments(documents.openDocuments()),
+            ensureCache = true,
+        )
         publishOpenDiagnostics()
         if (usesLocalSemanticRuntime()) {
             val semanticUris = requestedSemanticUris.ifEmpty { documents.openDocuments().map { it.uri }.toSet() }
@@ -1126,12 +1262,6 @@ class KotlinLanguageServer(
         publishedDiagnosticUris = publishedDiagnosticUris - uri
     }
 
-    private fun currentSnapshot(uri: String, timeoutMillis: Long = 400L): WorkspaceAnalysisSnapshot? =
-        awaitSemanticState(uri, timeoutMillis)?.first
-
-    private fun requestSemanticState(uri: String): Pair<WorkspaceAnalysisSnapshot, WorkspaceIndex>? =
-        awaitSemanticState(uri, timeoutMillis = config.semantic.requestTimeoutMillis)
-
     private fun availableSemanticState(uri: String): Pair<WorkspaceAnalysisSnapshot, WorkspaceIndex>? =
         if (!usesLocalSemanticRuntime()) {
             null
@@ -1144,53 +1274,11 @@ class KotlinLanguageServer(
 
     private fun currentIndex(): WorkspaceIndex =
         combinedIndex.takeIf { it.symbols.isNotEmpty() || it.references.isNotEmpty() || it.callEdges.isNotEmpty() }
-            ?: lightweightIndex
+            ?: mergeIndices(listOf(lightweightIndex, supportIndex))
 
-    private fun awaitSemanticState(
-        uri: String,
-        timeoutMillis: Long = 400L,
-    ): Pair<WorkspaceAnalysisSnapshot, WorkspaceIndex>? {
-        if (!usesLocalSemanticRuntime()) return null
-        moduleStateForUri(uri)?.let { state ->
-            if (semanticStateCurrentForUri(state, uri)) {
-                state.snapshot?.let { return it to currentIndex() }
-            }
-            scheduleRefresh(
-                reimportProject = project == null,
-                rebuildFastIndex = lightweightIndex.symbols.isEmpty(),
-                semanticUri = uri.takeIf(::isSourceUri),
-            )
-        } ?: run {
-            if (root == null) {
-                root = rootDetector.detect(documentUriToPath(uri))
-            }
-            scheduleRefresh(
-                reimportProject = project == null,
-                rebuildFastIndex = lightweightIndex.symbols.isEmpty(),
-                semanticUri = uri.takeIf(::isSourceUri),
-            )
-        }
-        if (root == null) {
-            root = rootDetector.detect(documentUriToPath(uri))
-        }
-        val deadline = System.nanoTime() + (timeoutMillis * 1_000_000L)
-        while (System.nanoTime() < deadline) {
-            try {
-                Thread.sleep(25)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return null
-            }
-            moduleStateForUri(uri)?.let { state ->
-                if (semanticStateCurrentForUri(state, uri)) {
-                    state.snapshot?.let { return it to currentIndex() }
-                }
-            }
-        }
-        return null
-    }
-
-    private fun usesLocalSemanticRuntime(): Boolean = config.semantic.backend != SemanticBackend.DISABLED
+    // Bridge-first mode has no local semantic analyzer. Keeping this off prevents
+    // background warmup/refresh loops from competing with the K2 bridge path.
+    private fun usesLocalSemanticRuntime(): Boolean = false
 
     private fun scheduleSemanticRefresh(uri: String) {
         if (!usesLocalSemanticRuntime() || !isSourceUri(uri)) return
@@ -1255,7 +1343,10 @@ class KotlinLanguageServer(
 
     private fun rebuildCombinedIndex() {
         combinedIndex = synchronized(semanticStateLock) {
-            mergeIndices(listOf(lightweightIndex) + semanticStates.values.filter(::semanticStateEligibleForIndex).map { it.index })
+            mergeIndices(
+                listOf(lightweightIndex, supportIndex) +
+                    semanticStates.values.filter(::semanticStateEligibleForIndex).map { it.index },
+            )
         }
     }
 
@@ -1448,6 +1539,25 @@ class KotlinLanguageServer(
         )
     }
 
+    private fun dev.codex.kotlinls.index.SupportSymbolLayer?.toWorkspaceIndex(): WorkspaceIndex =
+        if (this == null) {
+            WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        } else {
+            WorkspaceIndex(symbols = symbols, references = emptyList(), callEdges = emptyList())
+        }
+
+    private fun supportPackagesForDocuments(documents: Collection<TextDocumentSnapshot>): Set<String> =
+        documents.asSequence()
+            .flatMap { document -> supportPackagesForText(document.text).asSequence() }
+            .toSet()
+
+    private fun supportPackagesForText(text: String): Set<String> =
+        SourceIndexLookup.imports(text)
+            .mapNotNull { sourceImport ->
+                sourceImport.fqName.substringBeforeLast('.', missingDelimiterValue = "").takeIf { it.isNotBlank() }
+            }
+            .toSet()
+
     private fun moduleLabel(module: ImportedModule): String =
         module.gradlePath.removePrefix(":").ifBlank { module.name }
 
@@ -1601,6 +1711,33 @@ class KotlinLanguageServer(
         val rebuildFastIndex: Boolean,
         val semanticUris: Set<String>,
     )
+
+    private data class SupportRefreshRequest(
+        val project: ImportedProject,
+        val projectGeneration: Int,
+        val packageNames: Set<String>,
+        val ensureCache: Boolean,
+    ) {
+        fun merge(
+            nextProject: ImportedProject,
+            nextProjectGeneration: Int,
+            nextPackageNames: Set<String>,
+            nextEnsureCache: Boolean,
+        ): SupportRefreshRequest {
+            if (
+                project.root.normalize() != nextProject.root.normalize() ||
+                projectGeneration != nextProjectGeneration
+            ) {
+                return SupportRefreshRequest(nextProject, nextProjectGeneration, nextPackageNames, nextEnsureCache)
+            }
+            return SupportRefreshRequest(
+                project = nextProject,
+                projectGeneration = nextProjectGeneration,
+                packageNames = packageNames + nextPackageNames,
+                ensureCache = ensureCache || nextEnsureCache,
+            )
+        }
+    }
 
     private data class ModuleSemanticState(
         val module: ImportedModule,

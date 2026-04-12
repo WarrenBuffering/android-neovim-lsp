@@ -2,6 +2,7 @@ package dev.codex.kotlinls.completion
 
 import dev.codex.kotlinls.analysis.WorkspaceAnalysisSnapshot
 import dev.codex.kotlinls.index.IndexedSymbol
+import dev.codex.kotlinls.index.SourceIndexLookup
 import dev.codex.kotlinls.index.SymbolResolver
 import dev.codex.kotlinls.index.WorkspaceIndex
 import dev.codex.kotlinls.protocol.SymbolKind
@@ -129,6 +130,7 @@ class CompletionService {
         path: Path,
         text: String,
         params: CompletionParams,
+        resultLimit: Int = 100,
     ): CompletionList {
         val lineIndex = LineIndex.build(text)
         val offset = lineIndex.offset(params.position)
@@ -136,6 +138,7 @@ class CompletionService {
         if (importContext != null) {
             return importCompletionList(index, text, importContext)
         }
+        val importedFqNames = SourceIndexLookup.imports(text).mapTo(linkedSetOf()) { it.fqName }
         val prefix = currentPrefix(text, offset)
         val ranked = linkedMapOf<String, RankedCompletion>()
         keywords.filter { it.startsWith(prefix) }.forEach { keyword ->
@@ -149,23 +152,111 @@ class CompletionService {
                 score = 40,
             )
         }
+        val candidateLimit = maxOf(resultLimit * 4, 250)
         index.symbols.asSequence()
             .filter { it.name.startsWith(prefix) }
-            .take(200)
+            .take(candidateLimit)
             .forEach { symbol ->
+                val imported = symbol.fqName != null && symbol.fqName in importedFqNames
                 val needsImport = symbol.importable &&
                     symbol.fqName != null &&
-                    symbol.path != path
+                    symbol.path != path &&
+                    !imported
                 val score = when {
                     symbol.path == path -> 170
+                    imported -> 165
                     !needsImport -> 150
                     else -> 120
-                }
+                } + if (symbol.receiverType != null && imported) 35 else 0
                 ranked.putIfAbsent(symbol.id, rankedSymbol(text, symbol, needsImport, score))
+            }
+        syntheticMemberCompletions(index, path, text, offset, prefix)
+            .forEachIndexed { syntheticIndex, item ->
+                val score = 210 - syntheticIndex
+                ranked.putIfAbsent(
+                    "synthetic::${item.label}",
+                    RankedCompletion(item.copy(sortText = scoreToSortKey(score)), score),
+                )
             }
         return CompletionList(
             isIncomplete = false,
             items = ranked.values
+                .sortedWith(compareByDescending<RankedCompletion> { it.score }.thenBy { it.item.label })
+                .take(resultLimit)
+                .map { it.item },
+        )
+    }
+
+    fun mergeSemanticAndIndexCompletions(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        params: CompletionParams,
+        semantic: CompletionList,
+    ): CompletionList {
+        val fallback = completeFromIndex(
+            index = index,
+            path = path,
+            text = text,
+            params = params,
+            resultLimit = 250,
+        )
+        if (fallback.items.isEmpty()) return semantic
+        val offset = LineIndex.build(text).offset(params.position)
+        val prefix = currentPrefix(text, offset)
+        val memberAccess = isMemberAccessContext(text, offset)
+        val imports = SourceIndexLookup.imports(text)
+        val importedVisibleNames = imports.mapTo(linkedSetOf()) { it.visibleName }
+        val importedFqNames = imports.mapTo(linkedSetOf()) { it.fqName }
+        val merged = linkedMapOf<String, RankedCompletion>()
+
+        semantic.items.forEachIndexed { indexInSemantic, item ->
+            val score = mergedCompletionScore(
+                item = item,
+                prefix = prefix,
+                memberAccess = memberAccess,
+                importedVisibleNames = importedVisibleNames,
+                importedFqNames = importedFqNames,
+                primarySource = true,
+                duplicate = false,
+                ordinal = indexInSemantic,
+            )
+            merged[completionKey(item)] = RankedCompletion(
+                item = item.copy(sortText = scoreToSortKey(score)),
+                score = score,
+            )
+        }
+
+        fallback.items.forEachIndexed { indexInFallback, item ->
+            val key = completionKey(item)
+            val existing = merged[key]
+            val mergedItem = mergeCompletionItems(existing?.item, item)
+            val score = mergedCompletionScore(
+                item = mergedItem,
+                prefix = prefix,
+                memberAccess = memberAccess,
+                importedVisibleNames = importedVisibleNames,
+                importedFqNames = importedFqNames,
+                primarySource = false,
+                duplicate = existing != null,
+                ordinal = indexInFallback,
+            )
+            val candidate = RankedCompletion(
+                item = mergedItem.copy(sortText = scoreToSortKey(score)),
+                score = score,
+            )
+            merged[key] = when {
+                existing == null -> candidate
+                candidate.score > existing.score -> candidate
+                else -> existing.copy(
+                    item = mergeCompletionItems(existing.item, item).copy(sortText = existing.item.sortText),
+                )
+            }
+        }
+
+        return CompletionList(
+            isIncomplete = semantic.isIncomplete || fallback.isIncomplete,
+            items = merged.values
                 .sortedWith(compareByDescending<RankedCompletion> { it.score }.thenBy { it.item.label })
                 .take(100)
                 .map { it.item },
@@ -694,6 +785,267 @@ class CompletionService {
                 newText = importText,
             ),
         )
+    }
+
+    private fun completionKey(item: CompletionItem): String =
+        item.data?.get("symbolId")
+            ?: item.data?.get("fqName")
+            ?: buildString {
+                append(item.label)
+                append("::")
+                append(item.kind ?: -1)
+                append("::")
+                append(item.detail ?: "")
+            }
+
+    private fun mergedCompletionScore(
+        item: CompletionItem,
+        prefix: String,
+        memberAccess: Boolean,
+        importedVisibleNames: Set<String>,
+        importedFqNames: Set<String>,
+        primarySource: Boolean,
+        duplicate: Boolean,
+        ordinal: Int,
+    ): Int {
+        val filter = item.filterText ?: item.label
+        val fqName = item.data?.get("fqName").orEmpty().ifBlank { null }
+        val imported = item.label in importedVisibleNames || (fqName != null && fqName in importedFqNames)
+        var score = when {
+            filter == prefix || item.label == prefix -> 320
+            filter.startsWith(prefix) || item.label.startsWith(prefix) -> 260
+            filter.contains(prefix, ignoreCase = true) || item.label.contains(prefix, ignoreCase = true) -> 160
+            else -> 80
+        }
+        score += if (primarySource) 180 else 120
+        score += if (duplicate) 140 else 0
+        score += if (item.data?.get("smart") == "true") 70 else 0
+        score += if (imported) 120 else 0
+        score += if (item.additionalTextEdits.isNullOrEmpty()) 20 else -10
+        score += if (memberAccess) {
+            when (item.kind) {
+                CompletionItemKind.FUNCTION,
+                CompletionItemKind.PROPERTY,
+                CompletionItemKind.VARIABLE,
+                -> 35
+
+                CompletionItemKind.CLASS,
+                CompletionItemKind.MODULE,
+                -> -35
+
+                else -> 0
+            }
+        } else {
+            0
+        }
+        score += when {
+            primarySource -> (140 - ordinal).coerceAtLeast(0)
+            else -> (90 - ordinal).coerceAtLeast(0)
+        }
+        return score
+    }
+
+    private fun mergeCompletionItems(primary: CompletionItem?, secondary: CompletionItem): CompletionItem {
+        if (primary == null) return secondary
+        val mergedEdits = listOfNotNull(primary.additionalTextEdits, secondary.additionalTextEdits)
+            .flatten()
+            .distinctBy { "${it.range.start.line}:${it.range.start.character}:${it.newText}" }
+            .takeIf { it.isNotEmpty() }
+        val mergedData = linkedMapOf<String, String>().apply {
+            primary.data?.let(::putAll)
+            secondary.data?.let(::putAll)
+        }.takeIf { it.isNotEmpty() }
+        return primary.copy(
+            kind = primary.kind ?: secondary.kind,
+            detail = primary.detail.takeUnless { it.isNullOrBlank() || it == "/**" } ?: secondary.detail,
+            documentation = primary.documentation ?: secondary.documentation,
+            filterText = primary.filterText ?: secondary.filterText,
+            insertText = primary.insertText ?: secondary.insertText,
+            insertTextFormat = primary.insertTextFormat ?: secondary.insertTextFormat,
+            additionalTextEdits = mergedEdits,
+            data = mergedData,
+        )
+    }
+
+    private fun syntheticMemberCompletions(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        offset: Int,
+        prefix: String,
+    ): List<CompletionItem> {
+        if (!isMemberAccessContext(text, offset) || !prefix.startsWith("to")) return emptyList()
+        val chain = receiverAccessChain(text, offset) ?: return emptyList()
+        val receiverType = inferReceiverChainType(index, path, text, chain)
+            ?: fallbackNumericReceiverType(chain)
+            ?: return emptyList()
+        return primitiveConversionCandidates(receiverType)
+            .filter { it.startsWith(prefix) }
+            .map { method ->
+                CompletionItem(
+                    label = method,
+                    kind = CompletionItemKind.FUNCTION,
+                    detail = "Kotlin primitive conversion",
+                    filterText = method,
+                    data = mapOf(
+                        "provider" to "synthetic",
+                        "fqName" to "kotlin.$method",
+                    ),
+                )
+            }
+    }
+
+    private fun receiverAccessChain(text: String, offset: Int): List<String>? {
+        var cursor = offset.coerceIn(0, text.length)
+        while (cursor > 0 && text[cursor - 1].isJavaIdentifierPart()) {
+            cursor--
+        }
+        if (cursor <= 0 || text[cursor - 1] != '.') return null
+        var start = cursor - 1
+        while (start > 0) {
+            val candidate = text[start - 1]
+            if (candidate.isJavaIdentifierPart() || candidate == '.' || candidate == '?') {
+                start--
+            } else {
+                break
+            }
+        }
+        val raw = text.substring(start, cursor - 1)
+            .replace("?.", ".")
+            .trim('.')
+        if (raw.isBlank()) return null
+        return raw.split('.').filter { it.isNotBlank() }
+    }
+
+    private fun inferReceiverChainType(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        chain: List<String>,
+    ): String? {
+        if (chain.isEmpty()) return null
+        var currentType = resolveRootSymbolType(index, path, text, chain.first()) ?: return null
+        chain.drop(1).forEach { memberName ->
+            currentType = knownMemberReturnType(currentType, memberName)
+                ?: resolveMemberReturnType(index, currentType, memberName)
+                ?: return null
+        }
+        return currentType
+    }
+
+    private fun resolveRootSymbolType(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        symbolName: String,
+    ): String? {
+        val normalizedPath = path.normalize()
+        index.symbolsByPath[normalizedPath]
+            .orEmpty()
+            .asSequence()
+            .filter { it.name == symbolName }
+            .sortedWith(
+                compareByDescending<IndexedSymbol> { !it.importable }
+                    .thenByDescending { it.selectionRange.start.line }
+                    .thenByDescending { it.selectionRange.start.character },
+            )
+            .mapNotNull { symbol -> symbol.resultType ?: symbol.fqName }
+            .firstOrNull()
+            ?.let { return it }
+
+        SourceIndexLookup.imports(text)
+            .firstOrNull { it.visibleName == symbolName }
+            ?.let { sourceImport ->
+                index.symbolsByFqName[sourceImport.fqName]?.let { symbol ->
+                    return symbol.resultType ?: symbol.fqName
+                }
+                return sourceImport.fqName
+            }
+
+        return index.symbolsByName[symbolName]
+            .orEmpty()
+            .asSequence()
+            .filter { it.importable }
+            .mapNotNull { symbol -> symbol.resultType ?: symbol.fqName }
+            .firstOrNull()
+    }
+
+    private fun resolveMemberReturnType(
+        index: WorkspaceIndex,
+        receiverType: String,
+        memberName: String,
+    ): String? {
+        val receiverShortName = normalizeTypeShortName(receiverType) ?: return null
+        val receiverFqName = normalizeTypeFqName(receiverType)
+        return index.symbolsByName[memberName]
+            .orEmpty()
+            .asSequence()
+            .filter { symbol ->
+                receiverMatches(symbol, receiverShortName, receiverFqName)
+            }
+            .mapNotNull { symbol -> symbol.resultType ?: symbol.fqName }
+            .firstOrNull()
+    }
+
+    private fun knownMemberReturnType(
+        receiverType: String,
+        memberName: String,
+    ): String? {
+        val normalized = normalizeTypeShortName(receiverType) ?: return null
+        return when (normalized) {
+            "IntSize", "IntOffset", "IntRect" -> when (memberName) {
+                "width", "height", "x", "y", "left", "right", "top", "bottom" -> "kotlin.Int"
+                else -> null
+            }
+
+            "Size", "Rect" -> when (memberName) {
+                "width", "height", "left", "right", "top", "bottom" -> "kotlin.Float"
+                else -> null
+            }
+
+            "Dp", "TextUnit" -> when (memberName) {
+                "value" -> "kotlin.Float"
+                else -> null
+            }
+
+            else -> null
+        }
+    }
+
+    private fun primitiveConversionCandidates(receiverType: String): List<String> =
+        when (normalizeTypeShortName(receiverType)) {
+            "Byte", "Short", "Int", "Long", "Float", "Double" ->
+                listOf("toByte", "toShort", "toInt", "toLong", "toFloat", "toDouble")
+
+            "Char" -> listOf("toInt")
+            else -> emptyList()
+        }
+
+    private fun fallbackNumericReceiverType(chain: List<String>): String? {
+        val tail = chain.lastOrNull() ?: return null
+        return when {
+            tail in setOf("width", "height", "x", "y", "left", "right", "top", "bottom", "count", "index", "length", "size") ->
+                "kotlin.Int"
+
+            tail.endsWith("Px", ignoreCase = true) ||
+                tail.endsWith("Count", ignoreCase = true) ||
+                tail.endsWith("Index", ignoreCase = true) ||
+                tail.endsWith("Size", ignoreCase = true) ->
+                "kotlin.Int"
+
+            tail in setOf("alpha", "progress", "fraction", "scale", "value") ->
+                "kotlin.Float"
+
+            else -> null
+        }
+    }
+
+    private fun isMemberAccessContext(text: String, offset: Int): Boolean {
+        var cursor = offset.coerceIn(0, text.length)
+        while (cursor > 0 && text[cursor - 1].isJavaIdentifierPart()) {
+            cursor--
+        }
+        return cursor > 0 && text[cursor - 1] == '.'
     }
 
     private fun scoreToSortKey(score: Int): String = (1000 - score).coerceAtLeast(0).toString().padStart(4, '0')

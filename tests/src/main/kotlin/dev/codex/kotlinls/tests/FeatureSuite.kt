@@ -7,6 +7,9 @@ import dev.codex.kotlinls.index.WorkspaceIndexBuilder
 import dev.codex.kotlinls.navigation.NavigationService
 import dev.codex.kotlinls.projectimport.GradleProjectImporter
 import dev.codex.kotlinls.protocol.CompletionParams
+import dev.codex.kotlinls.protocol.CompletionItem
+import dev.codex.kotlinls.protocol.CompletionItemKind
+import dev.codex.kotlinls.protocol.CompletionList
 import dev.codex.kotlinls.protocol.InlayHintParams
 import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.TextDocumentIdentifier
@@ -174,6 +177,144 @@ fun featureSuite(): TestSuite {
                 val shout = completions.items.firstOrNull { it.label == "shout" }
                 assertTrue(shout?.additionalTextEdits?.any { it.newText.contains("import demo.lib.shout") } == true) {
                     "Expected shout completion to add import, got ${shout?.additionalTextEdits}"
+                }
+            },
+            TestCase("boosts imported extension completions in index-only mode") {
+                val root = FixtureSupport.fixture("multi-module")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
+                val content = """
+                    package demo.app
+
+                    import demo.lib.Greeting
+                    import demo.lib.shout
+
+                    fun demo(name: String): String {
+                        return Greeting().sh
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 31,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("Greeting().sh") }
+                val column = content.lines()[line].indexOf("sh") + 2
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                )
+                val topLabels = completions.items.take(10).map { it.label }
+                assertTrue(topLabels.contains("shout")) {
+                    "Expected imported extension completion to stay near the top, got $topLabels"
+                }
+            },
+            TestCase("merges weak semantic completions with indexed fallback candidates") {
+                val root = FixtureSupport.fixture("multi-module")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
+                val content = """
+                    package demo.app
+
+                    import demo.lib.Greeting
+                    import demo.lib.shout
+
+                    fun demo(name: String): String {
+                        return Greeting().sh
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 32,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("Greeting().sh") }
+                val column = content.lines()[line].indexOf("sh") + 2
+                val merged = completionService.mergeSemanticAndIndexCompletions(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                    semantic = CompletionList(
+                        isIncomplete = false,
+                        items = listOf(
+                            CompletionItem(
+                                label = "shape",
+                                kind = CompletionItemKind.FUNCTION,
+                                filterText = "shape",
+                                detail = "noise",
+                                data = mapOf("provider" to "jetbrains"),
+                            ),
+                            CompletionItem(
+                                label = "showcase",
+                                kind = CompletionItemKind.FUNCTION,
+                                filterText = "showcase",
+                                detail = "noise",
+                                data = mapOf("provider" to "jetbrains"),
+                            ),
+                        ),
+                    ),
+                )
+                assertTrue(merged.items.firstOrNull()?.label == "shout") {
+                    "Expected indexed fallback to outrank noisy semantic candidates, got ${merged.items.take(10).map { it.label }}"
+                }
+            },
+            TestCase("offers primitive conversion completions for local numeric chains in index-only mode") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    fun demo(): Float {
+                        val count = 1
+                        return count.to
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 42,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("count.to") }
+                val column = content.lines()[line].indexOf("to") + 2
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                )
+                assertTrue(completions.items.any { it.label == "toFloat" }) {
+                    "Expected primitive conversion completion, got ${completions.items.take(10).map { it.label }}"
                 }
             },
             TestCase("ranks expected-type-matching completions above unrelated ones") {

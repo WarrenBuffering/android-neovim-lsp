@@ -11,8 +11,11 @@ import dev.codex.kotlinls.protocol.CompletionList
 import dev.codex.kotlinls.protocol.CompletionParams
 import dev.codex.kotlinls.protocol.DocumentFormattingParams
 import dev.codex.kotlinls.protocol.DocumentRangeFormattingParams
+import dev.codex.kotlinls.protocol.Hover
+import dev.codex.kotlinls.protocol.Location
 import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
+import dev.codex.kotlinls.protocol.TextDocumentPositionParams
 import dev.codex.kotlinls.protocol.TextEdit
 import dev.codex.kotlinls.workspace.LineIndex
 import dev.codex.kotlinls.workspace.TextDocumentSnapshot
@@ -67,7 +70,26 @@ internal interface SemanticEngine : AutoCloseable {
         projectGeneration: Int,
     ): CompletionList?
 
+    fun hover(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        params: TextDocumentPositionParams,
+        projectGeneration: Int,
+    ): Hover?
+
+    fun definition(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        params: TextDocumentPositionParams,
+        projectGeneration: Int,
+    ): List<Location>?
+
     fun formatDocument(
+        projectRoot: Path?,
         path: Path,
         text: String,
         version: Int?,
@@ -76,6 +98,7 @@ internal interface SemanticEngine : AutoCloseable {
     ): List<TextEdit>?
 
     fun formatRange(
+        projectRoot: Path?,
         path: Path,
         text: String,
         version: Int?,
@@ -110,7 +133,26 @@ internal class DisabledSemanticEngine(
         projectGeneration: Int,
     ): CompletionList? = null
 
+    override fun hover(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        params: TextDocumentPositionParams,
+        projectGeneration: Int,
+    ): Hover? = null
+
+    override fun definition(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        params: TextDocumentPositionParams,
+        projectGeneration: Int,
+    ): List<Location>? = null
+
     override fun formatDocument(
+        projectRoot: Path?,
         path: Path,
         text: String,
         version: Int?,
@@ -119,6 +161,7 @@ internal class DisabledSemanticEngine(
     ): List<TextEdit>? = null
 
     override fun formatRange(
+        projectRoot: Path?,
         path: Path,
         text: String,
         version: Int?,
@@ -160,7 +203,8 @@ internal class BridgeK2SemanticEngine private constructor(
     override val capabilities: SemanticEngineCapabilities = SemanticEngineCapabilities(
         completion = true,
         formatting = true,
-        rangeFormatting = false,
+        rangeFormatting = true,
+        hover = true,
     )
 
     override fun onProjectChanged(project: ImportedProject?) {
@@ -205,7 +249,9 @@ internal class BridgeK2SemanticEngine private constructor(
                     priority = index,
                 )
             }
-            scheduleSyncDrainLocked(liveSyncDebounceMillis)
+            if (bridge != null) {
+                scheduleSyncDrainLocked(liveSyncDebounceMillis)
+            }
         }
     }
 
@@ -232,7 +278,54 @@ internal class BridgeK2SemanticEngine private constructor(
         return CompletionList(isIncomplete = false, items = bridgeItems(text, items))
     }
 
+    override fun hover(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        params: TextDocumentPositionParams,
+        projectGeneration: Int,
+    ): Hover? {
+        val offset = LineIndex.build(text).offset(params.position)
+        val key = SemanticRequestKey("hover", params.textDocument.uri, version, projectGeneration, "${params.position.line}:${params.position.character}")
+        synchronized(pendingSyncLock) {
+            pendingDocumentSyncs.remove(params.textDocument.uri)
+        }
+        val hover = awaitMemoized(key) {
+            val activeBridge = acquireBridge() ?: return@awaitMemoized null
+            withForegroundRequest {
+                activeBridge.hover(project.root, path, text, offset)
+            }
+        } ?: return null
+        if (!isCurrentVersion(params.textDocument.uri, version)) return null
+        return hover
+    }
+
+    override fun definition(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        params: TextDocumentPositionParams,
+        projectGeneration: Int,
+    ): List<Location>? {
+        val offset = LineIndex.build(text).offset(params.position)
+        val key = SemanticRequestKey("definition", params.textDocument.uri, version, projectGeneration, "${params.position.line}:${params.position.character}")
+        synchronized(pendingSyncLock) {
+            pendingDocumentSyncs.remove(params.textDocument.uri)
+        }
+        val locations = awaitMemoized(key) {
+            val activeBridge = acquireBridge() ?: return@awaitMemoized null
+            withForegroundRequest {
+                activeBridge.definition(project.root, path, text, offset)
+            }
+        } ?: return null
+        if (!isCurrentVersion(params.textDocument.uri, version)) return null
+        return locations
+    }
+
     override fun formatDocument(
+        projectRoot: Path?,
         path: Path,
         text: String,
         version: Int?,
@@ -241,19 +334,31 @@ internal class BridgeK2SemanticEngine private constructor(
     ): List<TextEdit>? {
         val uri = params.textDocument.uri
         val key = SemanticRequestKey("format-document", uri, version, projectGeneration, "document")
-        val edits = awaitMemoized(key) {
-            formatterService.formatDocumentText(
-                path = path,
-                text = text,
-                params = params,
-                requireExternalFormatter = true,
-            )
+        val edits = awaitMemoized(key, timeoutMillis = null) {
+            val bridged = projectRoot
+                ?.let { root ->
+                    val activeBridge = acquireBridge() ?: return@let null
+                    withForegroundRequest {
+                        activeBridge.formatDocument(root, path, text)
+                    }
+                }
+            if (bridged != null) {
+                formatterService.editsForFormattedText(text, bridged)
+            } else {
+                formatterService.formatDocumentText(
+                    path = path,
+                    text = text,
+                    params = params,
+                    requireExternalFormatter = true,
+                )
+            }
         } ?: return null
         if (!isCurrentVersion(uri, version)) return null
         return edits
     }
 
     override fun formatRange(
+        projectRoot: Path?,
         path: Path,
         text: String,
         version: Int?,
@@ -262,13 +367,27 @@ internal class BridgeK2SemanticEngine private constructor(
     ): List<TextEdit>? {
         val uri = params.textDocument.uri
         val key = SemanticRequestKey("format-range", uri, version, projectGeneration, "${params.range.start.line}:${params.range.start.character}")
-        val edits = awaitMemoized(key) {
-            formatterService.formatRangeText(
-                path = path,
-                text = text,
-                params = params,
-                requireExternalFormatter = true,
-            )
+        val edits = awaitMemoized(key, timeoutMillis = null) {
+            val bridged = projectRoot
+                ?.let { root ->
+                    val activeBridge = acquireBridge() ?: return@let null
+                    val lineIndex = LineIndex.build(text)
+                    val startOffset = lineIndex.offset(params.range.start)
+                    val endOffset = lineIndex.offset(params.range.end)
+                    withForegroundRequest {
+                        activeBridge.formatRange(root, path, text, startOffset, endOffset)
+                    }
+                }
+            if (bridged != null) {
+                formatterService.editsForFormattedText(text, bridged)
+            } else {
+                formatterService.formatRangeText(
+                    path = path,
+                    text = text,
+                    params = params,
+                    requireExternalFormatter = true,
+                )
+            }
         } ?: return null
         if (!isCurrentVersion(uri, version)) return null
         return edits
@@ -293,6 +412,9 @@ internal class BridgeK2SemanticEngine private constructor(
         return synchronized(this) {
             bridge ?: JetBrainsCompletionBridge.detect(forceEnable = true)?.also { detected ->
                 bridge = detected
+                synchronized(pendingSyncLock) {
+                    scheduleSyncDrainLocked(0L)
+                }
             }
         }
     }
@@ -300,7 +422,9 @@ internal class BridgeK2SemanticEngine private constructor(
     private fun enqueueProjectWarmup(projectRoot: Path, immediate: Boolean = false) {
         synchronized(pendingSyncLock) {
             pendingProjectWarmups.add(projectRoot)
-            scheduleSyncDrainLocked(if (immediate) 0L else liveSyncDebounceMillis)
+            if (bridge != null) {
+                scheduleSyncDrainLocked(if (immediate) 0L else liveSyncDebounceMillis)
+            }
         }
     }
 
@@ -321,10 +445,16 @@ internal class BridgeK2SemanticEngine private constructor(
     private fun drainPendingSyncs() {
         val warmups: List<Path>
         val documentSyncs: List<PendingBridgeSync>
+        val activeBridge: JetBrainsCompletionBridge
         synchronized(pendingSyncLock) {
             if (foregroundRequests.get() > 0) {
                 syncDrainScheduled = false
                 scheduleSyncDrainLocked(liveSyncRetryMillis)
+                return
+            }
+            val currentBridge = bridge
+            if (currentBridge == null) {
+                syncDrainScheduled = false
                 return
             }
             warmups = pendingProjectWarmups.toList()
@@ -332,9 +462,9 @@ internal class BridgeK2SemanticEngine private constructor(
             pendingProjectWarmups.clear()
             pendingDocumentSyncs.clear()
             syncDrainScheduled = false
+            activeBridge = currentBridge
         }
         if (warmups.isEmpty() && documentSyncs.isEmpty()) return
-        val activeBridge = acquireBridge() ?: return
         warmups.forEachIndexed { index, projectRoot ->
             if (foregroundRequests.get() > 0) {
                 requeueWarmups(warmups.drop(index), liveSyncRetryMillis)
@@ -380,13 +510,18 @@ internal class BridgeK2SemanticEngine private constructor(
     @Suppress("UNCHECKED_CAST")
     private fun <T> awaitMemoized(
         key: SemanticRequestKey,
+        timeoutMillis: Long? = semanticConfig.requestTimeoutMillis,
         supplier: () -> T?,
     ): T? {
         val created = CompletableFuture.supplyAsync(supplier, requestExecutor) as CompletableFuture<Any?>
         val future = inFlight.putIfAbsent(key, created) ?: created
         created.takeIf { future !== it }?.cancel(true)
         return try {
-            future.get(semanticConfig.requestTimeoutMillis, TimeUnit.MILLISECONDS) as T?
+            if (timeoutMillis == null) {
+                future.get() as T?
+            } else {
+                future.get(timeoutMillis, TimeUnit.MILLISECONDS) as T?
+            }
         } catch (_: java.util.concurrent.TimeoutException) {
             null
         } catch (_: java.util.concurrent.CancellationException) {

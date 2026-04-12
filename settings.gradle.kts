@@ -7,7 +7,13 @@ pluginManagement {
 
 val enableJetBrainsBridge = providers.gradleProperty("kotlinls.enableJetBrainsBridge")
     .map(String::toBoolean)
-    .orElse(false)
+    .orElse(
+        listOf(
+            file("/Applications/Android Studio.app/Contents"),
+            file("/Applications/IntelliJ IDEA.app/Contents"),
+            file("/Applications/IntelliJ IDEA CE.app/Contents"),
+        ).any { it.isDirectory },
+    )
     .get()
 
 dependencyResolutionManagement {

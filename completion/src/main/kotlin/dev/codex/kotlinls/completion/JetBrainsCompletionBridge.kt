@@ -3,6 +3,11 @@ package dev.codex.kotlinls.completion
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.readValue
 import dev.codex.kotlinls.protocol.Json
+import dev.codex.kotlinls.protocol.Hover
+import dev.codex.kotlinls.protocol.Location
+import dev.codex.kotlinls.protocol.MarkupContent
+import dev.codex.kotlinls.protocol.Position
+import dev.codex.kotlinls.protocol.Range
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.InputStream
@@ -131,6 +136,83 @@ class JetBrainsCompletionBridge private constructor(
     }
 
     @Synchronized
+    fun hover(
+        projectRoot: Path,
+        filePath: Path,
+        text: String,
+        offset: Int,
+    ): Hover? {
+        val response = sendRequest(
+            method = "hover",
+            payload = payloadFor(projectRoot, filePath, text, offset, limit = 0),
+        )
+        if (!response.success) return null
+        val markdown = response.hoverMarkdown?.takeIf { it.isNotBlank() } ?: return null
+        return Hover(MarkupContent(kind = "markdown", value = markdown))
+    }
+
+    @Synchronized
+    fun definition(
+        projectRoot: Path,
+        filePath: Path,
+        text: String,
+        offset: Int,
+    ): List<Location>? {
+        val response = sendRequest(
+            method = "definition",
+            payload = payloadFor(projectRoot, filePath, text, offset, limit = 0),
+        )
+        if (!response.success) return null
+        return response.locations.map { it.toProtocol() }
+    }
+
+    @Synchronized
+    fun formatDocument(
+        projectRoot: Path,
+        filePath: Path,
+        text: String,
+    ): String? {
+        val response = sendRequest(
+            method = "format",
+            payload = payloadFor(
+                projectRoot = projectRoot,
+                filePath = filePath,
+                text = text,
+                offset = 0,
+                limit = 0,
+                rangeStart = -1,
+                rangeEnd = -1,
+            ),
+        )
+        if (!response.success) return null
+        return response.formattedText
+    }
+
+    @Synchronized
+    fun formatRange(
+        projectRoot: Path,
+        filePath: Path,
+        text: String,
+        startOffset: Int,
+        endOffset: Int,
+    ): String? {
+        val response = sendRequest(
+            method = "format",
+            payload = payloadFor(
+                projectRoot = projectRoot,
+                filePath = filePath,
+                text = text,
+                offset = 0,
+                limit = 0,
+                rangeStart = startOffset,
+                rangeEnd = endOffset,
+            ),
+        )
+        if (!response.success) return null
+        return response.formattedText
+    }
+
+    @Synchronized
     override fun close() {
         runCatching { writer.close() }
         runCatching { reader.close() }
@@ -150,6 +232,8 @@ class JetBrainsCompletionBridge private constructor(
         text: String?,
         offset: Int,
         limit: Int,
+        rangeStart: Int = -1,
+        rangeEnd: Int = -1,
     ): CompletionPayload =
         if (filePath != null && text != null) {
             CompletionPayload(
@@ -158,6 +242,8 @@ class JetBrainsCompletionBridge private constructor(
                 text = text,
                 offset = offset,
                 limit = limit,
+                rangeStart = rangeStart,
+                rangeEnd = rangeEnd,
             )
         } else {
             CompletionPayload(
@@ -166,6 +252,8 @@ class JetBrainsCompletionBridge private constructor(
                 text = "",
                 offset = offset,
                 limit = limit,
+                rangeStart = rangeStart,
+                rangeEnd = rangeEnd,
             )
         }
 
@@ -383,6 +471,8 @@ private data class CompletionPayload(
     val text: String,
     val offset: Int,
     val limit: Int,
+    val rangeStart: Int = -1,
+    val rangeEnd: Int = -1,
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -391,8 +481,38 @@ private data class BridgeResponse(
     val success: Boolean = false,
     val message: String? = null,
     val items: List<JetBrainsBridgeCompletion> = emptyList(),
+    val locations: List<BridgeLocation> = emptyList(),
+    val hoverMarkdown: String? = null,
+    val formattedText: String? = null,
     val error: String? = null,
 )
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+private data class BridgeLocation(
+    val uri: String = "",
+    val range: BridgeRange = BridgeRange(),
+) {
+    fun toProtocol(): Location =
+        Location(uri = uri, range = range.toProtocol())
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+private data class BridgeRange(
+    val start: BridgePosition = BridgePosition(),
+    val end: BridgePosition = BridgePosition(),
+) {
+    fun toProtocol(): Range =
+        Range(start = start.toProtocol(), end = end.toProtocol())
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+private data class BridgePosition(
+    val line: Int = 0,
+    val character: Int = 0,
+) {
+    fun toProtocol(): Position =
+        Position(line = line, character = character)
+}
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 private data class ProductInfo(

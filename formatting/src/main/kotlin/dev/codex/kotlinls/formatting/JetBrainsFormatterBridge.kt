@@ -114,7 +114,7 @@ class JetBrainsFormatterBridge private constructor(
                     if (none { it == "--enable-native-access=ALL-UNNAMED" }) {
                         add("--enable-native-access=ALL-UNNAMED")
                     }
-                    if (none { it == "--add-modules=jdk.incubator.vector" }) {
+                    if (supportsIncubatorVector(javaBinary) && none { it == "--add-modules=jdk.incubator.vector" }) {
                         add("--add-modules=jdk.incubator.vector")
                     }
                 }
@@ -157,6 +157,16 @@ class JetBrainsFormatterBridge private constructor(
 
         private fun resolveResourcePath(productInfoPath: Path, relativePath: String): Path =
             productInfoPath.parent.resolve(relativePath).normalize()
+
+        private fun supportsIncubatorVector(javaBinary: Path): Boolean {
+            val javaHome = javaBinary.parent?.parent ?: return false
+            val jmods = javaHome.resolve("jmods")
+            val vectorModule = jmods.resolve("jdk.incubator.vector.jmod")
+            if (Files.isRegularFile(vectorModule)) {
+                return true
+            }
+            return false
+        }
 
         private fun commonIdeaHomes(): List<Path> =
             listOf(

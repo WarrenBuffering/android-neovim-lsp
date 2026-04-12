@@ -23,20 +23,39 @@ import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.project.DumbService;
 import com.intellij.openapi.project.Project;
 import com.intellij.openapi.util.Computable;
+import com.intellij.openapi.util.TextRange;
 import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
 import com.intellij.openapi.wm.ex.WindowManagerEx;
 import com.intellij.psi.PsiClass;
+import com.intellij.psi.PsiDocumentManager;
+import com.intellij.psi.PsiDocCommentOwner;
 import com.intellij.psi.PsiElement;
 import com.intellij.psi.PsiField;
+import com.intellij.psi.PsiFile;
 import com.intellij.psi.PsiMethod;
+import com.intellij.psi.PsiNameIdentifierOwner;
 import com.intellij.psi.PsiPackage;
+import com.intellij.psi.PsiManager;
+import com.intellij.psi.PsiPolyVariantReference;
+import com.intellij.psi.PsiReference;
+import com.intellij.psi.ResolveResult;
+import com.intellij.psi.codeStyle.CodeStyleManager;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.kotlin.descriptors.DeclarationDescriptor;
+import org.jetbrains.kotlin.idea.decompiler.navigation.SourceNavigationHelper;
+import org.jetbrains.kotlin.idea.references.KtReference;
+import org.jetbrains.kotlin.idea.references.ReferenceUtilKt;
 import org.jetbrains.kotlin.psi.KtCallableDeclaration;
+import org.jetbrains.kotlin.psi.KtCallExpression;
 import org.jetbrains.kotlin.psi.KtClass;
 import org.jetbrains.kotlin.psi.KtClassLikeDeclaration;
+import org.jetbrains.kotlin.psi.KtDeclaration;
+import org.jetbrains.kotlin.psi.KtElement;
 import org.jetbrains.kotlin.psi.KtFile;
 import org.jetbrains.kotlin.psi.KtNamedDeclaration;
+import org.jetbrains.kotlin.psi.KtReferenceExpression;
+import org.jetbrains.kotlin.references.fe10.util.DescriptorToSourceUtilsIde;
 import kotlin.coroutines.Continuation;
 
 import java.io.BufferedReader;
@@ -52,6 +71,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
     private final ObjectMapper mapper = new ObjectMapper()
@@ -94,7 +114,7 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             BufferedReader reader = new BufferedReader(new java.io.InputStreamReader(socket.getInputStream(), java.nio.charset.StandardCharsets.UTF_8));
             BufferedWriter writer = new BufferedWriter(new java.io.OutputStreamWriter(socket.getOutputStream(), java.nio.charset.StandardCharsets.UTF_8))
         ) {
-            writeResponse(writer, new BridgeResponse(0L, true, "ready", List.of(), null));
+            writeResponse(writer, new BridgeResponse(0L, true, "ready", List.of(), List.of(), null, null, null));
             String line;
             while ((line = reader.readLine()) != null) {
                 BridgeRequest request = mapper.readValue(line, BridgeRequest.class);
@@ -102,17 +122,23 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
                 try {
                     if ("complete".equals(request.method())) {
                         response = handleCompletion(request);
+                    } else if ("hover".equals(request.method())) {
+                        response = handleHover(request);
+                    } else if ("definition".equals(request.method())) {
+                        response = handleDefinition(request);
+                    } else if ("format".equals(request.method())) {
+                        response = handleFormat(request);
                     } else if ("sync".equals(request.method())) {
                         response = handleSync(request);
                     } else if ("prime".equals(request.method())) {
                         response = handleSync(request);
                     } else if ("ping".equals(request.method())) {
-                        response = new BridgeResponse(request.id(), true, "pong", List.of(), null);
+                        response = new BridgeResponse(request.id(), true, "pong", List.of(), List.of(), null, null, null);
                     } else {
-                        response = new BridgeResponse(request.id(), false, null, List.of(), "Unknown method: " + request.method());
+                        response = new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unknown method: " + request.method());
                     }
                 } catch (Throwable t) {
-                    response = new BridgeResponse(request.id(), false, null, List.of(), stackTrace(t));
+                    response = new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, stackTrace(t));
                 }
                 writeResponse(writer, response);
             }
@@ -134,39 +160,95 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
     private BridgeResponse handleCompletion(BridgeRequest request) {
         CompletionPayload payload = request.payload();
         if (payload == null) {
-            return new BridgeResponse(request.id(), false, null, List.of(), "Missing completion payload");
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Missing completion payload");
         }
         Project project = openProject(payload.projectRoot());
         DocumentHandle handle = loadDocumentHandle(payload.filePath());
         if (handle == null) {
-            return new BridgeResponse(request.id(), false, null, List.of(), "Unable to open file: " + payload.filePath());
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
         }
         String currentText = payload.text() == null ? handle.document().getText() : payload.text();
         replaceDocumentText(project, handle.document(), currentText);
         DumbService.getInstance(project).waitForSmartMode();
         replaceDocumentText(project, handle.document(), currentText);
-        List<BridgeCompletionItem> smartItems = collectCompletionItems(project, handle.virtualFile(), handle.document(), payload.offset(), CompletionType.SMART, payload.limit());
+        List<BridgeCompletionItem> smartItems = collectCompletionItems(project, handle.virtualFile(), handle.document(), payload.offset(), CompletionType.SMART, payload.limit(), 1);
         replaceDocumentText(project, handle.document(), currentText);
-        List<BridgeCompletionItem> basicItems = collectCompletionItems(project, handle.virtualFile(), handle.document(), payload.offset(), CompletionType.BASIC, payload.limit());
-        List<BridgeCompletionItem> merged = mergeCompletions(smartItems, basicItems, payload.limit());
-        return new BridgeResponse(request.id(), true, null, merged, null);
+        List<BridgeCompletionItem> basicItems = collectCompletionItems(project, handle.virtualFile(), handle.document(), payload.offset(), CompletionType.BASIC, payload.limit(), 1);
+        List<BridgeCompletionItem> expandedBasicItems = List.of();
+        if (isMemberAccessContext(currentText, payload.offset())) {
+            replaceDocumentText(project, handle.document(), currentText);
+            expandedBasicItems = collectCompletionItems(project, handle.virtualFile(), handle.document(), payload.offset(), CompletionType.BASIC, payload.limit(), 2);
+        }
+        List<BridgeCompletionItem> merged = mergeCompletions(payload.limit(), smartItems, basicItems, expandedBasicItems);
+        return new BridgeResponse(request.id(), true, null, merged, List.of(), null, null, null);
     }
 
     private BridgeResponse handleSync(BridgeRequest request) {
         CompletionPayload payload = request.payload();
         if (payload == null) {
-            return new BridgeResponse(request.id(), false, null, List.of(), "Missing sync payload");
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Missing sync payload");
         }
         Project project = openProject(payload.projectRoot());
         if (payload.filePath() == null || payload.filePath().isBlank()) {
-            return new BridgeResponse(request.id(), true, "synced", List.of(), null);
+            return new BridgeResponse(request.id(), true, "synced", List.of(), List.of(), null, null, null);
         }
         DocumentHandle handle = loadDocumentHandle(payload.filePath());
         if (handle == null) {
-            return new BridgeResponse(request.id(), false, null, List.of(), "Unable to open file: " + payload.filePath());
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
         }
         replaceDocumentText(project, handle.document(), payload.text() == null ? handle.document().getText() : payload.text());
-        return new BridgeResponse(request.id(), true, "synced", List.of(), null);
+        return new BridgeResponse(request.id(), true, "synced", List.of(), List.of(), null, null, null);
+    }
+
+    private BridgeResponse handleHover(BridgeRequest request) {
+        CompletionPayload payload = request.payload();
+        if (payload == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Missing hover payload");
+        }
+        Project project = openProject(payload.projectRoot());
+        DocumentHandle handle = loadDocumentHandle(payload.filePath());
+        if (handle == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
+        }
+        String currentText = payload.text() == null ? handle.document().getText() : payload.text();
+        replaceDocumentText(project, handle.document(), currentText);
+        DumbService.getInstance(project).waitForSmartMode();
+        String hoverMarkdown = renderHoverMarkdown(project, handle.virtualFile(), handle.document(), payload.offset());
+        return new BridgeResponse(request.id(), true, hoverMarkdown == null ? "empty" : "hover", List.of(), List.of(), hoverMarkdown, null, null);
+    }
+
+    private BridgeResponse handleDefinition(BridgeRequest request) {
+        CompletionPayload payload = request.payload();
+        if (payload == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Missing definition payload");
+        }
+        Project project = openProject(payload.projectRoot());
+        DocumentHandle handle = loadDocumentHandle(payload.filePath());
+        if (handle == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
+        }
+        String currentText = payload.text() == null ? handle.document().getText() : payload.text();
+        replaceDocumentText(project, handle.document(), currentText);
+        DumbService.getInstance(project).waitForSmartMode();
+        List<BridgeLocation> locations = resolveDefinitionLocations(project, handle.virtualFile(), handle.document(), payload.offset());
+        return new BridgeResponse(request.id(), true, locations.isEmpty() ? "empty" : "definition", List.of(), locations, null, null, null);
+    }
+
+    private BridgeResponse handleFormat(BridgeRequest request) {
+        CompletionPayload payload = request.payload();
+        if (payload == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Missing format payload");
+        }
+        Project project = openProject(payload.projectRoot());
+        DocumentHandle handle = loadDocumentHandle(payload.filePath());
+        if (handle == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
+        }
+        String currentText = payload.text() == null ? handle.document().getText() : payload.text();
+        replaceDocumentText(project, handle.document(), currentText);
+        DumbService.getInstance(project).waitForSmartMode();
+        String formattedText = formatDocument(project, handle.virtualFile(), handle.document(), payload.rangeStart(), payload.rangeEnd());
+        return new BridgeResponse(request.id(), true, "formatted", List.of(), List.of(), null, formattedText, null);
     }
 
     private Project openProject(String projectRoot) {
@@ -176,7 +258,7 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             }
             Path root = Path.of(projectRoot);
             TrustedProjects.setProjectTrusted(root, true);
-            Project project = ProjectUtil.openOrImport(root, OpenProjectTask.build().withForceOpenInNewFrame(true));
+            Project project = ProjectUtil.openOrImport(root, OpenProjectTask.build().withForceOpenInNewFrame(false));
             if (project == null) {
                 throw new IllegalStateException("Unable to open project: " + projectRoot);
             }
@@ -211,6 +293,318 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         );
     }
 
+    private String formatDocument(Project project, VirtualFile virtualFile, Document document, int rangeStart, int rangeEnd) {
+        AtomicReference<String> formattedText = new AtomicReference<>();
+        ApplicationManager.getApplication().invokeAndWait(
+            () -> formattedText.set(WriteCommandAction.writeCommandAction(project).compute(() -> {
+                PsiDocumentManager psiDocumentManager = PsiDocumentManager.getInstance(project);
+                psiDocumentManager.commitDocument(document);
+                PsiFile psiFile = PsiManager.getInstance(project).findFile(virtualFile);
+                if (psiFile == null) {
+                    throw new IllegalStateException("Unable to load PSI for " + virtualFile.getPath());
+                }
+                CodeStyleManager codeStyleManager = CodeStyleManager.getInstance(project);
+                if (rangeStart >= 0 && rangeEnd >= 0) {
+                    int start = Math.max(0, Math.min(rangeStart, document.getTextLength()));
+                    int end = Math.max(start, Math.min(rangeEnd, document.getTextLength()));
+                    codeStyleManager.reformatText(psiFile, List.of(new TextRange(start, end)));
+                } else {
+                    codeStyleManager.reformat(psiFile);
+                }
+                psiDocumentManager.commitDocument(document);
+                return document.getText();
+            })),
+            ModalityState.nonModal()
+        );
+        return formattedText.get();
+    }
+
+    private String renderHoverMarkdown(Project project, VirtualFile virtualFile, Document document, int offset) {
+        List<PsiElement> targets = resolveTargets(project, virtualFile, document, offset);
+        PsiElement target = targets.isEmpty() ? declarationAtOffset(project, virtualFile, offset) : targets.getFirst();
+        if (target == null) {
+            return null;
+        }
+        PsiElement navigation = navigationTarget(target);
+        String signature = renderSignature(navigation);
+        String docText = extractLeadingDocText(navigation);
+        StringBuilder markdown = new StringBuilder();
+        if (signature != null && !signature.isBlank()) {
+            markdown.append("```kotlin\n").append(signature.strip()).append("\n```");
+        }
+        if (docText != null && !docText.isBlank()) {
+            if (markdown.length() > 0) {
+                markdown.append("\n\n");
+            }
+            markdown.append(docText.strip());
+        }
+        return markdown.length() == 0 ? null : markdown.toString();
+    }
+
+    private List<BridgeLocation> resolveDefinitionLocations(Project project, VirtualFile virtualFile, Document document, int offset) {
+        List<PsiElement> targets = resolveTargets(project, virtualFile, document, offset);
+        List<BridgeLocation> locations = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (PsiElement target : targets) {
+            BridgeLocation location = toBridgeLocation(navigationTarget(target));
+            if (location == null) {
+                continue;
+            }
+            String key = location.uri() + ":" + location.range().start().line() + ":" + location.range().start().character();
+            if (seen.add(key)) {
+                locations.add(location);
+            }
+        }
+        return locations;
+    }
+
+    private List<PsiElement> resolveTargets(Project project, VirtualFile virtualFile, Document document, int offset) {
+        return ApplicationManager.getApplication().runReadAction((Computable<List<PsiElement>>) () -> {
+            PsiFile psiFile = PsiManager.getInstance(project).findFile(virtualFile);
+            if (psiFile == null) {
+                return List.of();
+            }
+            PsiElement leaf = psiElementAtOffset(psiFile, offset);
+            if (leaf == null) {
+                return List.of();
+            }
+            LinkedHashSet<PsiElement> resolved = new LinkedHashSet<>();
+            for (PsiElement current = leaf; current != null && current != psiFile; current = current.getParent()) {
+                collectKotlinResolvedTargets(project, current, resolved);
+                collectResolvedTargets(current.getReference(), resolved);
+                for (PsiReference reference : current.getReferences()) {
+                    collectResolvedTargets(reference, resolved);
+                }
+                if (!resolved.isEmpty()) {
+                    break;
+                }
+            }
+            return new ArrayList<>(resolved);
+        });
+    }
+
+    private PsiElement declarationAtOffset(Project project, VirtualFile virtualFile, int offset) {
+        return ApplicationManager.getApplication().runReadAction((Computable<PsiElement>) () -> {
+            PsiFile psiFile = PsiManager.getInstance(project).findFile(virtualFile);
+            if (psiFile == null) {
+                return null;
+            }
+            PsiElement leaf = psiElementAtOffset(psiFile, offset);
+            for (PsiElement current = leaf; current != null && current != psiFile; current = current.getParent()) {
+                if (current instanceof KtNamedDeclaration || current instanceof PsiNameIdentifierOwner || current instanceof PsiMethod || current instanceof PsiClass || current instanceof PsiField) {
+                    return current;
+                }
+            }
+            return leaf;
+        });
+    }
+
+    private PsiElement psiElementAtOffset(PsiFile psiFile, int offset) {
+        int safeOffset = Math.max(0, Math.min(offset, psiFile.getTextLength()));
+        PsiElement element = psiFile.findElementAt(safeOffset);
+        if (element == null && safeOffset > 0) {
+            element = psiFile.findElementAt(safeOffset - 1);
+        }
+        return element;
+    }
+
+    private void collectResolvedTargets(PsiReference reference, Set<PsiElement> resolved) {
+        if (reference == null) {
+            return;
+        }
+        if (reference instanceof PsiPolyVariantReference polyReference) {
+            for (ResolveResult result : polyReference.multiResolve(false)) {
+                if (result != null && result.getElement() != null) {
+                    resolved.add(result.getElement());
+                }
+            }
+            return;
+        }
+        PsiElement target = reference.resolve();
+        if (target != null) {
+            resolved.add(target);
+        }
+    }
+
+    private void collectKotlinResolvedTargets(Project project, PsiElement element, Set<PsiElement> resolved) {
+        for (KtElement candidate : kotlinReferenceCandidates(element)) {
+            try {
+                KtReference mainReference = candidate instanceof KtReferenceExpression referenceExpression
+                    ? ReferenceUtilKt.getMainReference(referenceExpression)
+                    : ReferenceUtilKt.getMainReference(candidate);
+                collectResolvedTargets(mainReference, resolved);
+                for (DeclarationDescriptor descriptor : ReferenceUtilKt.resolveMainReferenceToDescriptors(candidate)) {
+                    PsiElement declaration = DescriptorToSourceUtilsIde.INSTANCE.getAnyDeclaration(project, descriptor);
+                    if (declaration != null) {
+                        resolved.add(declaration);
+                    }
+                }
+            } catch (Throwable ignored) {
+                // Some PSI nodes are not resolvable through Kotlin's main-reference helpers.
+            }
+        }
+    }
+
+    private List<KtElement> kotlinReferenceCandidates(PsiElement element) {
+        List<KtElement> candidates = new ArrayList<>();
+        if (element instanceof KtCallExpression callExpression && callExpression.getCalleeExpression() instanceof KtElement callee) {
+            candidates.add(callee);
+        }
+        if (element instanceof KtReferenceExpression referenceExpression) {
+            candidates.add(referenceExpression);
+        } else if (element instanceof KtElement ktElement) {
+            candidates.add(ktElement);
+        }
+        return candidates;
+    }
+
+    private PsiElement navigationTarget(PsiElement element) {
+        if (element == null) {
+            return null;
+        }
+        if (element instanceof KtDeclaration declaration) {
+            KtDeclaration sourceNavigation = SourceNavigationHelper.INSTANCE.getNavigationElement(declaration);
+            if (sourceNavigation != null) {
+                return sourceNavigation;
+            }
+        }
+        PsiElement navigation = element.getNavigationElement();
+        return navigation != null ? navigation : element;
+    }
+
+    private BridgeLocation toBridgeLocation(PsiElement element) {
+        if (element == null) {
+            return null;
+        }
+        PsiFile file = element.getContainingFile();
+        if (file == null || file.getVirtualFile() == null || element.getTextRange() == null) {
+            return null;
+        }
+        Document targetDocument = FileDocumentManager.getInstance().getDocument(file.getVirtualFile());
+        if (targetDocument == null) {
+            return null;
+        }
+        TextRange range = preferredTextRange(element);
+        int startOffset = Math.max(0, Math.min(range.getStartOffset(), targetDocument.getTextLength()));
+        int endOffset = Math.max(startOffset, Math.min(range.getEndOffset(), targetDocument.getTextLength()));
+        return new BridgeLocation(
+            file.getVirtualFile().getUrl(),
+            new BridgeRange(positionForOffset(targetDocument, startOffset), positionForOffset(targetDocument, endOffset))
+        );
+    }
+
+    private TextRange preferredTextRange(PsiElement element) {
+        if (element instanceof PsiNameIdentifierOwner named && named.getNameIdentifier() != null) {
+            return named.getNameIdentifier().getTextRange();
+        }
+        if (element instanceof KtNamedDeclaration named && named.getNameIdentifier() != null) {
+            return named.getNameIdentifier().getTextRange();
+        }
+        return element.getTextRange();
+    }
+
+    private BridgePosition positionForOffset(Document document, int offset) {
+        int safeOffset = Math.max(0, Math.min(offset, document.getTextLength()));
+        int line = document.getLineNumber(safeOffset);
+        int lineStart = document.getLineStartOffset(line);
+        return new BridgePosition(line, safeOffset - lineStart);
+    }
+
+    private String renderSignature(PsiElement element) {
+        if (element == null) {
+            return null;
+        }
+        if (element instanceof PsiMethod method) {
+            String returnType = method.getReturnType() != null ? method.getReturnType().getPresentableText() + " " : "";
+            return returnType + method.getName() + method.getParameterList().getText();
+        }
+        if (element instanceof PsiField field) {
+            return field.getType().getPresentableText() + " " + field.getName();
+        }
+        if (element instanceof PsiClass psiClass) {
+            String kind = psiClass.isInterface() ? "interface" : (psiClass.isEnum() ? "enum class" : "class");
+            return kind + " " + psiClass.getName();
+        }
+        String text = element.getText();
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        text = text.replace("\r", "");
+        int braceIndex = text.indexOf('{');
+        if (braceIndex > 0) {
+            text = text.substring(0, braceIndex);
+        }
+        StringBuilder signature = new StringBuilder();
+        int added = 0;
+        for (String line : text.strip().split("\\R")) {
+            String trimmed = line.stripTrailing();
+            if (trimmed.isBlank()) {
+                if (added > 0) {
+                    break;
+                }
+                continue;
+            }
+            if (signature.length() > 0) {
+                signature.append('\n');
+            }
+            signature.append(trimmed);
+            added += 1;
+            if (added >= 8) {
+                break;
+            }
+        }
+        return signature.length() == 0 ? null : signature.toString();
+    }
+
+    private String extractLeadingDocText(PsiElement element) {
+        if (element instanceof PsiDocCommentOwner owner && owner.getDocComment() != null) {
+            return stripDocComment(owner.getDocComment().getText());
+        }
+        if (element == null || element.getContainingFile() == null || element.getContainingFile().getVirtualFile() == null || element.getTextRange() == null) {
+            return null;
+        }
+        Document document = FileDocumentManager.getInstance().getDocument(element.getContainingFile().getVirtualFile());
+        if (document == null) {
+            return null;
+        }
+        String fullText = document.getText();
+        int startOffset = Math.max(0, Math.min(element.getTextRange().getStartOffset(), fullText.length()));
+        String prefix = fullText.substring(0, startOffset);
+        int docEnd = prefix.lastIndexOf("*/");
+        if (docEnd < 0) {
+            return null;
+        }
+        String between = prefix.substring(docEnd + 2);
+        if (!between.isBlank()) {
+            return null;
+        }
+        int docStart = prefix.lastIndexOf("/**", docEnd);
+        if (docStart < 0) {
+            return null;
+        }
+        return stripDocComment(fullText.substring(docStart, docEnd + 2));
+    }
+
+    private String stripDocComment(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        String normalized = raw
+            .replace("\r", "")
+            .replaceFirst("^/\\*\\*", "")
+            .replaceFirst("\\*/$", "");
+        StringBuilder text = new StringBuilder();
+        for (String line : normalized.split("\\R")) {
+            String cleaned = line.replaceFirst("^\\s*\\*\\s?", "").stripTrailing();
+            if (text.length() > 0) {
+                text.append('\n');
+            }
+            text.append(cleaned);
+        }
+        String stripped = text.toString().strip();
+        return stripped.isEmpty() ? null : stripped;
+    }
+
     private DocumentHandle loadDocumentHandle(String filePath) {
         VirtualFile virtualFile = ApplicationManager.getApplication().runReadAction(
             (Computable<VirtualFile>) () -> LocalFileSystem.getInstance().refreshAndFindFileByNioFile(Path.of(filePath))
@@ -233,7 +627,8 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         Document document,
         int offset,
         CompletionType completionType,
-        int limit
+        int limit,
+        int invocationCount
     ) {
         Application app = ApplicationManager.getApplication();
         Editor editor = app.runReadAction((Computable<Editor>) () -> EditorFactory.getInstance().createEditor(document, project, virtualFile, false));
@@ -244,7 +639,7 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             }, ModalityState.nonModal());
             app.invokeAndWait(() -> {
                 CodeCompletionHandlerBase handler = CodeCompletionHandlerBase.createHandler(completionType, false, false, false);
-                handler.invokeCompletion(project, editor, 1, false);
+                handler.invokeCompletion(project, editor, invocationCount, false);
             }, ModalityState.nonModal());
             Lookup lookup = waitForLookup(editor);
             if (lookup == null) {
@@ -287,24 +682,27 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
     }
 
     private List<BridgeCompletionItem> mergeCompletions(
-        List<BridgeCompletionItem> smartItems,
-        List<BridgeCompletionItem> basicItems,
-        int limit
+        int limit,
+        List<BridgeCompletionItem>... completionGroups
     ) {
         Map<String, BridgeCompletionItem> merged = new LinkedHashMap<>();
-        for (BridgeCompletionItem item : smartItems) {
-            merged.put(keyOf(item), item);
-            if (merged.size() >= limit) {
-                return new ArrayList<>(merged.values());
-            }
-        }
-        for (BridgeCompletionItem item : basicItems) {
-            merged.putIfAbsent(keyOf(item), item);
-            if (merged.size() >= limit) {
-                break;
+        for (List<BridgeCompletionItem> group : completionGroups) {
+            for (BridgeCompletionItem item : group) {
+                merged.putIfAbsent(keyOf(item), item);
+                if (merged.size() >= limit) {
+                    return new ArrayList<>(merged.values());
+                }
             }
         }
         return new ArrayList<>(merged.values());
+    }
+
+    private boolean isMemberAccessContext(String text, int offset) {
+        int cursor = Math.max(0, Math.min(offset, text.length()));
+        while (cursor > 0 && Character.isJavaIdentifierPart(text.charAt(cursor - 1))) {
+            cursor--;
+        }
+        return cursor > 0 && text.charAt(cursor - 1) == '.';
     }
 
     private String keyOf(BridgeCompletionItem item) {
@@ -430,11 +828,26 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
 
     private record BridgeRequest(long id, String method, CompletionPayload payload) {}
 
-    private record CompletionPayload(String projectRoot, String filePath, String text, int offset, int limit) {}
+    private record CompletionPayload(String projectRoot, String filePath, String text, int offset, int limit, int rangeStart, int rangeEnd) {}
 
-    private record BridgeResponse(long id, boolean success, String message, List<BridgeCompletionItem> items, String error) {}
+    private record BridgeResponse(
+        long id,
+        boolean success,
+        String message,
+        List<BridgeCompletionItem> items,
+        List<BridgeLocation> locations,
+        String hoverMarkdown,
+        String formattedText,
+        String error
+    ) {}
 
     private record DocumentHandle(VirtualFile virtualFile, Document document) {}
+
+    private record BridgeLocation(String uri, BridgeRange range) {}
+
+    private record BridgeRange(BridgePosition start, BridgePosition end) {}
+
+    private record BridgePosition(int line, int character) {}
 
     private record BridgeCompletionItem(
         String label,

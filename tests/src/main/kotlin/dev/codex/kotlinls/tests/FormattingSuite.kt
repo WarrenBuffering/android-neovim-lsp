@@ -173,56 +173,59 @@ fun formattingSuite(): TestSuite {
                 assertContains(formatted, "fun second(name: String) = name.trim()")
             },
             TestCase("fallback formatting organizes imports and trims trailing whitespace without style linting") {
-                val root = Files.createTempDirectory("kotlinls-format-editorconfig")
-                root.resolve("src/main/kotlin/demo").createDirectories()
-                root.resolve("settings.gradle.kts").writeText("""rootProject.name = "tmp"""" + "\n")
-                root.resolve("build.gradle.kts").writeText(
-                    """
-                    plugins {
-                        kotlin("jvm") version "2.3.20"
-                    }
+                withSystemProperty("kotlinls.disableIntellijBridge", "true") {
+                    val localFormattingService = FormattingService()
+                    val root = Files.createTempDirectory("kotlinls-format-editorconfig")
+                    root.resolve("src/main/kotlin/demo").createDirectories()
+                    root.resolve("settings.gradle.kts").writeText("""rootProject.name = "tmp"""" + "\n")
+                    root.resolve("build.gradle.kts").writeText(
+                        """
+                        plugins {
+                            kotlin("jvm") version "2.3.20"
+                        }
 
-                    repositories {
-                        mavenCentral()
-                    }
-                    """.trimIndent() + "\n",
-                )
-                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
-                val content = """
-                    package demo
+                        repositories {
+                            mavenCentral()
+                        }
+                        """.trimIndent() + "\n",
+                    )
+                    val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                    val content = """
+                        package demo
 
-                    import kotlin.collections.listOf
-                    import kotlin.collections.setOf
+                        import kotlin.collections.listOf
+                        import kotlin.collections.setOf
 
-                    fun greet() = listOf("hi")   
+                        fun greet() = listOf("hi")   
 
 
-                """.trimIndent()
-                appFile.writeText(content)
-                val project = importer.importProject(root)
-                val store = TextDocumentStore()
-                store.open(
-                    dev.codex.kotlinls.protocol.TextDocumentItem(
-                        uri = appFile.toUri().toString(),
-                        languageId = "kotlin",
-                        version = 10,
-                        text = content,
-                    ),
-                )
-                val snapshot = analyzer.analyze(project, store)
-                val edits = formattingService.formatDocument(
-                    snapshot,
-                    DocumentFormattingParams(
-                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
-                        options = FormattingOptions(tabSize = 8, insertSpaces = false),
-                    ),
-                )
-                val formatted = applyEdits(content, edits)
-                assertContains(formatted, "import kotlin.collections.listOf")
-                assertContains(formatted, "import kotlin.collections.setOf")
-                assertTrue("fun greet() = listOf(\"hi\")   " !in formatted) { "Expected trailing whitespace trim: $formatted" }
-                assertTrue(formatted.endsWith("\n")) { "Expected trailing newline in fallback output" }
-                assertEquals(false, formattingService.shouldPublishStyleDiagnostics(appFile))
+                    """.trimIndent()
+                    appFile.writeText(content)
+                    val project = importer.importProject(root)
+                    val store = TextDocumentStore()
+                    store.open(
+                        dev.codex.kotlinls.protocol.TextDocumentItem(
+                            uri = appFile.toUri().toString(),
+                            languageId = "kotlin",
+                            version = 10,
+                            text = content,
+                        ),
+                    )
+                    val snapshot = analyzer.analyze(project, store)
+                    val edits = localFormattingService.formatDocument(
+                        snapshot,
+                        DocumentFormattingParams(
+                            textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                            options = FormattingOptions(tabSize = 8, insertSpaces = false),
+                        ),
+                    )
+                    val formatted = applyEdits(content, edits)
+                    assertContains(formatted, "import kotlin.collections.listOf")
+                    assertContains(formatted, "import kotlin.collections.setOf")
+                    assertTrue("fun greet() = listOf(\"hi\")   " !in formatted) { "Expected trailing whitespace trim: $formatted" }
+                    assertTrue(formatted.endsWith("\n")) { "Expected trailing newline in fallback output" }
+                    assertEquals(false, localFormattingService.shouldPublishStyleDiagnostics(appFile))
+                }
             },
             TestCase("IntelliJ project style enables formatting defaults but not style diagnostics") {
                 val root = Files.createTempDirectory("kotlinls-format-style-gate")
@@ -258,94 +261,100 @@ fun formattingSuite(): TestSuite {
                 assertEquals(emptyList<dev.codex.kotlinls.protocol.Diagnostic>(), formattingService.lintDocument(appFile, "fun demo( )=1"))
             },
             TestCase("fallback formatting does not rewrite indentation based on editor tab size") {
-                val root = Files.createTempDirectory("kotlinls-format-kotlin-official")
-                root.resolve("src/main/kotlin/demo").createDirectories()
-                root.resolve("settings.gradle.kts").writeText("""rootProject.name = "tmp"""" + "\n")
-                root.resolve("build.gradle.kts").writeText(
-                    """
-                    plugins {
-                        kotlin("jvm") version "2.3.20"
-                    }
-
-                    repositories {
-                        mavenCentral()
-                    }
-                    """.trimIndent() + "\n",
-                )
-                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
-                val content = """
-                    package demo
-
-                    fun greet() {
-                        if (true) {
-                            println("hi")
+                withSystemProperty("kotlinls.disableIntellijBridge", "true") {
+                    val localFormattingService = FormattingService()
+                    val root = Files.createTempDirectory("kotlinls-format-kotlin-official")
+                    root.resolve("src/main/kotlin/demo").createDirectories()
+                    root.resolve("settings.gradle.kts").writeText("""rootProject.name = "tmp"""" + "\n")
+                    root.resolve("build.gradle.kts").writeText(
+                        """
+                        plugins {
+                            kotlin("jvm") version "2.3.20"
                         }
-                    }
-                """.trimIndent()
-                appFile.writeText(content)
-                val project = importer.importProject(root)
-                val store = TextDocumentStore()
-                store.open(
-                    dev.codex.kotlinls.protocol.TextDocumentItem(
-                        uri = appFile.toUri().toString(),
-                        languageId = "kotlin",
-                        version = 10,
-                        text = content,
-                    ),
-                )
-                val snapshot = analyzer.analyze(project, store)
-                val edits = formattingService.formatDocument(
-                    snapshot,
-                    DocumentFormattingParams(
-                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
-                        options = FormattingOptions(tabSize = 2, insertSpaces = true),
-                    ),
-                )
-                val formatted = applyEdits(content, edits)
-                assertEquals(content + "\n", formatted)
+
+                        repositories {
+                            mavenCentral()
+                        }
+                        """.trimIndent() + "\n",
+                    )
+                    val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                    val content = """
+                        package demo
+
+                        fun greet() {
+                            if (true) {
+                                println("hi")
+                            }
+                        }
+                    """.trimIndent()
+                    appFile.writeText(content)
+                    val project = importer.importProject(root)
+                    val store = TextDocumentStore()
+                    store.open(
+                        dev.codex.kotlinls.protocol.TextDocumentItem(
+                            uri = appFile.toUri().toString(),
+                            languageId = "kotlin",
+                            version = 10,
+                            text = content,
+                        ),
+                    )
+                    val snapshot = analyzer.analyze(project, store)
+                    val edits = localFormattingService.formatDocument(
+                        snapshot,
+                        DocumentFormattingParams(
+                            textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                            options = FormattingOptions(tabSize = 2, insertSpaces = true),
+                        ),
+                    )
+                    val formatted = applyEdits(content, edits)
+                    assertEquals(content + "\n", formatted)
+                }
             },
             TestCase("fallback formatting is stable across editor tab options") {
-                val root = Files.createTempDirectory("kotlinls-format-default-official")
-                root.resolve("src/main/kotlin/demo").createDirectories()
-                root.resolve("settings.gradle.kts").writeText("""rootProject.name = "tmp"""" + "\n")
-                root.resolve("build.gradle.kts").writeText(
-                    """
-                    plugins {
-                        kotlin("jvm") version "2.3.20"
-                    }
+                withSystemProperty("kotlinls.disableIntellijBridge", "true") {
+                    val localFormattingService = FormattingService()
+                    val root = Files.createTempDirectory("kotlinls-format-default-official")
+                    root.resolve("src/main/kotlin/demo").createDirectories()
+                    root.resolve("settings.gradle.kts").writeText("""rootProject.name = "tmp"""" + "\n")
+                    root.resolve("build.gradle.kts").writeText(
+                        """
+                        plugins {
+                            kotlin("jvm") version "2.3.20"
+                        }
 
-                    repositories {
-                        mavenCentral()
-                    }
-                    """.trimIndent() + "\n",
-                )
-                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
-                val content = """
-                    package demo
+                        repositories {
+                            mavenCentral()
+                        }
+                        """.trimIndent() + "\n",
+                    )
+                    val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                    val content = """
+                        package demo
 
-                    fun greet() = "hi"
-                """.trimIndent()
-                appFile.writeText(content)
-                val project = importer.importProject(root)
-                val store = TextDocumentStore()
-                store.open(
-                    dev.codex.kotlinls.protocol.TextDocumentItem(
-                        uri = appFile.toUri().toString(),
-                        languageId = "kotlin",
-                        version = 10,
-                        text = content,
-                    ),
-                )
-                val snapshot = analyzer.analyze(project, store)
-                val edits = formattingService.formatDocument(
-                    snapshot,
-                    DocumentFormattingParams(
-                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
-                        options = FormattingOptions(tabSize = 2, insertSpaces = false),
-                    ),
-                )
-                val formatted = applyEdits(content, edits)
-                assertEquals(content + "\n", formatted)
+                        fun greet() = "hi"
+                    """.trimIndent()
+                    appFile.writeText(content)
+                    val project = importer.importProject(root)
+                    val store = TextDocumentStore()
+                    store.open(
+                        dev.codex.kotlinls.protocol.TextDocumentItem(
+                            uri = appFile.toUri().toString(),
+                            languageId = "kotlin",
+                            version = 10,
+                            text = content,
+                        ),
+                    )
+                    val snapshot = analyzer.analyze(project, store)
+                    val edits = localFormattingService.formatDocument(
+                        snapshot,
+                        DocumentFormattingParams(
+                            textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                            options = FormattingOptions(tabSize = 2, insertSpaces = false),
+                        ),
+                    )
+                    val formatted = applyEdits(content, edits)
+                    assertEquals(content + "\n", formatted)
+                }
             },
             TestCase("reads IntelliJ Kotlin project code style options used by fallback formatting") {
                 val root = Files.createTempDirectory("kotlinls-format-intellij-style")
@@ -591,6 +600,72 @@ fun formattingSuite(): TestSuite {
                 contents.resolve("jbr/Contents/Home/bin/java").writeText("")
                 val bridge = JetBrainsFormatterBridge.fromIdeaHome(contents)
                 assertTrue(bridge != null) { "Expected JetBrains bridge to be detected from fake bundle" }
+            },
+            TestCase("JetBrains bridge only opts into incubator vector when runtime provides it") {
+                val root = Files.createTempDirectory("kotlinls-idea-home-no-vector")
+                val contents = root.resolve("Android Studio.app/Contents")
+                contents.resolve("Resources").createDirectories()
+                contents.resolve("bin").createDirectories()
+                contents.resolve("lib").createDirectories()
+                contents.resolve("plugins/Kotlin/lib").createDirectories()
+                contents.resolve("jbr/Contents/Home/bin").createDirectories()
+                contents.resolve("jbr/Contents/Home/jmods").createDirectories()
+                contents.resolve("Resources/product-info.json").writeText(
+                    """
+                    {
+                      "launch": [
+                        {
+                          "os": "macOS",
+                          "arch": "aarch64",
+                          "vmOptionsFilePath": "../bin/studio.vmoptions",
+                          "bootClassPathJarNames": ["app.jar"],
+                          "additionalJvmArguments": [
+                            "-Didea.platform.prefix=AndroidStudio",
+                            "--add-opens=java.base/java.lang=ALL-UNNAMED"
+                          ],
+                          "mainClass": "com.android.tools.idea.MainWrapper"
+                        }
+                      ]
+                    }
+                    """.trimIndent() + "\n",
+                )
+                contents.resolve("bin/studio.vmoptions").writeText("-Xmx512m\n")
+                contents.resolve("lib/app.jar").writeText("")
+                contents.resolve("plugins/Kotlin/lib/kotlin-plugin.jar").writeText("")
+                contents.resolve("jbr/Contents/Home/bin/java").writeText("")
+                val bridge = JetBrainsFormatterBridge.fromIdeaHome(contents) ?: error("Expected bridge")
+                val jvmArgsField = bridge.javaClass.getDeclaredField("jvmArgs").apply { isAccessible = true }
+                val jvmArgs = jvmArgsField.get(bridge) as List<*>
+                assertTrue("--add-modules=jdk.incubator.vector" !in jvmArgs) {
+                    "Expected bridge to skip incubator vector when jmod is missing, got $jvmArgs"
+                }
+            },
+            TestCase("real Android Studio bridge formats malformed Kotlin when available") {
+                val ideaHome = Path("/Applications/Android Studio.app/Contents")
+                if (!Files.isDirectory(ideaHome)) {
+                    return@TestCase
+                }
+                val bridge = JetBrainsFormatterBridge.fromIdeaHome(ideaHome) ?: return@TestCase
+                val tempFile = Files.createTempFile("kotlinls-real-formatter", ".kt")
+                val content = """
+                    package demo
+
+                    fun  probe( )= 1
+                """.trimIndent() + "\n"
+                tempFile.writeText(content)
+                val formatted = bridge.format(tempFile, content, 30_000) ?: error("Expected JetBrains bridge to format Kotlin source")
+                assertContains(formatted, "fun probe() = 1")
+            },
+            TestCase("formatter temp file keeps visible Kotlin filename") {
+                val root = Files.createTempDirectory("kotlinls-format-temp-file")
+                val appFile = root.resolve("IgnisMapView.kt")
+                val method = FormattingService::class.java.getDeclaredMethod("createFormatterTempFile", java.nio.file.Path::class.java)
+                method.isAccessible = true
+                val tempPath = method.invoke(formattingService, appFile) as java.nio.file.Path
+                val fileName = tempPath.fileName.toString()
+                assertTrue(!fileName.startsWith(".")) { "Expected formatter temp file to stay visible, got $fileName" }
+                assertTrue(fileName.endsWith(".kt")) { "Expected formatter temp file to keep Kotlin extension, got $fileName" }
+                assertContains(fileName, "IgnisMapView")
             },
             TestCase("keeps JetBrains formatter bridge off by default") {
                 withSystemProperty("kotlinls.enableIntellijBridge", null) {
