@@ -11,6 +11,10 @@ import kotlin.io.path.exists
 class PersistentSupportSymbolCache(
     private val cacheRoot: Path = defaultSupportCacheRoot(),
 ) {
+    private val cacheLock = Any()
+    private val manifestCache = linkedMapOf<ManifestCacheKey, PersistedSupportSymbolCache>()
+    private val packageCache = linkedMapOf<SupportPackageCacheKey, List<IndexedSymbol>>()
+
     fun load(
         projectRoot: Path,
         fingerprint: String,
@@ -20,7 +24,7 @@ class PersistentSupportSymbolCache(
             SupportSymbolLayer(
                 fingerprint = manifest.fingerprint,
                 symbols = manifest.packages.flatMap { shard ->
-                    loadPackageSymbols(packageFile(projectRoot, shard.fileName))
+                    loadPackageSymbols(projectRoot, manifest.fingerprint, shard.fileName)
                 },
             )
         }.getOrNull()
@@ -43,7 +47,7 @@ class PersistentSupportSymbolCache(
                     .asSequence()
                     .filter { shard -> normalizePackageName(shard.packageName) in requested }
                     .flatMap { shard ->
-                        loadPackageSymbols(packageFile(projectRoot, shard.fileName)).asSequence()
+                        loadPackageSymbols(projectRoot, manifest.fingerprint, shard.fileName).asSequence()
                     }
                     .toList(),
             )
@@ -60,6 +64,7 @@ class PersistentSupportSymbolCache(
             val packagesRoot = packageRoot(projectRoot)
             packagesRoot.toFile().deleteRecursively()
             packagesRoot.createDirectories()
+            invalidateMemoryCache(projectRoot)
             val packageEntries = layer.symbols
                 .groupBy { normalizePackageName(it.packageName) }
                 .toSortedMap()
@@ -109,6 +114,15 @@ class PersistentSupportSymbolCache(
                 ),
             )
             Files.move(tempFile, cacheFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            rememberManifest(
+                ManifestCacheKey(projectRoot.normalize(), layer.fingerprint),
+                PersistedSupportSymbolCache(
+                    schemaVersion = SCHEMA_VERSION,
+                    fingerprint = layer.fingerprint,
+                    projectRoot = projectRoot.normalize().toString(),
+                    packages = packageEntries,
+                ),
+            )
         }
     }
 
@@ -127,42 +141,108 @@ class PersistentSupportSymbolCache(
         projectRoot: Path,
         fingerprint: String,
     ): PersistedSupportSymbolCache? {
+        val normalizedProjectRoot = projectRoot.normalize()
+        val key = ManifestCacheKey(normalizedProjectRoot, fingerprint)
+        synchronized(cacheLock) {
+            manifestCache[key]?.let { return it }
+        }
         val cacheFile = cacheFile(projectRoot)
         if (!cacheFile.exists()) return null
-        return runCatching {
+        val manifest = runCatching {
             Json.mapper.readValue(cacheFile.toFile(), PersistedSupportSymbolCache::class.java)
         }.getOrNull()
             ?.takeIf { it.schemaVersion == SCHEMA_VERSION }
-            ?.takeIf { it.projectRoot == projectRoot.normalize().toString() }
+            ?.takeIf { it.projectRoot == normalizedProjectRoot.toString() }
             ?.takeIf { it.fingerprint == fingerprint }
+        if (manifest != null) {
+            rememberManifest(key, manifest)
+        }
+        return manifest
     }
 
-    private fun loadPackageSymbols(packageFile: Path): List<IndexedSymbol> =
-        Json.mapper.readValue(packageFile.toFile(), Array<PersistedSupportIndexedSymbol>::class.java)
-            .map { symbol ->
-                IndexedSymbol(
-                    id = symbol.id,
-                    name = symbol.name,
-                    fqName = symbol.fqName,
-                    kind = symbol.kind,
-                    path = Path.of(symbol.path),
-                    uri = symbol.uri,
-                    range = symbol.range,
-                    selectionRange = symbol.selectionRange,
-                    containerName = symbol.containerName,
-                    containerFqName = symbol.containerFqName,
-                    signature = symbol.signature,
-                    documentation = symbol.documentation,
-                    packageName = symbol.packageName,
-                    moduleName = symbol.moduleName,
-                    importable = symbol.importable,
-                    receiverType = symbol.receiverType,
-                    resultType = symbol.resultType,
-                    parameterCount = symbol.parameterCount,
-                    supertypes = symbol.supertypes,
-                )
-            }
+    private fun loadPackageSymbols(
+        projectRoot: Path,
+        fingerprint: String,
+        fileName: String,
+    ): List<IndexedSymbol> {
+        val key = SupportPackageCacheKey(projectRoot.normalize(), fingerprint, fileName)
+        synchronized(cacheLock) {
+            packageCache[key]?.let { return it }
+        }
+        val symbols = Json.mapper.readValue(
+            packageFile(projectRoot, fileName).toFile(),
+            Array<PersistedSupportIndexedSymbol>::class.java,
+        ).map { symbol ->
+            IndexedSymbol(
+                id = symbol.id,
+                name = symbol.name,
+                fqName = symbol.fqName,
+                kind = symbol.kind,
+                path = Path.of(symbol.path),
+                uri = symbol.uri,
+                range = symbol.range,
+                selectionRange = symbol.selectionRange,
+                containerName = symbol.containerName,
+                containerFqName = symbol.containerFqName,
+                signature = symbol.signature,
+                documentation = symbol.documentation,
+                packageName = symbol.packageName,
+                moduleName = symbol.moduleName,
+                importable = symbol.importable,
+                receiverType = symbol.receiverType,
+                resultType = symbol.resultType,
+                parameterCount = symbol.parameterCount,
+                supertypes = symbol.supertypes,
+            )
+        }
+        synchronized(cacheLock) {
+            packageCache[key] = symbols
+            trimCache(packageCache, 256)
+        }
+        return symbols
+    }
 
+    private fun invalidateMemoryCache(projectRoot: Path) {
+        val normalizedRoot = projectRoot.normalize()
+        synchronized(cacheLock) {
+            manifestCache.keys
+                .filter { key -> key.projectRoot == normalizedRoot }
+                .toList()
+                .forEach(manifestCache::remove)
+            packageCache.keys
+                .filter { key -> key.projectRoot == normalizedRoot }
+                .toList()
+                .forEach(packageCache::remove)
+        }
+    }
+
+    private fun rememberManifest(
+        key: ManifestCacheKey,
+        manifest: PersistedSupportSymbolCache,
+    ) {
+        synchronized(cacheLock) {
+            manifestCache[key] = manifest
+            trimCache(manifestCache, 8)
+        }
+    }
+
+    private fun <K, V> trimCache(cache: LinkedHashMap<K, V>, maxEntries: Int) {
+        while (cache.size > maxEntries) {
+            val eldestKey = cache.entries.firstOrNull()?.key ?: break
+            cache.remove(eldestKey)
+        }
+    }
+
+    private data class ManifestCacheKey(
+        val projectRoot: Path,
+        val fingerprint: String,
+    )
+
+    private data class SupportPackageCacheKey(
+        val projectRoot: Path,
+        val fingerprint: String,
+        val fileName: String,
+    )
     private fun normalizePackageName(value: String): String = value.trim()
 
     private fun sha256(value: String): String =

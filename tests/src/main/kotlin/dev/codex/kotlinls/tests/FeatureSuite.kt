@@ -3,6 +3,8 @@ package dev.codex.kotlinls.tests
 import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.completion.CompletionService
 import dev.codex.kotlinls.hover.HoverAndSignatureService
+import dev.codex.kotlinls.index.IndexedSymbol
+import dev.codex.kotlinls.index.WorkspaceIndex
 import dev.codex.kotlinls.index.WorkspaceIndexBuilder
 import dev.codex.kotlinls.navigation.NavigationService
 import dev.codex.kotlinls.projectimport.GradleProjectImporter
@@ -12,8 +14,11 @@ import dev.codex.kotlinls.protocol.CompletionItemKind
 import dev.codex.kotlinls.protocol.CompletionList
 import dev.codex.kotlinls.protocol.InlayHintParams
 import dev.codex.kotlinls.protocol.Position
+import dev.codex.kotlinls.protocol.Range
+import dev.codex.kotlinls.protocol.SymbolKind
 import dev.codex.kotlinls.protocol.TextDocumentIdentifier
 import dev.codex.kotlinls.workspace.TextDocumentStore
+import java.nio.file.Path
 import kotlin.io.path.readText
 
 fun featureSuite(): TestSuite {
@@ -100,6 +105,54 @@ fun featureSuite(): TestSuite {
                 }
                 assertTrue("GroupThing" !in labels) {
                     "Expected import completion to exclude unrelated workspace symbols, got ${labels.take(10)}"
+                }
+            },
+            TestCase("prefers source-backed import completion details over lowered binary symbols") {
+                val index = WorkspaceIndex(
+                    symbols = listOf(
+                        indexedSymbol(
+                            id = "source::androidx.compose.foundation.layout.Column",
+                            name = "Column",
+                            fqName = "androidx.compose.foundation.layout.Column",
+                            signature = "Column(modifier: Modifier = ..., verticalArrangement: Arrangement.Vertical = ..., horizontalAlignment: Alignment.Horizontal = ..., content: @Composable ColumnScope.() -> Unit)",
+                            documentation = "A layout composable that places its children in a vertical sequence.",
+                            packageName = "androidx.compose.foundation.layout",
+                            path = Path.of("/tmp/androidx/compose/foundation/layout/Column.kt"),
+                            uri = "file:///tmp/androidx/compose/foundation/layout/Column.kt",
+                        ),
+                        indexedSymbol(
+                            id = "binary::androidx.compose.foundation.layout.Column",
+                            name = "Column",
+                            fqName = "androidx.compose.foundation.layout.Column",
+                            signature = "Column(Modifier, Vertical, Horizontal, Function3, Composer, int, int): void",
+                            documentation = null,
+                            packageName = "androidx.compose.foundation.layout",
+                            path = Path.of("/binary-libraries/foundation-layout/ColumnKt.class"),
+                            uri = "jar:file:///Users/test/.gradle/foundation-layout.jar!/androidx/compose/foundation/layout/ColumnKt.class",
+                        ),
+                    ),
+                    references = emptyList(),
+                    callEdges = emptyList(),
+                )
+                val text = """
+                    package demo
+
+                    import androidx.compose.foundation.layout.Col
+                """.trimIndent()
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = Path.of("/workspace/demo/App.kt"),
+                    text = text,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier("file:///workspace/demo/App.kt"),
+                        position = Position(2, text.lines()[2].length),
+                    ),
+                )
+                val column = completions.items.firstOrNull { it.label == "Column" }
+                assertTrue(column != null) { "Expected Column completion, got ${completions.items.map { it.label to it.detail }}" }
+                assertContains(column?.detail.orEmpty(), "vertical sequence")
+                assertTrue("Composer" !in column?.detail.orEmpty()) {
+                    "Expected source-backed completion detail, got ${column?.detail}"
                 }
             },
             TestCase("offers package segment completion inside imports") {
@@ -218,6 +271,59 @@ fun featureSuite(): TestSuite {
                 val topLabels = completions.items.take(10).map { it.label }
                 assertTrue(topLabels.contains("shout")) {
                     "Expected imported extension completion to stay near the top, got $topLabels"
+                }
+            },
+            TestCase("scopes index-only member completion through local parameter and inferred property types") {
+                val root = FixtureSupport.fixture("multi-module")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
+                val content = """
+                    package demo.app
+
+                    class StateHolder {
+                        fun collectAsState() = 1
+                        fun collectLatest() = 2
+                    }
+
+                    class Vm {
+                        val mapState = StateHolder()
+                    }
+
+                    fun collectNoise() = 0
+                    class CollectionIndex
+
+                    fun demo(vm: Vm) {
+                        vm.mapState.colle
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 32,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("vm.mapState.colle") }
+                val column = content.lines()[line].indexOf("colle") + 5
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                )
+                val labels = completions.items.take(10).map { it.label }
+                assertTrue("collectAsState" in labels) {
+                    "Expected receiver-scoped member completion, got $labels"
+                }
+                assertTrue("CollectionIndex" !in labels && "collectNoise" !in labels) {
+                    "Expected member completion to exclude unrelated globals, got $labels"
                 }
             },
             TestCase("merges weak semantic completions with indexed fallback candidates") {
@@ -537,6 +643,51 @@ fun featureSuite(): TestSuite {
                 assertContains(hoverText, "### Returns")
                 assertContains(hoverText, "greeting text")
             },
+            TestCase("prefers source-backed definitions over binary jar entries") {
+                val index = WorkspaceIndex(
+                    symbols = listOf(
+                        indexedSymbol(
+                            id = "source::androidx.compose.foundation.layout.Column",
+                            name = "Column",
+                            fqName = "androidx.compose.foundation.layout.Column",
+                            signature = "Column(modifier: Modifier = ..., content: @Composable ColumnScope.() -> Unit)",
+                            documentation = "A layout composable that places its children in a vertical sequence.",
+                            packageName = "androidx.compose.foundation.layout",
+                            path = Path.of("/tmp/androidx/compose/foundation/layout/Column.kt"),
+                            uri = "file:///tmp/androidx/compose/foundation/layout/Column.kt",
+                        ),
+                        indexedSymbol(
+                            id = "binary::androidx.compose.foundation.layout.Column",
+                            name = "Column",
+                            fqName = "androidx.compose.foundation.layout.Column",
+                            signature = "Column(Modifier, Vertical, Horizontal, Function3, Composer, int, int): void",
+                            documentation = null,
+                            packageName = "androidx.compose.foundation.layout",
+                            path = Path.of("/binary-libraries/foundation-layout/ColumnKt.class"),
+                            uri = "jar:file:///Users/test/.gradle/foundation-layout.jar!/androidx/compose/foundation/layout/ColumnKt.class",
+                        ),
+                    ),
+                    references = emptyList(),
+                    callEdges = emptyList(),
+                )
+                val text = """
+                    package demo
+
+                    import androidx.compose.foundation.layout.Column
+                """.trimIndent()
+                val locations = navigationService.definitionFromIndex(
+                    index = index,
+                    path = Path.of("/workspace/demo/App.kt"),
+                    text = text,
+                    params = dev.codex.kotlinls.protocol.TextDocumentPositionParams(
+                        textDocument = TextDocumentIdentifier("file:///workspace/demo/App.kt"),
+                        position = Position(2, text.lines()[2].lastIndexOf("Column") + 2),
+                    ),
+                )
+                assertTrue(locations.singleOrNull()?.uri == "file:///tmp/androidx/compose/foundation/layout/Column.kt") {
+                    "Expected source-backed definition target, got $locations"
+                }
+            },
             TestCase("resolves hover and definition for local variables") {
                 val root = FixtureSupport.fixture("simple-jvm-app")
                 val project = importer.importProject(root)
@@ -689,3 +840,28 @@ fun featureSuite(): TestSuite {
         ),
     )
 }
+
+private fun indexedSymbol(
+    id: String,
+    name: String,
+    fqName: String,
+    signature: String,
+    documentation: String?,
+    packageName: String,
+    path: Path,
+    uri: String,
+): IndexedSymbol = IndexedSymbol(
+    id = id,
+    name = name,
+    fqName = fqName,
+    kind = SymbolKind.FUNCTION,
+    path = path,
+    uri = uri,
+    range = Range(Position(1, 0), Position(1, 1)),
+    selectionRange = Range(Position(1, 0), Position(1, 1)),
+    signature = signature,
+    documentation = documentation,
+    packageName = packageName,
+    moduleName = "support",
+    importable = true,
+)

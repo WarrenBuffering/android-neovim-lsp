@@ -11,6 +11,7 @@ class SupportSymbolIndexBuilder(
     private val externalSourceMirror: ExternalSourceMirror = ExternalSourceMirror(),
     private val persistentSupportCache: PersistentSupportSymbolCache = PersistentSupportSymbolCache(),
     private val kotlinSourceIndexer: KotlinSourceIndexer = KotlinSourceIndexer(),
+    private val binaryClasspathSymbolIndexer: BinaryClasspathSymbolIndexer = BinaryClasspathSymbolIndexer(),
 ) {
     private val cacheLock = Any()
     private val supportSymbolLayers = linkedMapOf<Path, SupportSymbolLayer>()
@@ -55,9 +56,12 @@ class SupportSymbolIndexBuilder(
 
         val computed = SupportSymbolLayer(
             fingerprint = fingerprint,
-            symbols = buildJavaSourceSymbols(project) +
-                buildExternalLibrarySymbols(project) +
-                buildJdkSourceSymbols(),
+            symbols = (
+                buildJavaSourceSymbols(project) +
+                    buildExternalLibrarySymbols(project) +
+                    buildBinaryLibrarySymbols(project) +
+                    buildJdkSourceSymbols()
+                ).distinctBy { it.id },
         )
         synchronized(cacheLock) {
             supportSymbolLayers[projectRoot] = computed
@@ -84,6 +88,8 @@ class SupportSymbolIndexBuilder(
 
     private fun supportLayerFingerprint(project: ImportedProject): String =
         buildString {
+            append("support-index-v2-binary-members")
+            append('\n')
             project.modules.sortedBy { it.gradlePath }.forEach { module ->
                 append(module.gradlePath)
                 append('|')
@@ -94,6 +100,13 @@ class SupportSymbolIndexBuilder(
                 module.classpathSourceJars.sortedBy(Path::toString).forEach { jar ->
                     appendFileFingerprint(this, "sourceJar", jar.normalize())
                 }
+                append('|')
+                module.classpathJars
+                    .filter { it.isRegularFile() && it.extension == "jar" }
+                    .sortedBy(Path::toString)
+                    .forEach { jar ->
+                        appendFileFingerprint(this, "binaryJar", jar.normalize())
+                    }
                 append('\n')
             }
             defaultJdkSourceArchive()?.let { srcZip ->
@@ -131,6 +144,29 @@ class SupportSymbolIndexBuilder(
                     }
                     .toList()
             }
+
+    private fun buildBinaryLibrarySymbols(project: ImportedProject): List<IndexedSymbol> {
+        val sourceBackedBinaryNames = project.modules
+            .flatMap { module -> module.classpathSourceJars.asSequence() }
+            .map { sourceJar -> sourceJar.fileName.toString().removeSuffix(".jar").removeSuffix("-sources") }
+            .toSet()
+        val classpathEntries = project.modules
+            .flatMap { module -> module.classpathJars }
+            .distinctBy { it.normalize() }
+        return project.modules
+            .flatMap { module -> module.classpathJars.map { jar -> module.name to jar } }
+            .distinctBy { (_, jar) -> jar.normalize() }
+            .filter { (_, jar) ->
+                jar.isRegularFile() &&
+                    jar.extension == "jar" &&
+                    jar.fileName.toString().removeSuffix(".jar") !in sourceBackedBinaryNames
+            }
+            .flatMap { (moduleName, jar) ->
+                runCatching {
+                    binaryClasspathSymbolIndexer.index(jar, moduleName, classpathEntries)
+                }.getOrDefault(emptyList())
+            }
+    }
 
     private fun buildJdkSourceSymbols(): List<IndexedSymbol> {
         val srcZip = defaultJdkSourceArchive() ?: return emptyList()

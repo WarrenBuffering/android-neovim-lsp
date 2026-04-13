@@ -73,6 +73,7 @@ object SourceIndexLookup {
             .filter { candidate -> !importableOnly || candidate.importable }
             .sortedWith(
                 compareBy<IndexedSymbol>(
+                    { candidate -> -indexedSymbolQuality(candidate) },
                     { candidate -> if (packageName != null && candidate.packageName == packageName) 0 else 1 },
                     { candidate -> if (moduleName != null && candidate.moduleName == moduleName) 0 else 1 },
                     { candidate -> pathDistance(currentPath, candidate.path.normalize()) },

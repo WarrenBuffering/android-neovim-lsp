@@ -631,7 +631,12 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         int invocationCount
     ) {
         Application app = ApplicationManager.getApplication();
-        Editor editor = app.runReadAction((Computable<Editor>) () -> EditorFactory.getInstance().createEditor(document, project, virtualFile, false));
+        Editor[] editorHolder = new Editor[1];
+        app.invokeAndWait(
+            () -> editorHolder[0] = EditorFactory.getInstance().createEditor(document, project, virtualFile, false),
+            ModalityState.nonModal()
+        );
+        Editor editor = editorHolder[0];
         try {
             app.invokeAndWait(() -> {
                 editor.getCaretModel().moveToOffset(Math.max(0, Math.min(offset, document.getTextLength())));
@@ -645,13 +650,18 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             if (lookup == null) {
                 return List.of();
             }
-            List<BridgeCompletionItem> items = new ArrayList<>();
-            for (LookupElement element : lookup.getItems()) {
-                items.add(toBridgeItem(project, element, completionType == CompletionType.SMART));
-                if (items.size() >= limit) {
-                    break;
+            List<LookupElement> lookupItems = new ArrayList<>();
+            app.invokeAndWait(() -> lookupItems.addAll(lookup.getItems()), ModalityState.nonModal());
+            List<BridgeCompletionItem> items = app.runReadAction((Computable<List<BridgeCompletionItem>>) () -> {
+                List<BridgeCompletionItem> collected = new ArrayList<>();
+                for (LookupElement element : lookupItems) {
+                    collected.add(toBridgeItem(project, element, completionType == CompletionType.SMART));
+                    if (collected.size() >= limit) {
+                        break;
+                    }
                 }
-            }
+                return collected;
+            });
             app.invokeAndWait(() -> LookupManager.hideActiveLookup(project), ModalityState.nonModal());
             return items;
         } finally {

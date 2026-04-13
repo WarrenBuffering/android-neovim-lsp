@@ -11,17 +11,22 @@ import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.psi.KtCallableDeclaration
+import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtClass
 import org.jetbrains.kotlin.psi.KtClassOrObject
 import org.jetbrains.kotlin.psi.KtConstructor
 import org.jetbrains.kotlin.psi.KtDeclaration
 import org.jetbrains.kotlin.psi.KtEnumEntry
+import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
 import org.jetbrains.kotlin.psi.KtNamedFunction
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
 import org.jetbrains.kotlin.psi.KtObjectDeclaration
 import org.jetbrains.kotlin.psi.KtParameter
 import org.jetbrains.kotlin.psi.KtProperty
+import org.jetbrains.kotlin.psi.KtQualifiedExpression
+import org.jetbrains.kotlin.psi.KtSafeQualifiedExpression
 import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtTypeAlias
 import org.jetbrains.kotlin.psi.psiUtil.containingClassOrObject
@@ -136,9 +141,38 @@ class KotlinSourceIndexer : AutoCloseable {
     ): String? = when (this) {
         is KtConstructor<*> -> containingClassOrObject?.indexedFqName(packageName, containingClassOrObject?.name)
         is KtNamedFunction -> typeReference?.text
-        is KtProperty -> typeReference?.text
+        is KtProperty -> typeReference?.text ?: initializer?.inferredResultType(containingKtFile, packageName)
         is KtClassOrObject -> fqName
         else -> null
+    }
+
+    private fun KtExpression.inferredResultType(
+        file: KtFile,
+        packageName: String,
+    ): String? = when (this) {
+        is KtCallExpression -> calleeExpression?.text?.let { visibleName ->
+            resolveVisibleType(file, visibleName, packageName)
+        }
+
+        is KtQualifiedExpression -> selectorExpression?.inferredResultType(file, packageName)
+        is KtSafeQualifiedExpression -> selectorExpression?.inferredResultType(file, packageName)
+        is KtNameReferenceExpression -> resolveVisibleType(file, getReferencedName(), packageName)
+        else -> null
+    }
+
+    private fun resolveVisibleType(
+        file: KtFile,
+        visibleName: String,
+        packageName: String,
+    ): String? {
+        SourceIndexLookup.imports(file.text)
+            .firstOrNull { it.visibleName == visibleName }
+            ?.let { return it.fqName }
+        return when {
+            visibleName.contains('.') -> visibleName
+            visibleName.firstOrNull()?.isUpperCase() == true && packageName.isNotBlank() -> "$packageName.$visibleName"
+            else -> visibleName
+        }
     }
 
     private fun KtNamedDeclaration.parameterCount(): Int = when (this) {

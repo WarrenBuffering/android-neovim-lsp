@@ -40,7 +40,10 @@ import kotlin.io.path.name
 import kotlin.io.path.readText
 import kotlin.io.path.walk
 
-class WorkspaceIndexBuilder {
+class WorkspaceIndexBuilder(
+    private val includeSupportSymbols: Boolean = true,
+    private val supportSymbolIndexBuilder: SupportSymbolIndexBuilder = SupportSymbolIndexBuilder(),
+) {
     fun build(
         snapshot: WorkspaceAnalysisSnapshot,
         targetPaths: Set<Path>? = null,
@@ -97,8 +100,15 @@ class WorkspaceIndexBuilder {
             }
         }
 
+        val supportSymbols = when {
+            includeSupportSymbols -> supportSymbolIndexBuilder.loadOrBuild(snapshot.project).symbols
+            else -> emptyList()
+        }
+
         return WorkspaceIndex(
-            symbols = symbolAccumulator.sortedWith(compareBy({ it.name }, { it.path.toString() })),
+            symbols = (symbolAccumulator + supportSymbols)
+                .distinctBy { it.id }
+                .sortedWith(compareBy({ it.name }, { it.path.toString() })),
             references = references,
             callEdges = callEdges,
         )
