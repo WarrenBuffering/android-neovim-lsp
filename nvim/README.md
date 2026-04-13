@@ -4,7 +4,7 @@
 
 ```lua
 vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
-require("kotlin_neovim_lsp").setup()
+require("android_neovim_lsp").setup()
 ```
 
 If you used the release installer, this is the default runtime path it creates.
@@ -39,7 +39,7 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 `android-neovim-lsp` is not published to Mason in this repository state. If auto-detection is not enough, point `cmd` at the built executable:
 
 ```lua
-require("kotlin_neovim_lsp").setup({
+require("android_neovim_lsp").setup({
   cmd = { "/absolute/path/to/android-neovim-lsp/server/build/install/server/bin/android-neovim-lsp" },
 })
 ```

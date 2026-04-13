@@ -5,10 +5,10 @@ return {
       local configs = require("lspconfig.configs")
       local lspconfig = require("lspconfig")
 
-      if not configs.kotlin_neovim_lsp then
-        configs.kotlin_neovim_lsp = {
+      if not configs.android_neovim_lsp then
+        configs.android_neovim_lsp = {
           default_config = {
-            cmd = { "kotlin-neovim-lsp" },
+            cmd = { "android-neovim-lsp" },
             filetypes = { "kotlin" },
             root_dir = function(fname)
               return vim.fs.root(fname, {
@@ -25,7 +25,7 @@ return {
       end
 
       opts.servers = opts.servers or {}
-      opts.servers.kotlin_neovim_lsp = {
+      opts.servers.android_neovim_lsp = {
         on_attach = function(_, bufnr)
           vim.keymap.set("n", "<leader>co", function()
             vim.lsp.buf.code_action({
@@ -36,7 +36,7 @@ return {
         end,
       }
 
-      lspconfig.kotlin_neovim_lsp.setup(opts.servers.kotlin_neovim_lsp)
+      lspconfig.android_neovim_lsp.setup(opts.servers.android_neovim_lsp)
     end,
   },
 }

@@ -60,7 +60,7 @@ Validated on this workspace. The distributable bundle, tarball, and checksum fil
 ## Manual Demo
 
 ```bash
-./server/build/install/server/bin/kotlin-neovim-lsp
+./server/build/install/server/bin/android-neovim-lsp
 ```
 
 Point Neovim at the executable using the Lua files in `nvim/` or `lazyvim_example/`.

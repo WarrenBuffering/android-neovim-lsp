@@ -1,6 +1,6 @@
 vim.g.mapleader = " "
 
-require("kotlin_neovim_lsp").setup({
+require("android_neovim_lsp").setup({
   cmd = { "android-neovim-lsp" },
   on_attach = function(_, bufnr)
     local map = function(mode, lhs, rhs)

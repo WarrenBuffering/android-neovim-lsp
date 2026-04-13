@@ -1,7 +1,7 @@
 # Repository Tree
 
 ```text
-kotlin-neovim-lsp/
+android-neovim-lsp/
   analysis/
   benchmarks/
   code-actions/

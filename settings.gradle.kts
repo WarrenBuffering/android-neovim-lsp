@@ -24,7 +24,7 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "kotlin-neovim-lsp"
+rootProject.name = "android-neovim-lsp"
 
 include(
     ":protocol",
