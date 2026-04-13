@@ -1,6 +1,7 @@
 package dev.codex.kotlinls.tests
 
 import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
+import dev.codex.kotlinls.diagnostics.DiagnosticsService
 import dev.codex.kotlinls.projectimport.GradleProjectImporter
 import dev.codex.kotlinls.protocol.TextDocumentItem
 import dev.codex.kotlinls.workspace.TextDocumentStore
@@ -36,9 +37,99 @@ fun analysisSuite(): TestSuite {
                     ),
                 )
                 val snapshot = analyzer.analyze(project, store)
-                assertTrue(snapshot.files.isNotEmpty()) { "Expected analyzed files" }
-                assertTrue(snapshot.diagnostics.any { it.message.contains("Unresolved reference", ignoreCase = true) }) {
-                    "Expected unresolved reference diagnostics, got ${snapshot.diagnostics}"
+                try {
+                    assertTrue(snapshot.files.isNotEmpty()) { "Expected analyzed files" }
+                    assertTrue(snapshot.diagnostics.any { it.message.contains("Unresolved reference", ignoreCase = true) }) {
+                        "Expected unresolved reference diagnostics, got ${snapshot.diagnostics}"
+                    }
+                } finally {
+                    snapshot.close()
+                }
+            },
+            TestCase("publishes immutable reassignment before downstream type mismatch noise") {
+                val projectRoot = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(projectRoot)
+                val appFile = projectRoot.resolve("src/main/kotlin/demo/App.kt")
+                val store = TextDocumentStore()
+                val brokenText = """
+                    package demo
+
+                    fun main() {
+                        val recordingPuck = 1
+                        recordingPuck = "sticks"
+                    }
+                """.trimIndent()
+                store.open(
+                    TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 2,
+                        text = brokenText,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                try {
+                    assertTrue(snapshot.diagnostics.any { it.message.contains("Val cannot be reassigned") }) {
+                        "Expected immutable reassignment diagnostic, got ${snapshot.diagnostics}"
+                    }
+
+                    val published = DiagnosticsService().publishable(snapshot, setOf(appFile.toUri().toString()))
+                        .singleOrNull()
+                        ?.diagnostics
+                        .orEmpty()
+                    val assignmentLine = published.filter { it.range.start.line == 4 }
+                    assertTrue(assignmentLine.isNotEmpty()) {
+                        "Expected published diagnostics on the reassignment line, got $published"
+                    }
+                    assertTrue(assignmentLine.first().message.contains("Val cannot be reassigned")) {
+                        "Expected immutable reassignment to be the primary diagnostic, got $assignmentLine"
+                    }
+                } finally {
+                    snapshot.close()
+                }
+            },
+            TestCase("preserves syntax diagnostics for malformed named-argument calls") {
+                val projectRoot = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(projectRoot)
+                val appFile = projectRoot.resolve("src/main/kotlin/demo/App.kt")
+                val store = TextDocumentStore()
+                val brokenText = """
+                    package demo
+
+                    fun navigate(routeKey: String, initialRoute: String) {}
+
+                    fun initialRoute(route: String, params: String): String = route + params
+
+                    fun openIncidentDetails() {
+                        navigate(
+                            val fish = "sticks"
+                            fish = "turn"
+                            routeKey = "route",
+                            initialRoute = initialRoute(
+                                "detail",
+                                "standard",
+                            ),
+                        )
+                    }
+                """.trimIndent()
+                store.open(
+                    TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 2,
+                        text = brokenText,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                try {
+                    assertTrue(snapshot.diagnostics.any { it.message.contains("Expecting an element") }) {
+                        "Expected syntax diagnostics, got ${snapshot.diagnostics}"
+                    }
+                    assertTrue(snapshot.diagnostics.any { it.message.contains("Unexpected tokens") }) {
+                        "Expected trailing syntax diagnostics, got ${snapshot.diagnostics}"
+                    }
+                } finally {
+                    snapshot.close()
                 }
             },
             TestCase("focused analysis keeps previously mirrored workspace files intact") {

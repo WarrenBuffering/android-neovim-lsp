@@ -34,9 +34,8 @@ class CollectingMessageCollector(
             endLine = location.lineEnd.takeIf { it > 0 }?.minus(1),
             endColumn = location.columnEnd.takeIf { it > 0 }?.minus(1),
             severity = severity.name,
-            message = message.substringBefore('\n'),
+            message = message.replace(Regex("\\s+"), " ").trim(),
             code = null,
         )
     }
 }
-

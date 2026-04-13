@@ -4,6 +4,7 @@ package dev.codex.kotlinls.analysis
 
 import dev.codex.kotlinls.projectimport.ImportedModule
 import dev.codex.kotlinls.projectimport.ImportedProject
+import dev.codex.kotlinls.workspace.LineIndex
 import dev.codex.kotlinls.workspace.TextDocumentStore
 import org.jetbrains.kotlin.analyzer.AnalysisResult
 import org.jetbrains.kotlin.cli.common.config.addKotlinSourceRoot
@@ -15,9 +16,13 @@ import org.jetbrains.kotlin.cli.jvm.config.addJavaSourceRoot
 import org.jetbrains.kotlin.cli.jvm.config.addJvmClasspathRoots
 import org.jetbrains.kotlin.cli.jvm.config.configureJdkClasspathRoots
 import org.jetbrains.kotlin.com.intellij.openapi.Disposable
+import org.jetbrains.kotlin.com.intellij.openapi.util.TextRange
 import org.jetbrains.kotlin.com.intellij.openapi.util.Disposer
 import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration
+import org.jetbrains.kotlin.diagnostics.Diagnostic
+import org.jetbrains.kotlin.diagnostics.DiagnosticUtils
+import org.jetbrains.kotlin.diagnostics.rendering.DefaultErrorMessages
 import org.jetbrains.kotlin.load.kotlin.PackagePartProvider
 import org.jetbrains.kotlin.com.intellij.psi.search.GlobalSearchScope
 import org.jetbrains.kotlin.resolve.BindingContext
@@ -76,6 +81,7 @@ class KotlinWorkspaceAnalyzer(
             }
             val analysisResult: AnalysisResult = analyzer.analysisResult
             val bindingContext = analysisResult.bindingContext
+            val diagnostics = collectDiagnostics(bindingContext, collector, mirrorPlan)
             val files = sourceFiles.mapNotNull { ktFile ->
                 val originalPath = mirrorPlan.originalForMirror(ktFile.virtualFilePath) ?: return@mapNotNull null
                 val module = mirrorPlan.moduleForOriginal(originalPath) ?: return@mapNotNull null
@@ -91,7 +97,7 @@ class KotlinWorkspaceAnalyzer(
                 project = project,
                 files = files,
                 bindingContext = bindingContext,
-                diagnostics = collector.diagnostics,
+                diagnostics = diagnostics,
                 closeHook = { safeDispose(disposable) },
             )
         } catch (t: Throwable) {
@@ -108,6 +114,103 @@ class KotlinWorkspaceAnalyzer(
             // Keep the server alive and let process shutdown reclaim the abandoned disposable graph.
         }
     }
+
+    private fun collectDiagnostics(
+        bindingContext: BindingContext,
+        collector: CollectingMessageCollector,
+        mirrorPlan: MirrorPlan,
+    ): List<CompilerDiagnosticRecord> {
+        val structured = DiagnosticUtils.sortedDiagnostics(bindingContext.diagnostics.all())
+            .mapNotNull { it.toCompilerDiagnosticRecord(mirrorPlan) }
+        if (structured.isEmpty()) {
+            return collector.diagnostics
+        }
+        if (collector.diagnostics.isEmpty()) {
+            return structured
+        }
+        val merged = mutableListOf<CompilerDiagnosticRecord>()
+        val seenRecords = linkedSetOf<CompilerDiagnosticRecordKey>()
+        val structuredLocations = linkedSetOf<CompilerDiagnosticLocationKey>()
+        structured.forEach { record ->
+            val key = record.recordKey()
+            if (seenRecords.add(key)) {
+                merged += record
+                structuredLocations += record.locationKey()
+            }
+        }
+        collector.diagnostics.forEach { record ->
+            if (record.locationKey() in structuredLocations) {
+                return@forEach
+            }
+            val key = record.recordKey()
+            if (seenRecords.add(key)) {
+                merged += record
+            }
+        }
+        return merged
+    }
+
+    private fun Diagnostic.toCompilerDiagnosticRecord(
+        mirrorPlan: MirrorPlan,
+    ): CompilerDiagnosticRecord? {
+        val mirroredPath = psiFile.virtualFile?.path?.let(Path::of)?.normalize() ?: return null
+        val originalPath = mirrorPlan.mirrorToOriginal[mirroredPath] ?: return null
+        val text = mirrorPlan.textByOriginal[originalPath] ?: return null
+        val lineIndex = LineIndex.build(text)
+        val range = textRanges.firstOrNull() ?: psiElement.textRange ?: TextRange.EMPTY_RANGE
+        val startOffset = range.startOffset.coerceIn(0, text.length)
+        val endOffset = if (range.endOffset > startOffset) {
+            range.endOffset.coerceIn(startOffset, text.length)
+        } else {
+            (startOffset + 1).coerceAtMost(text.length)
+        }
+        val start = lineIndex.position(startOffset)
+        val end = lineIndex.position(endOffset)
+        val message = runCatching { DefaultErrorMessages.render(this) }
+            .getOrElse { factory.name }
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return CompilerDiagnosticRecord(
+            path = originalPath,
+            line = start.line,
+            column = start.character,
+            endLine = end.line,
+            endColumn = end.character,
+            severity = severity.toCompilerMessageSeverity().name,
+            message = message,
+            code = factory.name,
+        )
+    }
+
+    private fun CompilerDiagnosticRecord.locationKey(): CompilerDiagnosticLocationKey =
+        CompilerDiagnosticLocationKey(
+            path = path.normalize(),
+            line = line,
+            column = column,
+            endLine = endLine,
+            endColumn = endColumn,
+            severity = severity,
+        )
+
+    private fun CompilerDiagnosticRecord.recordKey(): CompilerDiagnosticRecordKey =
+        CompilerDiagnosticRecordKey(
+            location = locationKey(),
+            message = message,
+        )
+
+    private data class CompilerDiagnosticLocationKey(
+        val path: Path,
+        val line: Int,
+        val column: Int,
+        val endLine: Int?,
+        val endColumn: Int?,
+        val severity: String,
+    )
+
+    private data class CompilerDiagnosticRecordKey(
+        val location: CompilerDiagnosticLocationKey,
+        val message: String,
+    )
 
     @Suppress("UNCHECKED_CAST")
     private fun analyzeFilesWithJavaIntegration(
