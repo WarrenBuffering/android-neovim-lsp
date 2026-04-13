@@ -2,11 +2,11 @@
 
 > 100% vibe-coded. It works on my machine, it will continue working on my machine breaking changes or not, and I cannot be held liable for anything this repo does or does not do.
 
-`kotlin-neovim-lsp` is a standalone Kotlin/Android language server project aimed at Neovim and LazyVim.
+`android-neovim-lsp` is a standalone Kotlin/Android language server project aimed at Neovim and LazyVim.
 
 The current executable and Lua module names are:
 
-- binary: `kotlin-neovim-lsp`
+- binary: `android-neovim-lsp`
 - Lua module: `kotlin_neovim_lsp`
 
 ## What You Get
@@ -28,7 +28,7 @@ Build the installable server:
 The executable will be created at:
 
 ```bash
-./server/build/install/server/bin/kotlin-neovim-lsp
+./server/build/install/server/bin/android-neovim-lsp
 ```
 
 If you want the bridge-enabled package:
@@ -43,14 +43,45 @@ If you need to refresh dependency lockfiles:
 ./gradlew --write-locks resolveAndLockAll
 ```
 
+## Release Installer
+
+For macOS and Linux, the quickest install path is the release installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/WarrenBuffering/android-neovim-lsp/main/packaging/install-release.sh | bash
+```
+
+By default it:
+
+- downloads the latest GitHub release tarball
+- installs it into `~/.local/share/android-neovim-lsp`
+- symlinks `android-neovim-lsp` into `~/.local/bin`
+
+You can override the install location or pin a release with:
+
+```bash
+ANDROID_NEOVIM_LSP_INSTALL_ROOT=/some/path \
+ANDROID_NEOVIM_LSP_VERSION=v0.1.0 \
+curl -fsSL https://raw.githubusercontent.com/WarrenBuffering/android-neovim-lsp/main/packaging/install-release.sh | bash
+```
+
 ## Neovim Setup
+
+If `android-neovim-lsp` is already on your `PATH`, the plugin can be used like any other Neovim plugin:
+
+```lua
+vim.opt.runtimepath:append("/absolute/path/to/android-neovim-lsp/nvim")
+require("kotlin_neovim_lsp").setup()
+```
+
+If you unpack one of this repo's release bundles, the plugin will also auto-detect the sibling bundled server binary without needing an explicit `cmd`.
 
 Minimal `init.lua` example:
 
 ```lua
-local kotlin_lsp_cmd = "/absolute/path/to/kotlin-neovim-lsp/server/build/install/server/bin/kotlin-neovim-lsp"
+local kotlin_lsp_cmd = "/absolute/path/to/android-neovim-lsp/server/build/install/server/bin/android-neovim-lsp"
 
-vim.opt.runtimepath:append("/absolute/path/to/kotlin-neovim-lsp/nvim")
+vim.opt.runtimepath:append("/absolute/path/to/android-neovim-lsp/nvim")
 
 require("kotlin_neovim_lsp").setup({
   cmd = { kotlin_lsp_cmd },
@@ -82,7 +113,7 @@ return {
       if not configs.kotlin_neovim_lsp then
         configs.kotlin_neovim_lsp = {
           default_config = {
-            cmd = { "/absolute/path/to/kotlin-neovim-lsp/server/build/install/server/bin/kotlin-neovim-lsp" },
+            cmd = { "/absolute/path/to/android-neovim-lsp/server/build/install/server/bin/android-neovim-lsp" },
             filetypes = { "kotlin" },
             root_dir = function(fname)
               return vim.fs.root(fname, {
@@ -120,7 +151,10 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 
 ## Mason
 
-This repo is not currently published to Mason. Point Neovim directly at the built executable.
+This repo is not currently published to Mason. Until it is, users need either:
+
+- `android-neovim-lsp` on `PATH`
+- or a bundled release/package layout that keeps `nvim/` next to the installed server directory
 
 ## Repo Layout
 

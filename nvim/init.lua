@@ -1,7 +1,7 @@
 vim.g.mapleader = " "
 
 require("kotlin_neovim_lsp").setup({
-  cmd = { "kotlin-neovim-lsp" },
+  cmd = { "android-neovim-lsp" },
   on_attach = function(_, bufnr)
     local map = function(mode, lhs, rhs)
       vim.keymap.set(mode, lhs, rhs, { buffer = bufnr, silent = true })

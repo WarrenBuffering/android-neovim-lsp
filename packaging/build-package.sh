@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 ENABLE_JETBRAINS_BRIDGE="${ENABLE_JETBRAINS_BRIDGE:-0}"
 GRADLE_ARGS=(--no-configuration-cache :server:installDist)
-PACKAGE_NAME="kotlin-neovim-lsp"
+PACKAGE_NAME="android-neovim-lsp"
 
 if [[ "$ENABLE_JETBRAINS_BRIDGE" == "1" || "$ENABLE_JETBRAINS_BRIDGE" == "true" ]]; then
   GRADLE_ARGS=(-Pkotlinls.enableJetBrainsBridge=true "${GRADLE_ARGS[@]}")

@@ -1,12 +1,12 @@
 local M = {}
 
 function M.check()
-  vim.health.start("kotlin-neovim-lsp")
+  vim.health.start("android-neovim-lsp")
 
-  if vim.fn.executable("kotlin-neovim-lsp") == 1 then
-    vim.health.ok("Found `kotlin-neovim-lsp` on PATH")
+  if vim.fn.executable("android-neovim-lsp") == 1 then
+    vim.health.ok("Found `android-neovim-lsp` on PATH")
   else
-    vim.health.error("`kotlin-neovim-lsp` is not on PATH", {
+    vim.health.error("`android-neovim-lsp` is not on PATH", {
       "Build the server with `./gradlew :server:installDist`.",
       "Add `server/build/install/server/bin` to your PATH, or configure `cmd` explicitly.",
     })

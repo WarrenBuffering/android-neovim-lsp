@@ -11,5 +11,5 @@ application {
 }
 
 tasks.named<CreateStartScripts>("startScripts") {
-    applicationName = "kotlin-neovim-lsp"
+    applicationName = "android-neovim-lsp"
 }

@@ -12,3 +12,8 @@ The package includes:
 - Neovim runtime files
 - the LazyVim example spec
 
+Install the latest GitHub release bundle with:
+
+```bash
+./packaging/install-release.sh
+```
