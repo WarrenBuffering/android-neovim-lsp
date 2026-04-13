@@ -179,7 +179,7 @@ internal class BridgeK2SemanticEngine private constructor(
     private var bridge: JetBrainsCompletionBridge?,
     private val formatterService: FormattingService,
 ) : SemanticEngine {
-    private val liveSyncDebounceMillis = 750L
+    private val liveSyncDebounceMillis = 400L
     private val liveSyncRetryMillis = 100L
     private val requestExecutor = Executors.newFixedThreadPool(
         maxOf(2, minOf(Runtime.getRuntime().availableProcessors(), 4)),
