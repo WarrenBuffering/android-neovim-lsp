@@ -1,57 +1,149 @@
-100% vibe coded. It works on my machine. If it stops working on my machine I'm going to keep pushing breaking commits until it works on my machine again
-
 # Kotlin Neovim LSP
 
-`kotlin-neovim-lsp` is a standalone Kotlin Language Server Protocol project focused on Neovim and LazyVim. It packages the Kotlin IDE backend as a reusable library plus a thin executable wrapper so editor integrations can depend on a stable stdio server entrypoint.
+> 100% vibe-coded. It works on my machine, it will continue working on my machine breaking changes or not, and I cannot be held liable for anything this repo does or does not do.
 
-This repository is organized as a parity-first monorepo:
+`kotlin-neovim-lsp` is a standalone Kotlin/Android language server project aimed at Neovim and LazyVim.
 
-- `protocol`: JSON-RPC and LSP transport/types.
-- `workspace`: open-document state, line maps, and root detection.
-- `project-import`: Gradle-first project model reconstruction.
-- `analysis`: Kotlin compiler-backed PSI and semantic analysis.
-- `index`: declaration and reference indexing.
-- `diagnostics`: compiler and heuristic diagnostics.
-- `completion`, `hover`, `symbols`, `navigation`, `refactor`, `formatting`, `code-actions`: user-facing IDE capabilities.
-- `standalone-lsp`: reusable standalone Kotlin LSP library with stdio launcher helpers.
-- `server`: thin executable wrapper around `standalone-lsp`.
-- `tests`: custom deterministic test harnesses and fixture-driven suites.
-- `benchmarks`: latency and indexing microbenchmarks.
-- `nvim`, `lazyvim_example`: exact integration files for Neovim and LazyVim.
-- `fixtures`: real Kotlin workspace fixtures.
-- `docs`: parity strategy, capability matrix, architecture, and gap report.
+The current executable and Lua module names are:
 
-The primary delivery narrative lives in [docs/DELIVERY.md](docs/DELIVERY.md).
+- binary: `kotlin-neovim-lsp`
+- Lua module: `kotlin_neovim_lsp`
 
-## Build Model
+## What You Get
 
-Normal builds keep published dependencies pinned and locked, then ship a fully bundled distribution from `:server:installDist`.
+- a standalone stdio language server executable
+- Gradle-first Kotlin/Android project import
+- local workspace and library indexing
+- Neovim integration files in [`nvim/`](nvim/)
+- a LazyVim example in [`lazyvim_example/`](lazyvim_example/)
 
-- Default build: standalone LSP only.
-- JetBrains bridge: opt-in at build time with `-Pkotlinls.enableJetBrainsBridge=true`.
-- Runtime bridge detection: off by default unless `KOTLINLS_ENABLE_INTELLIJ_BRIDGE=true` or `-Dkotlinls.intellijHome=...` is set.
+## Build
 
-Refresh dependency lockfiles with:
+Build the installable server:
 
 ```bash
-./gradlew --write-locks resolveAndLockAll
+./gradlew :server:installDist
 ```
 
-Build the default bundled release with:
+The executable will be created at:
 
 ```bash
-./packaging/build-package.sh
+./server/build/install/server/bin/kotlin-neovim-lsp
 ```
 
-Build a bridge-enabled release with:
+If you want the bridge-enabled package:
 
 ```bash
 ENABLE_JETBRAINS_BRIDGE=1 ./packaging/build-package.sh
 ```
 
+If you need to refresh dependency lockfiles:
+
+```bash
+./gradlew --write-locks resolveAndLockAll
+```
+
+## Neovim Setup
+
+Minimal `init.lua` example:
+
+```lua
+local kotlin_lsp_cmd = "/absolute/path/to/kotlin-neovim-lsp/server/build/install/server/bin/kotlin-neovim-lsp"
+
+vim.opt.runtimepath:append("/absolute/path/to/kotlin-neovim-lsp/nvim")
+
+require("kotlin_neovim_lsp").setup({
+  cmd = { kotlin_lsp_cmd },
+})
+```
+
+The built-in root detection looks for:
+
+- `settings.gradle.kts`
+- `settings.gradle`
+- `build.gradle.kts`
+- `build.gradle`
+- `.git`
+
+## LazyVim Setup
+
+If you are using LazyVim, start from [`lazyvim_example/lua/plugins/kotlin-neovim-lsp.lua`](lazyvim_example/lua/plugins/kotlin-neovim-lsp.lua).
+
+Example:
+
+```lua
+return {
+  {
+    "neovim/nvim-lspconfig",
+    opts = function(_, opts)
+      local configs = require("lspconfig.configs")
+      local lspconfig = require("lspconfig")
+
+      if not configs.kotlin_neovim_lsp then
+        configs.kotlin_neovim_lsp = {
+          default_config = {
+            cmd = { "/absolute/path/to/kotlin-neovim-lsp/server/build/install/server/bin/kotlin-neovim-lsp" },
+            filetypes = { "kotlin" },
+            root_dir = function(fname)
+              return vim.fs.root(fname, {
+                "settings.gradle.kts",
+                "settings.gradle",
+                "build.gradle.kts",
+                "build.gradle",
+                ".git",
+              })
+            end,
+            single_file_support = true,
+          },
+        }
+      end
+
+      opts.servers = opts.servers or {}
+      opts.servers.kotlin_neovim_lsp = opts.servers.kotlin_neovim_lsp or {}
+
+      lspconfig.kotlin_neovim_lsp.setup(opts.servers.kotlin_neovim_lsp)
+    end,
+  },
+}
+```
+
+## Formatting On Save
+
+```lua
+vim.api.nvim_create_autocmd("BufWritePre", {
+  pattern = "*.kt",
+  callback = function(args)
+    vim.lsp.buf.format({ bufnr = args.buf, async = false })
+  end,
+})
+```
+
+## Mason
+
+This repo is not currently published to Mason. Point Neovim directly at the built executable.
+
+## Repo Layout
+
+- `protocol`: JSON-RPC and LSP transport/types
+- `workspace`: open-document state, line maps, and root detection
+- `project-import`: Gradle-first project model reconstruction
+- `analysis`: Kotlin compiler-backed PSI and semantic analysis
+- `index`: declaration and reference indexing
+- `diagnostics`: compiler and heuristic diagnostics
+- `completion`, `hover`, `symbols`, `navigation`, `refactor`, `formatting`, `code-actions`: user-facing IDE capabilities
+- `standalone-lsp`: reusable standalone Kotlin LSP library with stdio launcher helpers
+- `server`: thin executable wrapper around `standalone-lsp`
+- `tests`: deterministic test harnesses and fixture-driven suites
+- `benchmarks`: latency and indexing microbenchmarks
+- `nvim`, `lazyvim_example`: exact Neovim and LazyVim integration files
+- `fixtures`: real Kotlin workspace fixtures
+- `docs`: parity strategy, capability matrix, architecture, and gap report
+
+The primary delivery narrative lives in [`docs/DELIVERY.md`](docs/DELIVERY.md).
+
 ## Library Use
 
-Use the reusable library entrypoint from `standalone-lsp`:
+If you want to embed the standalone server yourself:
 
 ```kotlin
 import dev.codex.kotlinls.standalone.runStdioKotlinLanguageServer
