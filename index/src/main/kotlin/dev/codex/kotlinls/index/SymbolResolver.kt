@@ -8,6 +8,7 @@ import org.jetbrains.kotlin.descriptors.CallableDescriptor
 import org.jetbrains.kotlin.descriptors.ClassifierDescriptor
 import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtDeclaration
+import org.jetbrains.kotlin.psi.KtElement
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.psi.KtNamedDeclaration
@@ -82,6 +83,7 @@ class SymbolResolver {
 
         leaf.parentsWithSelf.filterIsInstance<KtNameReferenceExpression>().firstOrNull()?.let { reference ->
             snapshot.bindingContext[BindingContext.REFERENCE_TARGET, reference]?.let { return it }
+            resolvedCallDescriptor(snapshot, reference)?.let { return it }
         }
 
         leaf.parentsWithSelf.filterIsInstance<KtCallExpression>().firstOrNull()?.calleeExpression
@@ -89,6 +91,7 @@ class SymbolResolver {
                 if (callee is KtNameReferenceExpression) {
                     snapshot.bindingContext[BindingContext.REFERENCE_TARGET, callee]?.let { return it }
                 }
+                resolvedCallDescriptor(snapshot, callee)?.let { return it }
             }
 
         leaf.parentsWithSelf.filterIsInstance<KtNamedDeclaration>().firstOrNull()?.let { declaration ->
@@ -157,6 +160,14 @@ class SymbolResolver {
         val fqName = DescriptorUtils.getFqNameSafe(typeDescriptor.original).asString()
         index.symbolsByFqName[fqName]?.let { return it }
         return index.symbolsByName[fqName.substringAfterLast('.')]?.singleOrNull()
+    }
+
+    private fun resolvedCallDescriptor(
+        snapshot: WorkspaceAnalysisSnapshot,
+        element: KtElement,
+    ): DeclarationDescriptor? {
+        val call = snapshot.bindingContext[BindingContext.CALL, element] ?: return null
+        return snapshot.bindingContext[BindingContext.RESOLVED_CALL, call]?.resultingDescriptor
     }
 
     private fun enclosingExpression(

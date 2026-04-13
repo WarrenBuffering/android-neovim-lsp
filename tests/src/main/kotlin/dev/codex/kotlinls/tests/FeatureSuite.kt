@@ -423,6 +423,96 @@ fun featureSuite(): TestSuite {
                     "Expected primitive conversion completion, got ${completions.items.take(10).map { it.label }}"
                 }
             },
+            TestCase("offers primitive conversion completions from semantic receiver types") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    fun demo(): Float {
+                        val count = 1
+                        return count.to
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 43,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("count.to") }
+                val column = content.lines()[line].indexOf("to") + 2
+                val completions = completionService.complete(
+                    snapshot,
+                    index,
+                    CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                )
+                assertTrue(completions.items.any { it.label == "toFloat" }) {
+                    "Expected semantic primitive conversion completion, got ${completions.items.take(10).map { it.label }}"
+                }
+            },
+            TestCase("merges semantic member completions with indexed fallback") {
+                val root = FixtureSupport.fixture("multi-module")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
+                val content = """
+                    package demo.app
+
+                    import demo.lib.Greeting
+                    import demo.lib.shout
+
+                    fun demo(name: String): String {
+                        return Greeting().sh
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 44,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("Greeting().sh") }
+                val column = content.lines()[line].indexOf("sh") + 2
+                val merged = completionService.mergeSemanticAndIndexCompletions(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                    semantic = CompletionList(
+                        isIncomplete = false,
+                        items = listOf(
+                            CompletionItem(
+                                label = "showcase",
+                                kind = CompletionItemKind.FUNCTION,
+                                filterText = "showcase",
+                                detail = "semantic member",
+                                data = mapOf("provider" to "jetbrains"),
+                            ),
+                        ),
+                    ),
+                )
+                val labels = merged.items.take(10).map { it.label }
+                assertTrue("shout" in labels && "showcase" in labels) {
+                    "Expected merged member completions to keep semantic and indexed items, got $labels"
+                }
+            },
             TestCase("ranks expected-type-matching completions above unrelated ones") {
                 val root = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(root)
@@ -733,6 +823,43 @@ fun featureSuite(): TestSuite {
                 assertTrue(locations.any { it.uri == appFile.toUri().toString() && it.range.start.line == 3 }) {
                     "Expected local variable definition, got $locations"
                 }
+            },
+            TestCase("shows hover for primitive conversion calls resolved from semantic calls") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    fun demo(): Float {
+                        val count = 42
+                        return count.toFloat()
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 17,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("count.toFloat()") }
+                val column = content.lines()[line].indexOf("toFloat") + 3
+                val hover = hoverService.hover(
+                    snapshot,
+                    index,
+                    dev.codex.kotlinls.protocol.TextDocumentPositionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                )
+                val hoverText = hover?.contents?.value ?: error("Expected primitive conversion hover")
+                assertContains(hoverText, "toFloat")
+                assertContains(hoverText, "Float")
             },
             TestCase("navigates to inferred expression types") {
                 val root = FixtureSupport.fixture("multi-module")

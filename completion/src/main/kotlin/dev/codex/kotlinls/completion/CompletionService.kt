@@ -82,7 +82,8 @@ class CompletionService {
         }
 
         val memberCandidates = receiverCandidates(context, index)
-        if (memberCandidates.isNotEmpty()) {
+        val syntheticMembers = syntheticSemanticMemberCompletions(context)
+        if (memberCandidates.isNotEmpty() || syntheticMembers.isNotEmpty()) {
             memberCandidates.forEach { symbol ->
                 val symbolFqName = symbol.fqName
                 val needsImport = symbol.importable &&
@@ -95,6 +96,13 @@ class CompletionService {
                     ranked = ranked,
                     key = completionCandidateKey(symbol),
                     candidate = rankedSymbol(file.text, symbol, needsImport, score),
+                )
+            }
+            syntheticMembers.forEachIndexed { syntheticIndex, item ->
+                val score = 250 - syntheticIndex
+                ranked.putIfAbsent(
+                    "semantic-synthetic::${item.label}",
+                    RankedCompletion(item.copy(sortText = scoreToSortKey(score)), score),
                 )
             }
         } else {
@@ -291,9 +299,6 @@ class CompletionService {
         val offset = LineIndex.build(text).offset(params.position)
         val prefix = currentPrefix(text, offset)
         val memberAccess = isMemberAccessContext(text, offset)
-        if (memberAccess) {
-            return fallback
-        }
         val imports = SourceIndexLookup.imports(text)
         val importedVisibleNames = imports.mapTo(linkedSetOf()) { it.visibleName }
         val importedFqNames = imports.mapTo(linkedSetOf()) { it.fqName }
@@ -350,6 +355,14 @@ class CompletionService {
                 .take(100)
                 .map { it.item },
         )
+    }
+
+    fun isMemberAccessCompletion(
+        text: String,
+        params: CompletionParams,
+    ): Boolean {
+        val offset = LineIndex.build(text).offset(params.position)
+        return isMemberAccessContext(text, offset)
     }
 
     fun shouldPreferIndexCompletions(
@@ -621,6 +634,27 @@ class CompletionService {
             receiverTypeFqName = receiverFqName,
         )
         return (indexed + reflected).distinctBy { it.id }
+    }
+
+    private fun syntheticSemanticMemberCompletions(
+        context: CompletionContext,
+    ): List<CompletionItem> {
+        if (!context.memberAccess) return emptyList()
+        val receiverType = context.receiverTypeFqName ?: context.receiverType ?: return emptyList()
+        return primitiveConversionCandidates(receiverType)
+            .filter { method -> method.startsWith(context.prefix) }
+            .map { method ->
+                CompletionItem(
+                    label = method,
+                    kind = CompletionItemKind.FUNCTION,
+                    detail = "Kotlin primitive conversion",
+                    filterText = method,
+                    data = mapOf(
+                        "provider" to "synthetic",
+                        "fqName" to "kotlin.$method",
+                    ),
+                )
+            }
     }
 
     private fun inferredReceiverCandidates(
