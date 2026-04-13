@@ -24,7 +24,7 @@ class JetBrainsFormatterBridge private constructor(
     private val ideaPluginsPath: Path,
 ) : FormatterBridge {
     override fun format(path: Path, text: String, timeoutMillis: Long): String? {
-        val sandboxRoot = Files.createTempDirectory("kotlin-neovim-lsp-idea-bridge")
+        val sandboxRoot = Files.createTempDirectory("android-neovim-lsp-idea-bridge")
         return runCatching {
             val command = buildList {
                 add(javaBinary.toString())

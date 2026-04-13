@@ -98,7 +98,7 @@ class DiagnosticsService(
             ),
             severity = DiagnosticSeverity.WARNING,
             code = "package-mismatch",
-            source = "kotlin-neovim-lsp",
+            source = "android-neovim-lsp",
             message = "Package declaration does not match source root. Expected `$expected`.",
         )
     }
@@ -121,7 +121,7 @@ class DiagnosticsService(
             ),
             severity = DiagnosticSeverity.WARNING,
             code = "package-mismatch",
-            source = "kotlin-neovim-lsp",
+            source = "android-neovim-lsp",
             message = "Package declaration does not match source root. Expected `$expected`.",
         )
     }

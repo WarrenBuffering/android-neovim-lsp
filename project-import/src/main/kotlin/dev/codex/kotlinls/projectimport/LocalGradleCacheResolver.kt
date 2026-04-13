@@ -28,7 +28,7 @@ data class ResolvedClasspath(
 
 class LocalGradleCacheResolver(
     private val gradleHome: Path = Path(System.getProperty("user.home"), ".gradle"),
-    private val extractionCacheRoot: Path = Path(System.getProperty("java.io.tmpdir"), "kotlin-neovim-lsp", "artifact-cache"),
+    private val extractionCacheRoot: Path = Path(System.getProperty("java.io.tmpdir"), "android-neovim-lsp", "artifact-cache"),
 ) {
     private val metadataCache = ConcurrentHashMap<String, ArtifactMetadata?>()
     private val managedVersionsCache = ConcurrentHashMap<String, Map<String, String>>()

@@ -36,7 +36,7 @@ class JetBrainsCompletionBridge private constructor(
     private val extraPluginJars: List<Path>,
 ) : AutoCloseable {
     private val requestIds = AtomicLong(1)
-    private val sandboxRoot = Files.createTempDirectory("kotlin-neovim-lsp-jb-completion")
+    private val sandboxRoot = Files.createTempDirectory("android-neovim-lsp-jb-completion")
     private val process: Process
     private val socket: Socket
     private val reader: BufferedReader
@@ -292,7 +292,7 @@ class JetBrainsCompletionBridge private constructor(
             stream.bufferedReader(StandardCharsets.UTF_8).useLines { lines ->
                 lines.forEach { line ->
                     if (verbose) {
-                        System.err.println("[kotlin-neovim-lsp][jetbrains-completion] $line")
+                        System.err.println("[android-neovim-lsp][jetbrains-completion] $line")
                     }
                 }
             }

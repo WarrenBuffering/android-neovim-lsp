@@ -12,7 +12,7 @@ import kotlin.io.path.name
 import kotlin.io.path.outputStream
 
 class ExternalSourceMirror(
-    private val baseDir: Path = Path.of(System.getProperty("java.io.tmpdir"), "kotlin-neovim-lsp-external-sources"),
+    private val baseDir: Path = Path.of(System.getProperty("java.io.tmpdir"), "android-neovim-lsp-external-sources"),
 ) {
     fun materialize(sourceJar: Path): Path {
         baseDir.createDirectories()

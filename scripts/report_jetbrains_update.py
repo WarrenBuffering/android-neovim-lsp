@@ -22,7 +22,7 @@ def fetch_json(url: str) -> dict:
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "kotlin-neovim-lsp-vendor-report",
+            "User-Agent": "android-neovim-lsp-vendor-report",
             "Accept": "application/vnd.github+json",
         },
     )
@@ -33,7 +33,7 @@ def fetch_json(url: str) -> dict:
 def fetch_text(url: str) -> str:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "kotlin-neovim-lsp-vendor-report"},
+        headers={"User-Agent": "android-neovim-lsp-vendor-report"},
     )
     with urllib.request.urlopen(request, timeout=60) as response:
         return response.read().decode("utf-8", errors="replace")

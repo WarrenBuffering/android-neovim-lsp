@@ -133,19 +133,19 @@ class KotlinLanguageServer(
     private var moduleSemanticFingerprints: Map<String, String> = emptyMap()
 
     private val refreshExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "kotlin-neovim-lsp-refresh").apply { isDaemon = true }
+        Thread(runnable, "android-neovim-lsp-refresh").apply { isDaemon = true }
     }
     private val warmupExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "kotlin-neovim-lsp-warmup").apply { isDaemon = true }
+        Thread(runnable, "android-neovim-lsp-warmup").apply { isDaemon = true }
     }
     private val supportExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "kotlin-neovim-lsp-support").apply { isDaemon = true }
+        Thread(runnable, "android-neovim-lsp-support").apply { isDaemon = true }
     }
     private val persistExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "kotlin-neovim-lsp-persist").apply { isDaemon = true }
+        Thread(runnable, "android-neovim-lsp-persist").apply { isDaemon = true }
     }
     private val semanticRequestExecutor = Executors.newCachedThreadPool { runnable ->
-        Thread(runnable, "kotlin-neovim-lsp-semantic-request").apply { isDaemon = true }
+        Thread(runnable, "android-neovim-lsp-semantic-request").apply { isDaemon = true }
     }
     private val refreshLock = Any()
     private val semanticStateLock = Any()
@@ -322,7 +322,7 @@ class KotlinLanguageServer(
                                 runCatching {
                                     lightweightIndexBuilder.persistDocument(currentProject, source.first, source.second)
                                 }.onFailure { error ->
-                                    System.err.println("[kotlin-neovim-lsp] lightweight cache persist failed: ${error.message}")
+                                    System.err.println("[android-neovim-lsp] lightweight cache persist failed: ${error.message}")
                                 }
                             }
                             semanticEngine.invalidate(uri, documents.get(uri)?.version)
@@ -621,7 +621,7 @@ class KotlinLanguageServer(
             if (message.id != null) {
                 transport.sendError(message.id, JsonRpcErrorCodes.INTERNAL_ERROR, t.message ?: t::class.java.simpleName)
             }
-            System.err.println("[kotlin-neovim-lsp] ${t::class.java.simpleName}: ${t.message}")
+            System.err.println("[android-neovim-lsp] ${t::class.java.simpleName}: ${t.message}")
             t.printStackTrace(System.err)
         }
     }
@@ -692,7 +692,7 @@ class KotlinLanguageServer(
                     ),
                 ),
             ),
-            serverInfo = ServerInfo(name = "kotlin-neovim-lsp", version = "0.1.0-dev"),
+            serverInfo = ServerInfo(name = "android-neovim-lsp", version = "0.1.1"),
         )
     }
 
@@ -831,7 +831,7 @@ class KotlinLanguageServer(
                             if (isBenignCancellation(error)) {
                                 return@onFailure
                             }
-                            System.err.println("[kotlin-neovim-lsp] refresh failed: ${error.message}")
+                            System.err.println("[android-neovim-lsp] refresh failed: ${error.message}")
                             error.printStackTrace(System.err)
                         }
                 }
@@ -875,7 +875,7 @@ class KotlinLanguageServer(
                         if (isBenignCancellation(error)) {
                             return@onFailure
                         }
-                        System.err.println("[kotlin-neovim-lsp] support index refresh failed: ${error.message}")
+                        System.err.println("[android-neovim-lsp] support index refresh failed: ${error.message}")
                         error.printStackTrace(System.err)
                     }
                 }
@@ -1285,7 +1285,7 @@ class KotlinLanguageServer(
                         if (isBenignCancellation(error)) {
                             return@onFailure
                         }
-                        System.err.println("[kotlin-neovim-lsp] warmup failed for ${module.gradlePath}: ${error.message}")
+                        System.err.println("[android-neovim-lsp] warmup failed for ${module.gradlePath}: ${error.message}")
                         error.printStackTrace(System.err)
                     }
                 }
@@ -1915,7 +1915,7 @@ class KotlinLanguageServer(
             "window/showMessage",
             mapOf(
                 "type" to 3,
-                "message" to "kotlin-neovim-lsp: $message",
+                "message" to "android-neovim-lsp: $message",
             ),
         )
     }

@@ -183,10 +183,10 @@ internal class BridgeK2SemanticEngine private constructor(
     private val requestExecutor = Executors.newFixedThreadPool(
         maxOf(2, minOf(Runtime.getRuntime().availableProcessors(), 4)),
     ) { runnable ->
-        Thread(runnable, "kotlin-neovim-lsp-semantic").apply { isDaemon = true }
+        Thread(runnable, "android-neovim-lsp-semantic").apply { isDaemon = true }
     }
     private val syncExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
-        Thread(runnable, "kotlin-neovim-lsp-semantic-sync").apply { isDaemon = true }
+        Thread(runnable, "android-neovim-lsp-semantic-sync").apply { isDaemon = true }
     }
     private val inFlight = ConcurrentHashMap<SemanticRequestKey, CompletableFuture<Any?>>()
     private val latestDocumentVersions = ConcurrentHashMap<String, Int>()

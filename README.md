@@ -76,7 +76,7 @@ Refresh dependency lockfiles:
 Minimal setup:
 
 ```lua
-vim.opt.runtimepath:append(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
+vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
 require("android_neovim_lsp").setup()
 ```
 
@@ -97,6 +97,17 @@ require("android_neovim_lsp").setup({
   cmd = { android_lsp_cmd },
 })
 ```
+
+For local testing that matches the consumer install layout, run:
+
+```bash
+./packaging/install-local-dev.sh
+nvim -u /absolute/path/to/android-neovim-lsp/nvim/init.lua
+```
+
+That refreshes `~/.local/share/android-neovim-lsp` from your current checkout and keeps `nvim/init.lua` loading the installed runtime instead of the repo copy.
+
+That test entrypoint also bootstraps `lazy.nvim` and `nvim-lspconfig`, so it exercises a consumer-style plugin setup instead of depending on your existing editor config.
 
 The built-in root detection looks for:
 

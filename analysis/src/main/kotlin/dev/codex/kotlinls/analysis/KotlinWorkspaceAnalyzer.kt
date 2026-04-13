@@ -34,7 +34,7 @@ import kotlin.io.path.relativeTo
 import kotlin.io.path.walk
 
 class KotlinWorkspaceAnalyzer(
-    private val mirrorBase: Path = Path.of(System.getProperty("java.io.tmpdir"), "kotlin-neovim-lsp"),
+    private val mirrorBase: Path = Path.of(System.getProperty("java.io.tmpdir"), "android-neovim-lsp"),
 ) {
     private val mirrorCacheLock = Any()
     private val mirrorCaches = linkedMapOf<Path, MirrorWorkspaceCache>()

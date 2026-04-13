@@ -678,7 +678,7 @@ class FormattingService(
         if (siblingParent != null && Files.isDirectory(siblingParent) && Files.isWritable(siblingParent)) {
             return siblingParent.resolve(tempName)
         }
-        val fallbackParent = Files.createTempDirectory("kotlin-neovim-lsp-format")
+        val fallbackParent = Files.createTempDirectory("android-neovim-lsp-format")
         return fallbackParent.resolve(fileName.ifBlank { "snippet.kt" })
     }
 

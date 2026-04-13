@@ -39,7 +39,7 @@ def fetch_text(url: str) -> bytes:
     request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "kotlin-neovim-lsp-vendor-sync",
+            "User-Agent": "android-neovim-lsp-vendor-sync",
             "Accept": "text/plain",
         },
     )
