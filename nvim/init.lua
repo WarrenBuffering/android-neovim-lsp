@@ -45,7 +45,7 @@ require("lazy").setup({
           map("n", "<leader>cr", vim.lsp.buf.rename)
           map("n", "<leader>ca", vim.lsp.buf.code_action)
           map("n", "<leader>cf", function()
-            vim.lsp.buf.format({ async = false })
+            vim.lsp.buf.format({ async = true })
           end)
         end,
       })

@@ -38,11 +38,15 @@ The repo's `nvim/init.lua` also bootstraps `lazy.nvim` and `nvim-lspconfig`, so 
 
 ## Formatting on Save
 
+For Kotlin, prefer formatting after save so the editor does not block on a synchronous LSP formatting round-trip.
+
 ```lua
-vim.api.nvim_create_autocmd("BufWritePre", {
-  pattern = "*.kt",
-  callback = function(args)
-    vim.lsp.buf.format({ bufnr = args.buf, async = false })
+require("conform").setup({
+  format_after_save = function(bufnr)
+    if vim.bo[bufnr].filetype ~= "kotlin" then
+      return
+    end
+    return { lsp_format = "fallback" }
   end,
 })
 ```
