@@ -24,6 +24,7 @@ import java.nio.file.Files
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -178,8 +179,8 @@ internal class BridgeK2SemanticEngine private constructor(
     private var bridge: JetBrainsCompletionBridge?,
     private val formatterService: FormattingService,
 ) : SemanticEngine {
-    private val liveSyncDebounceMillis = 125L
-    private val liveSyncRetryMillis = 40L
+    private val liveSyncDebounceMillis = 750L
+    private val liveSyncRetryMillis = 100L
     private val requestExecutor = Executors.newFixedThreadPool(
         maxOf(2, minOf(Runtime.getRuntime().availableProcessors(), 4)),
     ) { runnable ->
@@ -194,8 +195,8 @@ internal class BridgeK2SemanticEngine private constructor(
     private val pendingSyncLock = Any()
     private val pendingProjectWarmups = linkedSetOf<Path>()
     private val pendingDocumentSyncs = linkedMapOf<String, PendingBridgeSync>()
-    @Volatile
-    private var syncDrainScheduled = false
+    private var syncDrainGeneration = 0L
+    private var pendingSyncDrain: ScheduledFuture<*>? = null
 
     override val available: Boolean
         get() = acquireBridge() != null
@@ -212,7 +213,9 @@ internal class BridgeK2SemanticEngine private constructor(
         synchronized(pendingSyncLock) {
             pendingProjectWarmups.clear()
             pendingDocumentSyncs.clear()
-            syncDrainScheduled = false
+            syncDrainGeneration += 1
+            pendingSyncDrain?.cancel(false)
+            pendingSyncDrain = null
         }
         val currentBridge = bridge
         bridge = null
@@ -398,7 +401,9 @@ internal class BridgeK2SemanticEngine private constructor(
         synchronized(pendingSyncLock) {
             pendingProjectWarmups.clear()
             pendingDocumentSyncs.clear()
-            syncDrainScheduled = false
+            syncDrainGeneration += 1
+            pendingSyncDrain?.cancel(false)
+            pendingSyncDrain = null
         }
         requestExecutor.shutdownNow()
         syncExecutor.shutdownNow()
@@ -429,39 +434,40 @@ internal class BridgeK2SemanticEngine private constructor(
     }
 
     private fun scheduleSyncDrainLocked(delayMillis: Long) {
-        if (syncDrainScheduled) return
-        syncDrainScheduled = true
+        val generation = ++syncDrainGeneration
+        pendingSyncDrain?.cancel(false)
         try {
-            syncExecutor.schedule(
-                { drainPendingSyncs() },
+            pendingSyncDrain = syncExecutor.schedule(
+                { drainPendingSyncs(generation) },
                 delayMillis.coerceAtLeast(0L),
                 TimeUnit.MILLISECONDS,
             )
         } catch (_: java.util.concurrent.RejectedExecutionException) {
-            syncDrainScheduled = false
+            pendingSyncDrain = null
         }
     }
 
-    private fun drainPendingSyncs() {
+    private fun drainPendingSyncs(generation: Long) {
         val warmups: List<Path>
         val documentSyncs: List<PendingBridgeSync>
         val activeBridge: JetBrainsCompletionBridge
         synchronized(pendingSyncLock) {
+            if (generation != syncDrainGeneration) {
+                return
+            }
+            pendingSyncDrain = null
             if (foregroundRequests.get() > 0) {
-                syncDrainScheduled = false
                 scheduleSyncDrainLocked(liveSyncRetryMillis)
                 return
             }
             val currentBridge = bridge
             if (currentBridge == null) {
-                syncDrainScheduled = false
                 return
             }
             warmups = pendingProjectWarmups.toList()
             documentSyncs = pendingDocumentSyncs.values.sortedBy { it.priority }.toList()
             pendingProjectWarmups.clear()
             pendingDocumentSyncs.clear()
-            syncDrainScheduled = false
             activeBridge = currentBridge
         }
         if (warmups.isEmpty() && documentSyncs.isEmpty()) return
