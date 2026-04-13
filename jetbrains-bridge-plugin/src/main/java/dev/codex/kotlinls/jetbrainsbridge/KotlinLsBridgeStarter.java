@@ -246,7 +246,8 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         }
         String currentText = payload.text() == null ? handle.document().getText() : payload.text();
         replaceDocumentText(project, handle.document(), currentText);
-        DumbService.getInstance(project).waitForSmartMode();
+        // IntelliJ formatting can operate on the PSI/document model without waiting for full smart-mode indexing.
+        // Blocking here makes synchronous LSP formatting requests time out on large Android projects.
         String formattedText = formatDocument(project, handle.virtualFile(), handle.document(), payload.rangeStart(), payload.rangeEnd());
         return new BridgeResponse(request.id(), true, "formatted", List.of(), List.of(), null, formattedText, null);
     }

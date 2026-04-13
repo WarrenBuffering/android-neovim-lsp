@@ -1,5 +1,12 @@
 local M = {}
 
+local function empty_map(value)
+  if value ~= nil then
+    return value
+  end
+  return vim.empty_dict()
+end
+
 local function root_dir(fname)
   return vim.fs.root(fname, {
     "settings.gradle.kts",
@@ -52,8 +59,8 @@ function M.default_config(opts)
     filetypes = { "kotlin" },
     root_dir = opts.root_dir or root_dir,
     single_file_support = true,
-    init_options = opts.init_options or {},
-    settings = opts.settings or {},
+    init_options = empty_map(opts.init_options),
+    settings = empty_map(opts.settings),
     capabilities = opts.capabilities or vim.lsp.protocol.make_client_capabilities(),
   }
 end

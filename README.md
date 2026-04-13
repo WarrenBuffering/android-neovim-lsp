@@ -124,38 +124,19 @@ Start from [`lazyvim_example/lua/plugins/android-neovim-lsp.lua`](lazyvim_exampl
 ```lua
 return {
   {
-    "neovim/nvim-lspconfig",
-    opts = function(_, opts)
-      local configs = require("lspconfig.configs")
-      local lspconfig = require("lspconfig")
-
-      if not configs.android_neovim_lsp then
-        configs.android_neovim_lsp = {
-          default_config = {
-            cmd = { "android-neovim-lsp" },
-            filetypes = { "kotlin" },
-            root_dir = function(fname)
-              return vim.fs.root(fname, {
-                "settings.gradle.kts",
-                "settings.gradle",
-                "build.gradle.kts",
-                "build.gradle",
-                ".git",
-              })
-            end,
-            single_file_support = true,
-          },
-        }
-      end
-
-      opts.servers = opts.servers or {}
-      opts.servers.android_neovim_lsp = opts.servers.android_neovim_lsp or {}
-
-      lspconfig.android_neovim_lsp.setup(opts.servers.android_neovim_lsp)
+    dir = vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"),
+    name = "android-neovim-lsp",
+    dependencies = { "neovim/nvim-lspconfig" },
+    config = function()
+      require("android_neovim_lsp").setup({
+      })
     end,
   },
 }
 ```
+
+Use `require("android_neovim_lsp")`. The older `require("kotlin_neovim_lsp")` name is no longer valid.
+When the plugin is loaded from the installed bundle, you can omit `cmd` and let it auto-detect the sibling launcher.
 
 ### Format On Save
 

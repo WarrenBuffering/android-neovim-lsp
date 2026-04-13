@@ -34,7 +34,6 @@ require("lazy").setup({
     dependencies = { "neovim/nvim-lspconfig" },
     config = function()
       require("android_neovim_lsp").setup({
-        cmd = { "android-neovim-lsp" },
         on_attach = function(_, bufnr)
           local map = function(mode, lhs, rhs)
             vim.keymap.set(mode, lhs, rhs, { buffer = bufnr, silent = true })
