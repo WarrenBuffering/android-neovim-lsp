@@ -75,6 +75,18 @@ On startup, the server attempts to preload:
 
 This means the server does not always start from zero.
 
+## Current Local Index Composition
+
+When the runtime says "local index" today, that currently means the in-process merged index view, not a single isolated shard.
+
+That local view is composed from:
+
+- lightweight workspace/source index
+- support/dependency symbol index
+- eligible semantic module indexes when they are available
+
+This is important because "route to local" is currently a provider decision, not yet always a narrow per-context index-selection decision.
+
 ### External Source Jar Extraction
 
 External source jars are also mirrored to disk when needed.

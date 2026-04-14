@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode
 import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.analysis.WorkspaceAnalysisSnapshot
 import dev.codex.kotlinls.codeactions.CodeActionService
+import dev.codex.kotlinls.completion.CompletionRoute
+import dev.codex.kotlinls.completion.CompletionRoutingDecision
 import dev.codex.kotlinls.completion.CompletionService
 import dev.codex.kotlinls.diagnostics.DiagnosticsService
 import dev.codex.kotlinls.formatting.FormattingService
@@ -156,6 +158,7 @@ class KotlinLanguageServer(
     private val warmupLock = Any()
     private val supportRefreshLock = Any()
     private val requestMemoLock = Any()
+    private val completionRouteStatsLock = Any()
     private val semanticRequestLock = Any()
     private val completionMemo = linkedMapOf<RequestMemoKey, MemoizedValue<CompletionList>>()
     private val hoverMemo = linkedMapOf<RequestMemoKey, MemoizedValue<dev.codex.kotlinls.protocol.Hover?>>()
@@ -186,6 +189,7 @@ class KotlinLanguageServer(
     private var currentProjectGeneration = 0
     private val latestSemanticRequestIds = linkedMapOf<String, Int>()
     private val inFlightSemanticRequests = linkedMapOf<String, CompletableFuture<ModuleSemanticState?>>()
+    private val completionRouteStats = linkedMapOf<String, CompletionRouteMetric>()
 
     fun run() {
         try {
@@ -358,61 +362,39 @@ class KotlinLanguageServer(
                     if (source != null) {
                         val cacheKey = requestMemoKey(params.textDocument.uri, params.position)
                         memoizedCompletion(cacheKey)?.let { return@respond it }
-                        val indexed = completionService.completeFromIndex(currentIndex(), source.first, source.second, params)
-                        val memberAccess = completionService.isMemberAccessCompletion(source.second, params)
-                        val localSemantic = if (memberAccess) {
-                            availableSemanticState(params.textDocument.uri)
-                                ?.let { current ->
-                                    completionService.complete(current.first, current.second, params)
-                                }
-                                ?.takeIf { semantic -> semantic.items.isNotEmpty() }
-                        } else {
-                            null
-                        }
-                        val response = when {
-                            completionService.shouldPreferIndexCompletions(source.second, params, indexed) && !memberAccess -> indexed
-                            indexed.items.isNotEmpty() && currentProject == null ->
-                                localSemantic?.let { semantic ->
-                                    completionService.mergeSemanticAndIndexCompletions(
-                                        index = currentIndex(),
-                                        path = source.first,
-                                        text = source.second,
-                                        params = params,
-                                        semantic = semantic,
-                                    )
-                                } ?: indexed
+                        val activeIndex = currentIndex()
+                        val routeDecision = completionService.classifyCompletionRoute(
+                            index = activeIndex,
+                            path = source.first,
+                            text = source.second,
+                            params = params,
+                            bridgeAvailable = currentProject != null,
+                        )
+                        val startedAt = System.nanoTime()
+                        val response = when (routeDecision.route) {
+                            CompletionRoute.INDEX -> completionService.completeFromIndex(
+                                index = activeIndex,
+                                path = source.first,
+                                text = source.second,
+                                params = params,
+                            )
 
-                            currentProject != null -> {
-                                val semanticItems = localSemantic ?: semanticEngine.complete(
-                                    project = currentProject,
+                            CompletionRoute.BRIDGE -> currentProject?.let { current ->
+                                semanticEngine.complete(
+                                    project = current,
                                     path = source.first,
                                     text = source.second,
                                     version = documents.get(params.textDocument.uri)?.version,
                                     params = params,
                                     projectGeneration = currentProjectGeneration,
                                 )
-                                if (semanticItems != null && semanticItems.items.isNotEmpty()) {
-                                    completionService.mergeSemanticAndIndexCompletions(
-                                        index = currentIndex(),
-                                        path = source.first,
-                                        text = source.second,
-                                        params = params,
-                                        semantic = semanticItems,
-                                    )
-                                } else {
-                                    indexed
-                                }
-                            }
-                            else -> localSemantic?.let { semantic ->
-                                completionService.mergeSemanticAndIndexCompletions(
-                                    index = currentIndex(),
-                                    path = source.first,
-                                    text = source.second,
-                                    params = params,
-                                    semantic = semantic,
-                                )
-                            } ?: indexed
+                            } ?: CompletionList(false, emptyList())
                         }
+                        recordCompletionRoute(
+                            decision = routeDecision,
+                            itemCount = response.items.size,
+                            latencyMs = ((System.nanoTime() - startedAt) / 1_000_000L).coerceAtLeast(0L),
+                        )
                         rememberCompletion(cacheKey, response)
                         return@respond response
                     }
@@ -2024,6 +2006,30 @@ class KotlinLanguageServer(
         )
     }
 
+    private fun recordCompletionRoute(
+        decision: CompletionRoutingDecision,
+        itemCount: Int,
+        latencyMs: Long,
+    ) {
+        val key = "${decision.route.name.lowercase()}:${decision.reason}"
+        val snapshot = synchronized(completionRouteStatsLock) {
+            val metric = completionRouteStats.getOrPut(key) { CompletionRouteMetric() }
+            metric.count += 1
+            metric.totalItems += itemCount.toLong()
+            metric.totalLatencyMs += latencyMs
+            metric.copy()
+        }
+        if (snapshot.count % 25 == 0) {
+            val averageItems = snapshot.totalItems.toDouble() / snapshot.count.toDouble()
+            val averageLatencyMs = snapshot.totalLatencyMs.toDouble() / snapshot.count.toDouble()
+            System.err.println(
+                "[android-neovim-lsp] completion route=$key count=${snapshot.count} " +
+                    "avgItems=${"%.1f".format(averageItems)} avgLatencyMs=${"%.1f".format(averageLatencyMs)} " +
+                    "receiver=${decision.receiverType ?: "-"} chainDepth=${decision.chainDepth ?: 0}",
+            )
+        }
+    }
+
     private fun <T : Any> read(node: JsonNode?, type: Class<T>): T {
         requireNotNull(node) { "Missing params for $type" }
         return Json.mapper.treeToValue(node, type)
@@ -2112,6 +2118,12 @@ class KotlinLanguageServer(
         val character: Int,
         val indexGeneration: Int,
         val projectGeneration: Int,
+    )
+
+    private data class CompletionRouteMetric(
+        var count: Int = 0,
+        var totalItems: Long = 0,
+        var totalLatencyMs: Long = 0,
     )
 
     private data class MemoizedValue<T>(

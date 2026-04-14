@@ -56,13 +56,13 @@ The JetBrains bridge remains useful because it is still stronger in contexts whe
 
 ## Desired Routing Model
 
-Use a three-tier routing strategy:
+Use a hard two-route strategy:
 
-1. local-only for clearly simple contexts
-2. local-first with bridge fallback for ambiguous middle cases
-3. bridge-first for a small set of known hard contexts
+1. local index only
+2. bridge only
 
-Do not use a binary "everything local" vs "everything bridge" model.
+Do not merge results.
+Do not do request-time local fallback after choosing the bridge route.
 
 ## Local-Only Contexts
 
@@ -75,29 +75,16 @@ The completion request should use local indexed completion only, with no bridge 
 - enum entry completions
 - named argument suggestions when parameter names are already indexed
 - lambda parameter/name suggestions when local symbol context is already indexed
-- straightforward member completion where receiver type can be identified cheaply and uniquely from indexed/local context
+- simple member completion where receiver inference is shallow and obvious
 - completion inside ordinary function bodies where nearby lexical/local declarations provide a strong result set
 - completion requests where the local path already returns a strong candidate set with obvious top matches
 
-## Local-First Then Bridge-Fallback Contexts
-
-The completion request should try local indexed completion first, then escalate to the bridge only if the local result is weak, for these contexts:
-
-- ordinary member access where receiver inference succeeds but confidence is not perfect
-- extension-heavy contexts where local inference produces plausible but not obviously complete candidates
-- DSL / builder-style code where nearby context is strong but overload ranking may still matter
-- cases where local completion returns some plausible results, but the ranking may be questionable
-
-Use bridge fallback only if one or more of the escalation rules below trigger.
-
-## Bridge-First Contexts
-
-The completion request should skip local-only completion and go directly to bridge-backed completion for these contexts:
+## Bridge-Only Contexts
 
 - smart-cast-sensitive completion
 - control-flow-sensitive narrowing
 - expected-type-sensitive completion where the expected type strongly affects ranking
-- ambiguous chained-call receivers
+- chained receiver completion
 - ambiguous inferred receiver situations
 - contexts where extension prioritization depends on deeper semantic facts than the index carries
 - cases where overload ranking depends on semantic analysis rather than lexical/index facts
@@ -108,18 +95,20 @@ Examples:
 - `value?.child?.leaf.<complete>` when intermediate receiver types are not cheap to infer from the index
 - assignment / return / call-argument positions where expected type is the main ranking signal
 
-## Escalation Rules
+## Recommended Hard Split
 
-When using the local-first tier, escalate to the bridge if any of the following are true:
+The current recommended hard split is:
 
-- local receiver inference failed
-- local receiver inference produced multiple competing receiver types
-- local completion returned zero candidates in a member-access context
-- local completion returned too few plausible candidates for the context
-- local top results are obviously the wrong shape for the context
-- local results are dominated by globals/importables when the user is clearly completing receiver members
-- the completion site is inside a known flow-sensitive scope
-- the expression chain is deep enough that local inference is likely unreliable
+- `import` -> local
+- `package` -> local
+- `top_level_symbol` -> local
+- `local_lexical` -> local
+- `named_argument` -> local
+- `simple_member_access` -> local
+- `type_position` -> local
+- `chained_member_access` -> bridge
+- `expected_type_sensitive_expression` -> bridge
+- `flow_sensitive_expression` -> bridge
 
 The routing code should prefer cheap heuristics. Do not add an expensive pre-analysis step just to decide whether the bridge is needed.
 
@@ -127,9 +116,8 @@ The routing code should prefer cheap heuristics. Do not add an expensive pre-ana
 
 Use the following mental model:
 
-- if the server can cheaply identify the receiver and cheaply produce a strong ranked local result, stay local
+- if the completion site is a known shallow lookup problem, stay local
 - if the answer depends on semantic state that the current index model does not represent well, use the bridge
-- if the local path returns a thin or suspicious result, escalate
 
 The key principle is:
 

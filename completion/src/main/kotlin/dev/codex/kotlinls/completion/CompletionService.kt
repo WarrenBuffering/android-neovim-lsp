@@ -18,6 +18,7 @@ import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
 import dev.codex.kotlinls.protocol.TextEdit
 import dev.codex.kotlinls.workspace.LineIndex
+import java.nio.file.Path
 import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtBinaryExpression
 import org.jetbrains.kotlin.psi.KtExpression
@@ -33,7 +34,6 @@ import org.jetbrains.kotlin.psi.KtSafeQualifiedExpression
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.parentsWithSelf
 import org.jetbrains.kotlin.lexer.KtTokens
-import java.nio.file.Path
 
 class CompletionService {
     private val jetBrainsBridge: JetBrainsCompletionBridge? by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
@@ -160,6 +160,10 @@ class CompletionService {
     ): CompletionList {
         val lineIndex = LineIndex.build(text)
         val offset = lineIndex.offset(params.position)
+        val packageContext = packageCompletionContext(text, offset)
+        if (packageContext != null) {
+            return packageCompletionList(index, packageContext)
+        }
         val importContext = importCompletionContext(text, offset)
         if (importContext != null) {
             return importCompletionList(index, text, importContext)
@@ -228,6 +232,106 @@ class CompletionService {
         )
     }
 
+    fun classifyCompletionRoute(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        params: CompletionParams,
+        bridgeAvailable: Boolean,
+    ): CompletionRoutingDecision {
+        if (!bridgeAvailable) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "bridge-unavailable",
+            )
+        }
+        val offset = LineIndex.build(text).offset(params.position)
+        if (packageCompletionContext(text, offset) != null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "package-context",
+            )
+        }
+        if (importCompletionContext(text, offset) != null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "import-context",
+            )
+        }
+        if (isTypePositionContext(text, offset)) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "type-position",
+            )
+        }
+        if (isExpectedTypeSensitiveExpression(text, offset)) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "expected-type-sensitive-expression",
+            )
+        }
+        if (isFlowSensitiveExpression(text, offset)) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "flow-sensitive-expression",
+            )
+        }
+        if (!isMemberAccessContext(text, offset)) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "top-level-or-lexical",
+            )
+        }
+        val chain = receiverAccessChain(text, offset)
+        if (chain == null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "unknown-member-chain",
+            )
+        }
+        if (chain.size > 1) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "chained-member-access",
+                chainDepth = chain.size,
+            )
+        }
+        val receiverName = chain.firstOrNull()
+        if (receiverName != null && inferSmartCastTypeFromText(receiverName, text, offset) != null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "flow-sensitive-smart-cast",
+                chainDepth = chain.size,
+            )
+        }
+        val prefix = currentPrefix(text, offset)
+        val receiverType = inferReceiverChainType(index, path, text, chain, offset)
+            ?: fallbackNumericReceiverType(chain)
+        if (receiverType == null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "unknown-receiver-type",
+                chainDepth = chain.size,
+            )
+        }
+        val indexedCandidates = inferredReceiverCandidates(index, path, text, offset, prefix)
+        val syntheticCandidates = syntheticMemberCompletions(index, path, text, offset, prefix)
+        if (indexedCandidates.isEmpty() && syntheticCandidates.isEmpty()) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "no-indexed-member-candidates",
+                receiverType = receiverType,
+                chainDepth = chain.size,
+            )
+        }
+        return CompletionRoutingDecision(
+            route = CompletionRoute.INDEX,
+            reason = "simple-member-access",
+            receiverType = receiverType,
+            chainDepth = chain.size,
+        )
+    }
+
     private fun memberCompletionListFromIndex(
         index: WorkspaceIndex,
         path: Path,
@@ -286,110 +390,6 @@ class CompletionService {
                 .take(resultLimit)
                 .map { it.item },
         )
-    }
-
-    fun mergeSemanticAndIndexCompletions(
-        index: WorkspaceIndex,
-        path: Path,
-        text: String,
-        params: CompletionParams,
-        semantic: CompletionList,
-    ): CompletionList {
-        val fallback = completeFromIndex(
-            index = index,
-            path = path,
-            text = text,
-            params = params,
-            resultLimit = 250,
-        )
-        if (fallback.items.isEmpty()) return semantic
-        val offset = LineIndex.build(text).offset(params.position)
-        val prefix = currentPrefix(text, offset)
-        val memberAccess = isMemberAccessContext(text, offset)
-        val imports = SourceIndexLookup.imports(text)
-        val importedVisibleNames = imports.mapTo(linkedSetOf()) { it.visibleName }
-        val importedFqNames = imports.mapTo(linkedSetOf()) { it.fqName }
-        val merged = linkedMapOf<String, RankedCompletion>()
-
-        semantic.items.forEachIndexed { indexInSemantic, item ->
-            val score = mergedCompletionScore(
-                item = item,
-                prefix = prefix,
-                memberAccess = memberAccess,
-                importedVisibleNames = importedVisibleNames,
-                importedFqNames = importedFqNames,
-                primarySource = true,
-                duplicate = false,
-                ordinal = indexInSemantic,
-            )
-            merged[completionKey(item)] = RankedCompletion(
-                item = item.copy(sortText = scoreToSortKey(score)),
-                score = score,
-            )
-        }
-
-        fallback.items.forEachIndexed { indexInFallback, item ->
-            val key = completionKey(item)
-            val existing = merged[key]
-            val mergedItem = mergeCompletionItems(existing?.item, item)
-            val score = mergedCompletionScore(
-                item = mergedItem,
-                prefix = prefix,
-                memberAccess = memberAccess,
-                importedVisibleNames = importedVisibleNames,
-                importedFqNames = importedFqNames,
-                primarySource = false,
-                duplicate = existing != null,
-                ordinal = indexInFallback,
-            )
-            val candidate = RankedCompletion(
-                item = mergedItem.copy(sortText = scoreToSortKey(score)),
-                score = score,
-            )
-            merged[key] = when {
-                existing == null -> candidate
-                candidate.score > existing.score -> candidate
-                else -> existing.copy(
-                    item = mergeCompletionItems(existing.item, item).copy(sortText = existing.item.sortText),
-                )
-            }
-        }
-
-        return CompletionList(
-            isIncomplete = semantic.isIncomplete || fallback.isIncomplete,
-            items = merged.values
-                .sortedWith(compareByDescending<RankedCompletion> { it.score }.thenBy { it.item.label })
-                .take(100)
-                .map { it.item },
-        )
-    }
-
-    fun isMemberAccessCompletion(
-        text: String,
-        params: CompletionParams,
-    ): Boolean {
-        val offset = LineIndex.build(text).offset(params.position)
-        return isMemberAccessContext(text, offset)
-    }
-
-    fun shouldPreferIndexCompletions(
-        text: String,
-        params: CompletionParams,
-        indexed: CompletionList,
-    ): Boolean {
-        if (indexed.items.isEmpty()) return false
-        val offset = LineIndex.build(text).offset(params.position)
-        val prefix = currentPrefix(text, offset)
-        if (importCompletionContext(text, offset) != null) return true
-        if (isMemberAccessContext(text, offset)) return true
-        val strongPrefixMatch = indexed.items.take(8).any { item ->
-            val filter = item.filterText ?: item.label
-            filter.startsWith(prefix) ||
-                item.label.startsWith(prefix) ||
-                (item.insertText?.startsWith(prefix) == true)
-        }
-        if (!strongPrefixMatch) return false
-        return isMemberAccessContext(text, offset) || prefix.length >= 2
     }
 
     private fun bridgeItems(
@@ -472,7 +472,10 @@ class CompletionService {
                         sortText = scoreToSortKey(score),
                         filterText = packageName,
                         insertText = packageName,
-                        data = mapOf("package" to fqName),
+                        data = mapOf(
+                            "provider" to "index",
+                            "package" to fqName,
+                        ),
                     ),
                     score = score,
                 ),
@@ -516,13 +519,61 @@ class CompletionService {
         )
     }
 
+    private fun packageCompletionList(
+        index: WorkspaceIndex,
+        context: PackageCompletionContext,
+    ): CompletionList {
+        val ranked = linkedMapOf<String, RankedCompletion>()
+        packageSegmentCandidates(index, context.qualifier, context.segmentPrefix)
+            .forEach { packageName ->
+                val score = when {
+                    packageName == context.segmentPrefix -> 240
+                    packageName.startsWith(context.segmentPrefix) -> 220
+                    else -> 180
+                }
+                val fqName = listOf(context.qualifier, packageName).filter { it.isNotBlank() }.joinToString(".")
+                ranked.putIfAbsent(
+                    "package::$fqName",
+                    RankedCompletion(
+                        item = CompletionItem(
+                            label = packageName,
+                            kind = CompletionItemKind.MODULE,
+                            detail = fqName,
+                            sortText = scoreToSortKey(score),
+                            filterText = packageName,
+                            insertText = packageName,
+                            data = mapOf(
+                                "provider" to "index",
+                                "package" to fqName,
+                            ),
+                        ),
+                        score = score,
+                    ),
+                )
+            }
+        return CompletionList(
+            isIncomplete = false,
+            items = ranked.values
+                .sortedWith(compareByDescending<RankedCompletion> { it.score }.thenBy { it.item.label })
+                .take(100)
+                .map { it.item },
+        )
+    }
+
     private fun importPackageCandidates(
         index: WorkspaceIndex,
         context: ImportCompletionContext,
     ): List<String> =
+        packageSegmentCandidates(index, context.qualifier, context.segmentPrefix)
+
+    private fun packageSegmentCandidates(
+        index: WorkspaceIndex,
+        qualifier: String,
+        segmentPrefix: String,
+    ): List<String> =
         index.packageNames.asSequence()
-            .mapNotNull { packageName -> directImportPackageChild(packageName, context.qualifier) }
-            .filter { child -> child.startsWith(context.segmentPrefix) }
+            .mapNotNull { packageName -> directImportPackageChild(packageName, qualifier) }
+            .filter { child -> child.startsWith(segmentPrefix) }
             .distinct()
             .sorted()
             .take(100)
@@ -556,6 +607,24 @@ class CompletionService {
         val qualifier = importedPath.substringBeforeLast('.', "")
         val segmentPrefix = importedPath.substringAfterLast('.', importedPath)
         return ImportCompletionContext(
+            qualifier = qualifier,
+            segmentPrefix = segmentPrefix,
+        )
+    }
+
+    private fun packageCompletionContext(text: String, offset: Int): PackageCompletionContext? {
+        val safeOffset = offset.coerceIn(0, text.length)
+        val lineStart = text.lastIndexOf('\n', (safeOffset - 1).coerceAtLeast(0)).let { index ->
+            if (index == -1) 0 else index + 1
+        }
+        val linePrefix = text.substring(lineStart, safeOffset)
+        val trimmed = linePrefix.trimStart()
+        if (!trimmed.startsWith("package ")) return null
+        val packagePath = trimmed.removePrefix("package ").trim()
+        if (packagePath.any { !it.isLetterOrDigit() && it != '_' && it != '.' }) return null
+        val qualifier = packagePath.substringBeforeLast('.', "")
+        val segmentPrefix = packagePath.substringAfterLast('.', packagePath)
+        return PackageCompletionContext(
             qualifier = qualifier,
             segmentPrefix = segmentPrefix,
         )
@@ -952,6 +1021,7 @@ class CompletionService {
                     null
                 },
                 data = mapOf(
+                    "provider" to "index",
                     "symbolId" to symbol.id,
                     "uri" to symbol.uri,
                     "fqName" to (symbol.fqName ?: ""),
@@ -1049,64 +1119,6 @@ class CompletionService {
                 newText = importText,
             ),
         )
-    }
-
-    private fun completionKey(item: CompletionItem): String =
-        item.data?.get("symbolId")
-            ?: item.data?.get("fqName")
-            ?: buildString {
-                append(item.label)
-                append("::")
-                append(item.kind ?: -1)
-                append("::")
-                append(item.detail ?: "")
-            }
-
-    private fun mergedCompletionScore(
-        item: CompletionItem,
-        prefix: String,
-        memberAccess: Boolean,
-        importedVisibleNames: Set<String>,
-        importedFqNames: Set<String>,
-        primarySource: Boolean,
-        duplicate: Boolean,
-        ordinal: Int,
-    ): Int {
-        val filter = item.filterText ?: item.label
-        val fqName = item.data?.get("fqName").orEmpty().ifBlank { null }
-        val imported = item.label in importedVisibleNames || (fqName != null && fqName in importedFqNames)
-        var score = when {
-            filter == prefix || item.label == prefix -> 320
-            filter.startsWith(prefix) || item.label.startsWith(prefix) -> 260
-            filter.contains(prefix, ignoreCase = true) || item.label.contains(prefix, ignoreCase = true) -> 160
-            else -> 80
-        }
-        score += if (primarySource) 180 else 120
-        score += if (duplicate) 140 else 0
-        score += if (item.data?.get("smart") == "true") 70 else 0
-        score += if (imported) 120 else 0
-        score += if (item.additionalTextEdits.isNullOrEmpty()) 20 else -10
-        score += if (memberAccess) {
-            when (item.kind) {
-                CompletionItemKind.FUNCTION,
-                CompletionItemKind.PROPERTY,
-                CompletionItemKind.VARIABLE,
-                -> 35
-
-                CompletionItemKind.CLASS,
-                CompletionItemKind.MODULE,
-                -> -35
-
-                else -> 0
-            }
-        } else {
-            0
-        }
-        score += when {
-            primarySource -> (140 - ordinal).coerceAtLeast(0)
-            else -> (90 - ordinal).coerceAtLeast(0)
-        }
-        return score
     }
 
     private fun mergeCompletionItems(primary: CompletionItem?, secondary: CompletionItem): CompletionItem {
@@ -1416,6 +1428,39 @@ class CompletionService {
         return cursor > 0 && text[cursor - 1] == '.'
     }
 
+    private fun isTypePositionContext(text: String, offset: Int): Boolean {
+        val tokenStart = (offset - currentPrefix(text, offset).length).coerceIn(0, text.length)
+        val lineStart = text.lastIndexOf('\n', (tokenStart - 1).coerceAtLeast(0)).let { index ->
+            if (index == -1) 0 else index + 1
+        }
+        val prefix = text.substring(lineStart, tokenStart).trimEnd()
+        return prefix.endsWith(":") ||
+            prefix.endsWith(" as") ||
+            prefix.endsWith(" is") ||
+            prefix.endsWith("<")
+    }
+
+    private fun isExpectedTypeSensitiveExpression(text: String, offset: Int): Boolean {
+        val tokenStart = (offset - currentPrefix(text, offset).length).coerceIn(0, text.length)
+        val lineStart = text.lastIndexOf('\n', (tokenStart - 1).coerceAtLeast(0)).let { index ->
+            if (index == -1) 0 else index + 1
+        }
+        val linePrefix = text.substring(lineStart, tokenStart).trimEnd()
+        if (linePrefix.startsWith("return ")) return true
+        if (!linePrefix.endsWith("=")) return false
+        val leftHandSide = linePrefix.removeSuffix("=").trimEnd()
+        if (leftHandSide.contains('(') && !leftHandSide.contains(':')) return false
+        return leftHandSide.startsWith("val ") ||
+            leftHandSide.startsWith("var ") ||
+            leftHandSide.contains(':')
+    }
+
+    private fun isFlowSensitiveExpression(text: String, offset: Int): Boolean {
+        val prefix = text.substring(0, offset.coerceIn(0, text.length))
+        return FLOW_SENSITIVE_IF_REGEX.containsMatchIn(prefix) ||
+            FLOW_SENSITIVE_WHEN_REGEX.containsMatchIn(prefix)
+    }
+
     private fun scoreToSortKey(score: Int): String = (1000 - score).coerceAtLeast(0).toString().padStart(4, '0')
 
     private data class RankedCompletion(
@@ -1438,8 +1483,36 @@ class CompletionService {
         val segmentPrefix: String,
     )
 
+    private data class PackageCompletionContext(
+        val qualifier: String,
+        val segmentPrefix: String,
+    )
+
     private data class ReceiverTypeHierarchy(
         val fqNames: Set<String>,
         val shortNames: Set<String>,
     )
+
+    private companion object {
+        val FLOW_SENSITIVE_IF_REGEX = Regex(
+            """\bif\s*\([^)]*\bis\s+[A-Za-z_][A-Za-z0-9_.<>?]*[^)]*\)\s*\{[\s\S]*$""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
+        )
+        val FLOW_SENSITIVE_WHEN_REGEX = Regex(
+            """\bwhen\s*\([^)]*\)\s*\{[\s\S]*\bis\s+[A-Za-z_][A-Za-z0-9_.<>?]*\s*->[\s\S]*$""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
+        )
+    }
 }
+
+enum class CompletionRoute {
+    INDEX,
+    BRIDGE,
+}
+
+data class CompletionRoutingDecision(
+    val route: CompletionRoute,
+    val reason: String,
+    val receiverType: String? = null,
+    val chainDepth: Int? = null,
+)
