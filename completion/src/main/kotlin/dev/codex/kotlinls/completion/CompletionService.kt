@@ -46,6 +46,7 @@ class CompletionService {
         snapshot: WorkspaceAnalysisSnapshot,
         index: WorkspaceIndex,
         params: CompletionParams,
+        allowBridge: Boolean = true,
     ): CompletionList {
         val file = snapshot.filesByUri[params.textDocument.uri] ?: return CompletionList(false, emptyList())
         val lineIndex = LineIndex.build(file.text)
@@ -55,23 +56,27 @@ class CompletionService {
         val importedFqNames = file.ktFile.importDirectives.mapNotNull { it.importedFqName?.asString() }.toSet()
         val importContext = context.importContext
         if (importContext != null) {
-            jetBrainsBridge?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
-                val filtered = bridged.filter { bridgeMatchesImportContext(it, importContext) }
-                if (filtered.isNotEmpty()) {
-                    return CompletionList(
-                        isIncomplete = false,
-                        items = bridgeItems(file, filtered, importedFqNames),
-                    )
+            if (allowBridge) {
+                jetBrainsBridge?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
+                    val filtered = bridged.filter { bridgeMatchesImportContext(it, importContext) }
+                    if (filtered.isNotEmpty()) {
+                        return CompletionList(
+                            isIncomplete = false,
+                            items = bridgeItems(file, filtered, importedFqNames),
+                        )
+                    }
                 }
             }
             return importCompletionList(index, file.text, importContext)
         }
-        jetBrainsBridge?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
-            if (bridged.isNotEmpty()) {
-                return CompletionList(
-                    isIncomplete = false,
-                    items = bridgeItems(file, bridged, importedFqNames),
-                )
+        if (allowBridge) {
+            jetBrainsBridge?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
+                if (bridged.isNotEmpty()) {
+                    return CompletionList(
+                        isIncomplete = false,
+                        items = bridgeItems(file, bridged, importedFqNames),
+                    )
+                }
             }
         }
         val localCandidates = visibleLocals(file, offset)

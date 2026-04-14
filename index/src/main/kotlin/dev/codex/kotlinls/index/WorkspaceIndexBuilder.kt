@@ -162,11 +162,11 @@ class WorkspaceIndexBuilder(
         declaration: KtNamedDeclaration,
         descriptor: DeclarationDescriptor?,
     ): Int = when {
+        declaration is KtEnumEntry -> SymbolKind.ENUM_MEMBER
         declaration is KtClass && declaration.isInterface() -> SymbolKind.INTERFACE
         declaration is KtClass && declaration.isEnum() -> SymbolKind.ENUM
-        declaration is KtClassOrObject -> SymbolKind.CLASS
         declaration is KtObjectDeclaration -> SymbolKind.OBJECT
-        declaration is KtEnumEntry -> SymbolKind.ENUM_MEMBER
+        declaration is KtClassOrObject -> SymbolKind.CLASS
         declaration is KtNamedFunction -> SymbolKind.FUNCTION
         declaration is KtConstructor<*> || descriptor is ConstructorDescriptor -> SymbolKind.CONSTRUCTOR
         declaration is KtProperty && declaration.isLocal -> SymbolKind.VARIABLE

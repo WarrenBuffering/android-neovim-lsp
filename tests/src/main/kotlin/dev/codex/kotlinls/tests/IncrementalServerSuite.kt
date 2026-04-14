@@ -246,6 +246,136 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 assertTrue(definitionCount > 0) { "Expected semantic definition for local variable once snapshot was ready" }
             }
         },
+        TestCase("requests inlay hint refresh after semantic analysis for open files") {
+            val projectRoot = createSemanticRequestFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf("mode" to "off"),
+                    ),
+                )
+                openDocument(server, appFile)
+                val refreshRequest = readUntil(server.reader, maxMessages = 160) { message ->
+                    message.method == "workspace/inlayHint/refresh"
+                }
+                assertTrue(refreshRequest != null) {
+                    "Expected workspace/inlayHint/refresh request after semantic state install"
+                }
+            }
+        },
+        TestCase("serves default-import Kotlin stdlib hover and definition from the support index") {
+            val projectRoot = createDefaultImportSupportFixture()
+            val appFile = projectRoot.resolve("src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(server, projectRoot)
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                var hoverText = ""
+                var definitionUri = ""
+                repeat(30) { attempt ->
+                    val hoverRequestId = 700 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to hoverRequestId,
+                            "method" to "textDocument/hover",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 2, "character" to 16),
+                            ),
+                        ),
+                    )
+                    val hoverResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                        message.id?.asInt() == hoverRequestId
+                    }
+                    hoverText = hoverResponse?.result?.toString().orEmpty()
+
+                    val definitionRequestId = 800 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to definitionRequestId,
+                            "method" to "textDocument/definition",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 2, "character" to 16),
+                            ),
+                        ),
+                    )
+                    val definitionResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                        message.id?.asInt() == definitionRequestId
+                    }
+                    definitionUri = definitionResponse?.result
+                        ?.firstOrNull()
+                        ?.get("uri")
+                        ?.asText()
+                        .orEmpty()
+                    if ("String" in hoverText && definitionUri.contains("/kotlin/String.kt")) {
+                        return@repeat
+                    }
+                    Thread.sleep(150)
+                }
+
+                assertContains(hoverText, "String")
+                assertContains(definitionUri, "/kotlin/String.kt")
+            }
+        },
+        TestCase("serves support-index import completions for non-project symbols") {
+            val projectRoot = createDefaultImportSupportFixture()
+            val appFile = projectRoot.resolve("src/main/kotlin/demo/app/App.kt")
+            appFile.writeText(
+                """
+                package demo.app
+
+                import kotlin.collections.lis
+
+                fun app(): Int = 1
+                """.trimIndent() + "\n",
+            )
+            withRunningServer { server ->
+                initializeServer(server, projectRoot)
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                var labels = emptyList<String>()
+                repeat(30) { attempt ->
+                    val requestId = 900 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to requestId,
+                            "method" to "textDocument/completion",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 2, "character" to 29),
+                            ),
+                        ),
+                    )
+                    val completionResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                        message.id?.asInt() == requestId
+                    }
+                    labels = completionResponse?.result
+                        ?.get("items")
+                        ?.mapNotNull { item -> item.get("label")?.asText() }
+                        .orEmpty()
+                    if ("listOf" in labels) {
+                        return@repeat
+                    }
+                    Thread.sleep(150)
+                }
+
+                assertTrue("listOf" in labels) {
+                    "Expected support-index import completion to include listOf, got ${labels.take(10)}"
+                }
+            }
+        },
         TestCase("serves first semantic hover and definition on cold request when focused analysis fits timeout") {
             val projectRoot = createSemanticRequestFixture()
             val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
@@ -773,6 +903,19 @@ private fun createSemanticRequestFixture(): Path {
             val count = 42
             return count
         }
+        """.trimIndent() + "\n",
+    )
+    return root
+}
+
+private fun createDefaultImportSupportFixture(): Path {
+    val root = FixtureSupport.fixtureCopy("simple-jvm-app")
+    root.resolve("src/main/kotlin/demo/app").createDirectories()
+    root.resolve("src/main/kotlin/demo/app/App.kt").writeText(
+        """
+        package demo.app
+
+        fun app(label: String): String = label.trim()
         """.trimIndent() + "\n",
     )
     return root

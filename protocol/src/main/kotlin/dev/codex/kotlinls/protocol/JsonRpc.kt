@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
@@ -39,6 +40,7 @@ class JsonRpcTransport(
     private val source = input
     private val sink = output
     private val writeLock = ReentrantLock()
+    private val outboundRequestIds = AtomicLong(1)
 
     fun readMessage(): JsonRpcInboundMessage? {
         val headers = linkedMapOf<String, String>()
@@ -97,6 +99,19 @@ class JsonRpcTransport(
         )
     }
 
+    fun sendRequest(method: String, params: Any? = null): Long {
+        val id = outboundRequestIds.getAndIncrement()
+        write(
+            mapOf(
+                "jsonrpc" to "2.0",
+                "id" to id,
+                "method" to method,
+                "params" to params,
+            ),
+        )
+        return id
+    }
+
     private fun write(payload: Any) {
         val bytes = Json.mapper.writeValueAsBytes(payload)
         val header = "Content-Length: ${bytes.size}\r\n\r\n".toByteArray(StandardCharsets.UTF_8)
@@ -122,4 +137,3 @@ class JsonRpcTransport(
         }
     }
 }
-

@@ -90,6 +90,11 @@ class KotlinSourceIndexer : AutoCloseable {
                 is KtNamedDeclaration -> add(this@collectIndexableDeclarations)
             }
             if (this@collectIndexableDeclarations is KtClassOrObject) {
+                if (this@collectIndexableDeclarations is KtClass && isEnum()) {
+                    body?.children
+                        ?.filterIsInstance<KtEnumEntry>()
+                        ?.forEach { entry -> add(entry) }
+                }
                 declarations.forEach { child ->
                     addAll(child.collectIndexableDeclarations())
                 }
@@ -100,6 +105,7 @@ class KotlinSourceIndexer : AutoCloseable {
 
     private fun KtNamedDeclaration.isIndexCandidate(): Boolean {
         if (this is KtProperty && isLocal) return false
+        if (this is KtEnumEntry) return true
         val parent = parent
         return parent is KtFile || parent is KtClassOrObject || this is KtConstructor<*>
     }
@@ -122,11 +128,11 @@ class KotlinSourceIndexer : AutoCloseable {
     }
 
     private fun KtNamedDeclaration.indexedKind(): Int = when {
+        this is KtEnumEntry -> SymbolKind.ENUM_MEMBER
         this is KtClass && isInterface() -> SymbolKind.INTERFACE
         this is KtClass && isEnum() -> SymbolKind.ENUM
         this is KtObjectDeclaration -> SymbolKind.OBJECT
         this is KtClassOrObject -> SymbolKind.CLASS
-        this is KtEnumEntry -> SymbolKind.ENUM_MEMBER
         this is KtNamedFunction -> SymbolKind.FUNCTION
         this is KtConstructor<*> -> SymbolKind.CONSTRUCTOR
         this is KtProperty -> SymbolKind.PROPERTY

@@ -21,7 +21,8 @@ object SourceIndexLookup {
 
         val token = identifierAt(text, position) ?: return null
         val imports = imports(text)
-        resolveImported(index, imports, token, normalizedPath, currentModuleName)?.let { return it }
+        val defaultImportedPackages = defaultImportPackages(normalizedPath)
+        resolveImported(index, imports, defaultImportedPackages, token, normalizedPath, currentModuleName)?.let { return it }
 
         val packageName = packageName(text)
         ownDeclarations.firstOrNull { it.name == token && it.importable.not() }?.let { return it }
@@ -42,9 +43,23 @@ object SourceIndexLookup {
         return null
     }
 
+    fun supportPackages(
+        path: Path,
+        text: String,
+    ): Set<String> =
+        buildSet {
+            addAll(defaultImportPackages(path))
+            imports(text)
+                .mapNotNull { sourceImport ->
+                    sourceImport.fqName.substringBeforeLast('.', missingDelimiterValue = "").takeIf { it.isNotBlank() }
+                }
+                .forEach(::add)
+        }
+
     private fun resolveImported(
         index: WorkspaceIndex,
         imports: List<SourceImport>,
+        defaultImportedPackages: Set<String>,
         token: String,
         currentPath: Path,
         moduleName: String?,
@@ -52,8 +67,11 @@ object SourceIndexLookup {
         val importedCandidates = imports
             .filter { it.visibleName == token }
             .mapNotNull { import -> index.symbolsByFqName[import.fqName] }
+        val defaultImportedCandidates = index.symbolsByName[token]
+            .orEmpty()
+            .filter { candidate -> candidate.packageName in defaultImportedPackages }
         return bestCandidate(
-            candidates = importedCandidates,
+            candidates = (importedCandidates + defaultImportedCandidates).distinctBy { it.id },
             currentPath = currentPath,
             packageName = null,
             moduleName = moduleName,
@@ -142,8 +160,28 @@ object SourceIndexLookup {
 
     private fun Char.isIdentifierChar(): Boolean = isLetterOrDigit() || this == '_' || this == '$'
 
+    private fun defaultImportPackages(path: Path): Set<String> =
+        when (path.fileName?.toString()?.substringAfterLast('.', "").orEmpty()) {
+            "kt", "kts" -> DEFAULT_KOTLIN_IMPORT_PACKAGES
+            "java" -> DEFAULT_JAVA_IMPORT_PACKAGES
+            else -> emptySet()
+        }
+
     private val PACKAGE_REGEX = Regex("""(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_$.]*)\s*$""")
     private val IMPORT_REGEX = Regex("""(?m)^\s*import\s+([A-Za-z_][A-Za-z0-9_$.]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*$""")
+    private val DEFAULT_KOTLIN_IMPORT_PACKAGES = setOf(
+        "java.lang",
+        "kotlin",
+        "kotlin.annotation",
+        "kotlin.collections",
+        "kotlin.comparisons",
+        "kotlin.io",
+        "kotlin.jvm",
+        "kotlin.ranges",
+        "kotlin.sequences",
+        "kotlin.text",
+    )
+    private val DEFAULT_JAVA_IMPORT_PACKAGES = setOf("java.lang")
 }
 
 data class SourceImport(

@@ -72,7 +72,7 @@ data class WorkspaceIndex(
         return symbolsByPrefix[bucketKey]
             .orEmpty()
             .asSequence()
-            .filter { symbol -> symbol.name.startsWith(prefix) }
+            .filter { symbol -> symbol.name.startsWith(prefix, ignoreCase = true) }
     }
 }
 

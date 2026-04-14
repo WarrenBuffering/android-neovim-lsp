@@ -155,6 +155,52 @@ fun featureSuite(): TestSuite {
                     "Expected source-backed completion detail, got ${column?.detail}"
                 }
             },
+            TestCase("offers top-level library function completions inside imports") {
+                val index = WorkspaceIndex(
+                    symbols = listOf(
+                        indexedSymbol(
+                            id = "source::androidx.compose.animation.core.animateDpAsState",
+                            name = "animateDpAsState",
+                            fqName = "androidx.compose.animation.core.animateDpAsState",
+                            signature = "animateDpAsState(targetValue: Dp, label: String = ...)",
+                            documentation = "Fire-and-forget animation for Dp values.",
+                            packageName = "androidx.compose.animation.core",
+                            path = Path.of("/tmp/androidx/compose/animation/core/AnimateAsState.kt"),
+                            uri = "file:///tmp/androidx/compose/animation/core/AnimateAsState.kt",
+                        ),
+                        indexedSymbol(
+                            id = "binary::androidx.compose.animation.core.animateDpAsState-AjpBEmI",
+                            name = "animateDpAsState-AjpBEmI",
+                            fqName = "androidx.compose.animation.core.animateDpAsState-AjpBEmI",
+                            signature = "animateDpAsState-AjpBEmI(...): State<Dp>",
+                            documentation = null,
+                            packageName = "androidx.compose.animation.core",
+                            path = Path.of("/binary-libraries/animation-core/AnimateAsStateKt.class"),
+                            uri = "jar:file:///Users/test/.gradle/animation-core.jar!/androidx/compose/animation/core/AnimateAsStateKt.class",
+                        ),
+                    ),
+                    references = emptyList(),
+                    callEdges = emptyList(),
+                )
+                val text = """
+                    package demo
+
+                    import androidx.compose.animation.core.animateDpAs
+                """.trimIndent()
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = Path.of("/workspace/demo/App.kt"),
+                    text = text,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier("file:///workspace/demo/App.kt"),
+                        position = Position(2, text.lines()[2].length),
+                    ),
+                )
+                val labels = completions.items.map { it.label }
+                assertTrue("animateDpAsState" in labels) {
+                    "Expected animateDpAsState import completion, got ${labels.take(10)}"
+                }
+            },
             TestCase("offers package segment completion inside imports") {
                 val root = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(root)
@@ -458,6 +504,49 @@ fun featureSuite(): TestSuite {
                 )
                 assertTrue(completions.items.any { it.label == "toFloat" }) {
                     "Expected semantic primitive conversion completion, got ${completions.items.take(10).map { it.label }}"
+                }
+            },
+            TestCase("offers enum entry completions for project-owned member access") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    enum class SheetVisibilityState {
+                        Peek,
+                        Fit,
+                        Expanded,
+                    }
+
+                    fun demo() {
+                        val state = SheetVisibilityState.Fi
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 44,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("SheetVisibilityState.Fi") }
+                val column = content.lines()[line].indexOf("Fi") + 2
+                val completions = completionService.complete(
+                    snapshot,
+                    index,
+                    CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                    allowBridge = false,
+                )
+                assertTrue(completions.items.any { it.label == "Fit" }) {
+                    "Expected enum entry completion, got ${completions.items.take(10).map { it.label }}"
                 }
             },
             TestCase("merges semantic member completions with indexed fallback") {

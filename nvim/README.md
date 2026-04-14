@@ -4,7 +4,11 @@
 
 ```lua
 vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
-require("android_neovim_lsp").setup()
+require("android_neovim_lsp").setup({
+  inlay_hints = false,
+  format_on_save = true,
+  block_on_save = false,
+})
 ```
 
 If you used the release installer, this is the default runtime path it creates.
@@ -36,20 +40,38 @@ That builds the local server, installs the bundle into the same layout as the re
 
 The repo's `nvim/init.lua` also bootstraps `lazy.nvim` and `nvim-lspconfig`, so `nvim -u .../nvim/init.lua` behaves like a small consumer config instead of depending on your existing Neovim setup.
 
-## Formatting on Save
+## Plugin Options
 
-For Kotlin, prefer formatting after save so the editor does not block on a synchronous LSP formatting round-trip.
+`android_neovim_lsp.setup()` accepts normal `lspconfig` options plus three plugin-specific toggles:
 
 ```lua
-require("conform").setup({
-  format_after_save = function(bufnr)
-    if vim.bo[bufnr].filetype ~= "kotlin" then
-      return
-    end
-    return { lsp_format = "fallback" }
-  end,
+require("android_neovim_lsp").setup({
+  inlay_hints = false,
+  format_on_save = true,
+  block_on_save = false,
 })
 ```
+
+You can also pass tables:
+
+```lua
+require("android_neovim_lsp").setup({
+  inlay_hints = {
+    enabled = false,
+  },
+  format_on_save = {
+    enabled = true,
+    quiet = true,
+    lsp_format = "fallback",
+    timeout_ms = 5000,
+  },
+  block_on_save = {
+    enabled = false,
+  },
+})
+```
+
+When `format_on_save` is enabled, the runtime disables LazyVim-style Kotlin autoformatting for that buffer and manages formatting itself. `block_on_save = false` formats asynchronously after the write, while `block_on_save = true` formats synchronously before the write and blocks until formatting finishes. If [`conform.nvim`](https://github.com/stevearc/conform.nvim) is installed, it is used automatically; otherwise the runtime falls back to `vim.lsp.buf.format()`.
 
 ## Mason
 

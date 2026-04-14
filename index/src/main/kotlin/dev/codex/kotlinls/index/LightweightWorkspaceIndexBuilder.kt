@@ -470,7 +470,7 @@ class LightweightWorkspaceIndexBuilder(
         current == 1 || current == total || current % 50 == 0
 
     companion object {
-        private const val SCHEMA_VERSION = 2
+        private const val SCHEMA_VERSION = 4
 
         private fun defaultIndexCacheRoot(): Path {
             val userHome = Path.of(System.getProperty("user.home"))
