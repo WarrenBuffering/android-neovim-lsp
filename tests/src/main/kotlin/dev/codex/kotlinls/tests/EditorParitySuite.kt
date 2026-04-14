@@ -272,7 +272,7 @@ fun editorParitySuite(): TestSuite {
                     ),
                 )
                 val hoverText = hover?.contents?.value ?: error("Expected stdlib hover from support index")
-                assertContains(hoverText, "toFloat")
+                assertContains(hoverText, "Parses the string as a `Float` number")
                 assertContains(hoverText, "Float")
             },
             TestCase("offers explicit type and return type code actions") {

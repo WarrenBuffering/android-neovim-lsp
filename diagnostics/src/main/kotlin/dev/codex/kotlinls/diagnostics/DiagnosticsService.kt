@@ -48,13 +48,74 @@ class DiagnosticsService(
         project: ImportedProject?,
         path: Path,
         text: String,
+        lookup: FastDiagnosticLookup? = null,
     ): List<Diagnostic> =
         buildList {
             project?.let { importedProject ->
                 packageMismatchDiagnostic(importedProject, path, text)?.let(::add)
             }
+            addAll(importDiagnostics(text, lookup))
             addAll(lintDiagnostics(path, text))
         }
+
+    private fun importDiagnostics(
+        text: String,
+        lookup: FastDiagnosticLookup?,
+    ): List<Diagnostic> {
+        val availableLookup = lookup ?: return emptyList()
+        val diagnostics = mutableListOf<Diagnostic>()
+        val seenImports = linkedMapOf<ImportIdentity, ImportLine>()
+        validImportLines(text).forEach { importLine ->
+            val identity = ImportIdentity(importLine.importedPath, importLine.alias)
+            val previous = seenImports.putIfAbsent(identity, importLine)
+            if (previous != null) {
+                diagnostics += importLine.diagnostic(
+                    code = "duplicate-import",
+                    message = "Duplicate import `${renderImport(identity)}`.",
+                )
+                return@forEach
+            }
+            when {
+                importLine.isWildcardImport -> {
+                    val packageName = importLine.importedPath.removeSuffix(".*")
+                    if (packageName.isBlank()) {
+                        diagnostics += importLine.diagnostic(
+                            code = "malformed-import",
+                            message = "Malformed import statement.",
+                        )
+                    } else if (packageName !in availableLookup.packagePrefixes) {
+                        diagnostics += importLine.diagnostic(
+                            code = "unresolved-import-package",
+                            message = "Unresolved import package `$packageName`.",
+                        )
+                    }
+                }
+
+                importLine.importedPath in availableLookup.importableFqNames -> Unit
+
+                importLine.packageName.isNotBlank() && importLine.packageName in availableLookup.packagePrefixes -> {
+                    diagnostics += importLine.diagnostic(
+                        code = "unresolved-import-symbol",
+                        message = "Unresolved import `${importLine.importedPath}`.",
+                    )
+                }
+
+                else -> {
+                    diagnostics += importLine.diagnostic(
+                        code = "unresolved-import-package",
+                        message = "Unresolved import package `${importLine.packageName.ifBlank { importLine.importedPath }}`.",
+                    )
+                }
+            }
+        }
+        malformedImportLines(text).forEach { malformed ->
+            diagnostics += malformed.diagnostic(
+                code = "malformed-import",
+                message = "Malformed import statement.",
+            )
+        }
+        return diagnostics.sortedWith(compareBy<Diagnostic> { it.range.start.line }.thenBy { it.range.start.character })
+    }
 
     private fun CompilerDiagnosticRecord.toLsp(text: String): Diagnostic {
         val lineIndex = LineIndex.build(text)
@@ -141,7 +202,82 @@ class DiagnosticsService(
         val textHash: Int,
     )
 
+    private data class ImportLine(
+        val lineNumber: Int,
+        val rawLine: String,
+        val importedPath: String,
+        val alias: String?,
+    ) {
+        val packageName: String = importedPath.substringBeforeLast('.', missingDelimiterValue = "")
+        val isWildcardImport: Boolean = importedPath.endsWith(".*")
+
+        fun diagnostic(
+            code: String,
+            message: String,
+        ): Diagnostic = Diagnostic(
+            range = Range(
+                start = dev.codex.kotlinls.protocol.Position(lineNumber, 0),
+                end = dev.codex.kotlinls.protocol.Position(lineNumber, rawLine.length),
+            ),
+            severity = DiagnosticSeverity.ERROR,
+            code = code,
+            source = "android-neovim-lsp",
+            message = message,
+        )
+    }
+
+    private data class ImportIdentity(
+        val importedPath: String,
+        val alias: String?,
+    )
+
+    data class FastDiagnosticLookup(
+        val importableFqNames: Set<String>,
+        val packagePrefixes: Set<String>,
+    )
+
     private companion object {
         val PACKAGE_REGEX = Regex("""(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_$.]*)\s*$""")
+        val VALID_IMPORT_REGEX = Regex(
+            """^\s*import\s+([A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*(?:\.\*)?)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*$""",
+        )
+        val IMPORT_PREFIX_REGEX = Regex("""^\s*import\b""")
+
+        fun validImportLines(text: String): List<ImportLine> =
+            text.lineSequence()
+                .mapIndexedNotNull { index, line ->
+                    val match = VALID_IMPORT_REGEX.matchEntire(line) ?: return@mapIndexedNotNull null
+                    ImportLine(
+                        lineNumber = index,
+                        rawLine = line,
+                        importedPath = match.groupValues[1],
+                        alias = match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() },
+                    )
+                }
+                .toList()
+
+        fun malformedImportLines(text: String): List<ImportLine> =
+            text.lineSequence()
+                .mapIndexedNotNull { index, line ->
+                    if (!IMPORT_PREFIX_REGEX.containsMatchIn(line) || VALID_IMPORT_REGEX.matches(line)) {
+                        return@mapIndexedNotNull null
+                    }
+                    ImportLine(
+                        lineNumber = index,
+                        rawLine = line,
+                        importedPath = line.trim().removePrefix("import").trim(),
+                        alias = null,
+                    )
+                }
+                .toList()
+
+        fun renderImport(identity: ImportIdentity): String =
+            buildString {
+                append(identity.importedPath)
+                if (!identity.alias.isNullOrBlank()) {
+                    append(" as ")
+                    append(identity.alias)
+                }
+            }
     }
 }

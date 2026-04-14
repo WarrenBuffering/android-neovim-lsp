@@ -1,6 +1,7 @@
 package dev.codex.kotlinls.tests
 
 import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
+import dev.codex.kotlinls.completion.CompletionRoute
 import dev.codex.kotlinls.completion.CompletionService
 import dev.codex.kotlinls.hover.HoverAndSignatureService
 import dev.codex.kotlinls.index.IndexedSymbol
@@ -372,7 +373,7 @@ fun featureSuite(): TestSuite {
                     "Expected member completion to exclude unrelated globals, got $labels"
                 }
             },
-            TestCase("merges weak semantic completions with indexed fallback candidates") {
+            TestCase("routes simple member access to the local index when indexed members exist") {
                 val root = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(root)
                 val store = TextDocumentStore()
@@ -399,7 +400,7 @@ fun featureSuite(): TestSuite {
                 val index = indexBuilder.build(snapshot)
                 val line = content.lines().indexOfFirst { it.contains("Greeting().sh") }
                 val column = content.lines()[line].indexOf("sh") + 2
-                val merged = completionService.mergeSemanticAndIndexCompletions(
+                val decision = completionService.classifyCompletionRoute(
                     index = index,
                     path = appFile,
                     text = content,
@@ -407,28 +408,22 @@ fun featureSuite(): TestSuite {
                         textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
                         position = Position(line, column),
                     ),
-                    semantic = CompletionList(
-                        isIncomplete = false,
-                        items = listOf(
-                            CompletionItem(
-                                label = "shape",
-                                kind = CompletionItemKind.FUNCTION,
-                                filterText = "shape",
-                                detail = "noise",
-                                data = mapOf("provider" to "jetbrains"),
-                            ),
-                            CompletionItem(
-                                label = "showcase",
-                                kind = CompletionItemKind.FUNCTION,
-                                filterText = "showcase",
-                                detail = "noise",
-                                data = mapOf("provider" to "jetbrains"),
-                            ),
-                        ),
+                    bridgeAvailable = true,
+                )
+                assertEquals(CompletionRoute.INDEX, decision.route) {
+                    "Expected simple member access to stay local, got $decision"
+                }
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
                     ),
                 )
-                assertTrue(merged.items.firstOrNull()?.label == "shout") {
-                    "Expected indexed fallback to outrank noisy semantic candidates, got ${merged.items.take(10).map { it.label }}"
+                assertTrue(completions.items.firstOrNull()?.label == "shout") {
+                    "Expected indexed member completion to prioritize `shout`, got ${completions.items.take(10).map { it.label }}"
                 }
             },
             TestCase("offers primitive conversion completions for local numeric chains in index-only mode") {
@@ -549,7 +544,7 @@ fun featureSuite(): TestSuite {
                     "Expected enum entry completion, got ${completions.items.take(10).map { it.label }}"
                 }
             },
-            TestCase("merges semantic member completions with indexed fallback") {
+            TestCase("keeps simple member access on the local route without semantic merging") {
                 val root = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(root)
                 val store = TextDocumentStore()
@@ -576,7 +571,7 @@ fun featureSuite(): TestSuite {
                 val index = indexBuilder.build(snapshot)
                 val line = content.lines().indexOfFirst { it.contains("Greeting().sh") }
                 val column = content.lines()[line].indexOf("sh") + 2
-                val merged = completionService.mergeSemanticAndIndexCompletions(
+                val decision = completionService.classifyCompletionRoute(
                     index = index,
                     path = appFile,
                     text = content,
@@ -584,22 +579,23 @@ fun featureSuite(): TestSuite {
                         textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
                         position = Position(line, column),
                     ),
-                    semantic = CompletionList(
-                        isIncomplete = false,
-                        items = listOf(
-                            CompletionItem(
-                                label = "showcase",
-                                kind = CompletionItemKind.FUNCTION,
-                                filterText = "showcase",
-                                detail = "semantic member",
-                                data = mapOf("provider" to "jetbrains"),
-                            ),
-                        ),
+                    bridgeAvailable = true,
+                )
+                assertEquals(CompletionRoute.INDEX, decision.route) {
+                    "Expected simple member access to remain local, got $decision"
+                }
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
                     ),
                 )
-                val labels = merged.items.take(10).map { it.label }
-                assertTrue("shout" in labels && "showcase" in labels) {
-                    "Expected merged member completions to keep semantic and indexed items, got $labels"
+                val labels = completions.items.take(10).map { item -> item.label }
+                assertTrue("shout" in labels) {
+                    "Expected local member completions to include `shout`, got $labels"
                 }
             },
             TestCase("ranks expected-type-matching completions above unrelated ones") {

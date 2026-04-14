@@ -87,6 +87,12 @@ That local view is composed from:
 
 This is important because "route to local" is currently a provider decision, not yet always a narrow per-context index-selection decision.
 
+Current narrowing now applied in the completion path:
+
+- package completion uses the lightweight workspace/source index
+- import completion uses lightweight + support/dependency indexes
+- other local completion routes still use the broader combined local index
+
 ### External Source Jar Extraction
 
 External source jars are also mirrored to disk when needed.

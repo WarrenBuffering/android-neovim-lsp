@@ -1,6 +1,7 @@
 package dev.codex.kotlinls.index
 
 import dev.codex.kotlinls.projectimport.ImportedProject
+import dev.codex.kotlinls.projectimport.StableArtifactFingerprint
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.extension
@@ -92,6 +93,8 @@ class SupportSymbolIndexBuilder(
             append('\n')
             project.modules.sortedBy { it.gradlePath }.forEach { module ->
                 append(module.gradlePath)
+                append('|')
+                append(module.externalDependencies.map { it.notation }.sorted())
                 append('|')
                 module.javaSourceRoots.sortedBy(Path::toString).forEach { root ->
                     appendTreeFingerprint(this, "java", root.normalize())
@@ -222,9 +225,13 @@ class SupportSymbolIndexBuilder(
     private fun appendFileFingerprint(builder: StringBuilder, label: String, path: Path) {
         val normalized = path.normalize()
         builder.append(label).append(':').append(normalized).append(':')
-        builder.append(runCatching { Files.size(normalized) }.getOrDefault(0L))
-        builder.append(':')
-        builder.append(runCatching { Files.getLastModifiedTime(normalized).toMillis() }.getOrDefault(0L))
+        if (normalized.extension.lowercase() in setOf("jar", "zip", "aar")) {
+            builder.append(StableArtifactFingerprint.fingerprint(normalized))
+        } else {
+            builder.append(runCatching { Files.size(normalized) }.getOrDefault(0L))
+            builder.append(':')
+            builder.append(runCatching { Files.getLastModifiedTime(normalized).toMillis() }.getOrDefault(0L))
+        }
         builder.append(';')
     }
 }

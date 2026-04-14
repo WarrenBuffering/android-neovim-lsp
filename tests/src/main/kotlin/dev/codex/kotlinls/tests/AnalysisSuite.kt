@@ -2,10 +2,12 @@ package dev.codex.kotlinls.tests
 
 import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.diagnostics.DiagnosticsService
+import dev.codex.kotlinls.diagnostics.DiagnosticsService.FastDiagnosticLookup
 import dev.codex.kotlinls.projectimport.GradleProjectImporter
 import dev.codex.kotlinls.protocol.TextDocumentItem
 import dev.codex.kotlinls.workspace.TextDocumentStore
 import java.nio.file.Files
+import java.nio.file.Path
 import kotlin.io.path.relativeTo
 
 fun analysisSuite(): TestSuite {
@@ -132,6 +134,35 @@ fun analysisSuite(): TestSuite {
                     snapshot.close()
                 }
             },
+            TestCase("fast diagnostics validate imports from the local index") {
+                val diagnostics = DiagnosticsService().fastDiagnostics(
+                    project = null,
+                    path = Path.of("/tmp/FastImports.kt"),
+                    text = """
+                        package demo
+
+                        import androidx.compose.runtime.Composable
+                        import androidx.compose.runtime.Composable
+                        import androidx.compose.runtime.MissingThing
+                        import androidz.compose.runtime.Composable
+                        import androidx.compose.runtime.
+                    """.trimIndent(),
+                    lookup = importValidationLookup(),
+                )
+
+                assertTrue(diagnostics.any { it.code == "duplicate-import" && it.message.contains("Composable") }) {
+                    "Expected duplicate import diagnostic, got $diagnostics"
+                }
+                assertTrue(diagnostics.any { it.code == "unresolved-import-symbol" && it.message.contains("MissingThing") }) {
+                    "Expected unresolved import symbol diagnostic, got $diagnostics"
+                }
+                assertTrue(diagnostics.any { it.code == "unresolved-import-package" && it.message.contains("androidz.compose.runtime") }) {
+                    "Expected unresolved import package diagnostic, got $diagnostics"
+                }
+                assertTrue(diagnostics.any { it.code == "malformed-import" }) {
+                    "Expected malformed import diagnostic, got $diagnostics"
+                }
+            },
             TestCase("focused analysis keeps previously mirrored workspace files intact") {
                 val projectRoot = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(projectRoot)
@@ -161,3 +192,13 @@ fun analysisSuite(): TestSuite {
         ),
     )
 }
+
+private fun importValidationLookup(): FastDiagnosticLookup =
+    FastDiagnosticLookup(
+        importableFqNames = setOf("androidx.compose.runtime.Composable"),
+        packagePrefixes = setOf(
+            "androidx",
+            "androidx.compose",
+            "androidx.compose.runtime",
+        ),
+    )

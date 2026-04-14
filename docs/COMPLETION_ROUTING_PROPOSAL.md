@@ -110,6 +110,12 @@ The current recommended hard split is:
 - `expected_type_sensitive_expression` -> bridge
 - `flow_sensitive_expression` -> bridge
 
+Within the local route, the current preferred index selection is:
+
+- `package` -> lightweight workspace/source index
+- `import` -> lightweight workspace/source index + support/dependency index
+- other local completion routes -> combined local index view
+
 The routing code should prefer cheap heuristics. Do not add an expensive pre-analysis step just to decide whether the bridge is needed.
 
 ## Confidence Model
