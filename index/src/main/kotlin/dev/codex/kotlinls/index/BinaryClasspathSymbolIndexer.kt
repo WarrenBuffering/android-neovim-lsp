@@ -77,6 +77,16 @@ class BinaryClasspathSymbolIndexer {
                 runtimeClass.superclass?.name?.replace('$', '.')?.let(::add)
                 runtimeClass.interfaces.map { it.name.replace('$', '.') }.forEach(::add)
             },
+            enumEntries = runtimeClass.enumConstants
+                ?.mapNotNull { constant ->
+                    (constant as? Enum<*>)?.let { enumValue ->
+                        IndexedEnumEntry(
+                            name = enumValue.name,
+                            stringValue = enumValue.toString(),
+                        )
+                    }
+                }
+                .orEmpty(),
         )
         val constructorSymbols = runtimeClass.constructors
             .asSequence()
@@ -132,6 +142,20 @@ class BinaryClasspathSymbolIndexer {
             importable = false,
             resultType = ownerFqName,
             parameterCount = constructor.parameterCount,
+            parameters = constructor.parameters.mapIndexed { index, parameter ->
+                IndexedParameter(
+                    name = constructor.kotlinFunction?.parameters
+                        ?.filter { kotlinParameter -> kotlinParameter.kind.name == "VALUE" }
+                        ?.getOrNull(index)
+                        ?.name
+                        ?: parameter.name.takeUnless { it.isNullOrBlank() }
+                        ?: "arg${index + 1}",
+                    type = constructor.genericParameterTypes.getOrNull(index)?.typeName?.normalizeBinaryType()
+                        ?: parameter.type.typeName.normalizeBinaryType(),
+                    isVararg = constructor.isVarArgs && index == constructor.parameterCount - 1,
+                    isNullable = false,
+                )
+            },
         )
     }
 
@@ -147,7 +171,7 @@ class BinaryClasspathSymbolIndexer {
             id = "binary::$ownerFqName#field:${field.name}",
             name = field.name,
             fqName = "$ownerFqName.${field.name}",
-            kind = SymbolKind.PROPERTY,
+            kind = if (field.isEnumConstant) SymbolKind.ENUM_MEMBER else SymbolKind.PROPERTY,
             path = syntheticPath(jar, ownerFqName),
             uri = syntheticUri(jar, ownerFqName),
             range = ZERO_RANGE,
@@ -160,6 +184,15 @@ class BinaryClasspathSymbolIndexer {
             moduleName = moduleName,
             importable = false,
             resultType = field.type.typeName.normalizeBinaryType(),
+            enumValue = field.takeIf { it.isEnumConstant }
+                ?.runCatching { get(null) as? Enum<*> }
+                ?.getOrNull()
+                ?.let { enumValue ->
+                    IndexedEnumEntry(
+                        name = enumValue.name,
+                        stringValue = enumValue.toString(),
+                    )
+                },
         )
     }
 
@@ -212,6 +245,20 @@ class BinaryClasspathSymbolIndexer {
             receiverType = receiverType,
             resultType = method.genericReturnType.typeName.normalizeBinaryType(),
             parameterCount = method.parameterCount,
+            parameters = method.parameters.mapIndexed { index, parameter ->
+                IndexedParameter(
+                    name = kotlinFunction?.parameters
+                        ?.filter { kotlinParameter -> kotlinParameter.kind.name == "VALUE" }
+                        ?.getOrNull(index)
+                        ?.name
+                        ?: parameter.name.takeUnless { it.isNullOrBlank() }
+                        ?: "arg${index + 1}",
+                    type = method.genericParameterTypes.getOrNull(index)?.typeName?.normalizeBinaryType()
+                        ?: parameter.type.typeName.normalizeBinaryType(),
+                    isVararg = method.isVarArgs && index == method.parameterCount - 1,
+                    isNullable = false,
+                )
+            },
         )
     }
 

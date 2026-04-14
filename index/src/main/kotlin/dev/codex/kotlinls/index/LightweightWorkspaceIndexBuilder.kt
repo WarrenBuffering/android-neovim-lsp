@@ -377,6 +377,9 @@ class LightweightWorkspaceIndexBuilder(
                                 resultType = symbol.resultType,
                                 parameterCount = symbol.parameterCount,
                                 supertypes = symbol.supertypes,
+                                parameters = symbol.parameters,
+                                enumEntries = symbol.enumEntries,
+                                enumValue = symbol.enumValue,
                             )
                         },
                     )
@@ -439,6 +442,9 @@ class LightweightWorkspaceIndexBuilder(
                                     resultType = symbol.resultType,
                                     parameterCount = symbol.parameterCount,
                                     supertypes = symbol.supertypes,
+                                    parameters = symbol.parameters,
+                                    enumEntries = symbol.enumEntries,
+                                    enumValue = symbol.enumValue,
                                 )
                             },
                         )
@@ -470,7 +476,7 @@ class LightweightWorkspaceIndexBuilder(
         current == 1 || current == total || current % 50 == 0
 
     companion object {
-        private const val SCHEMA_VERSION = 4
+        private const val SCHEMA_VERSION = 5
 
         private fun defaultIndexCacheRoot(): Path {
             val userHome = Path.of(System.getProperty("user.home"))
@@ -561,4 +567,7 @@ private data class PersistedIndexedSymbol(
     val resultType: String?,
     val parameterCount: Int,
     val supertypes: List<String>,
+    val parameters: List<IndexedParameter> = emptyList(),
+    val enumEntries: List<IndexedEnumEntry> = emptyList(),
+    val enumValue: IndexedEnumEntry? = null,
 )

@@ -25,6 +25,23 @@ data class IndexedSymbol(
     val resultType: String? = null,
     val parameterCount: Int = 0,
     val supertypes: List<String> = emptyList(),
+    val parameters: List<IndexedParameter> = emptyList(),
+    val enumEntries: List<IndexedEnumEntry> = emptyList(),
+    val enumValue: IndexedEnumEntry? = null,
+)
+
+data class IndexedParameter(
+    val name: String,
+    val type: String? = null,
+    val defaultValue: String? = null,
+    val isVararg: Boolean = false,
+    val isNullable: Boolean = false,
+)
+
+data class IndexedEnumEntry(
+    val name: String,
+    val arguments: List<String> = emptyList(),
+    val stringValue: String? = null,
 )
 
 data class IndexedReference(

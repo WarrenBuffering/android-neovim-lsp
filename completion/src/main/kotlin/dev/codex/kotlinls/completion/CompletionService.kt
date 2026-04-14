@@ -5,6 +5,8 @@ import dev.codex.kotlinls.index.IndexedSymbol
 import dev.codex.kotlinls.index.SourceIndexLookup
 import dev.codex.kotlinls.index.SymbolResolver
 import dev.codex.kotlinls.index.WorkspaceIndex
+import dev.codex.kotlinls.index.indexedSymbolCompletionDetail
+import dev.codex.kotlinls.index.indexedSymbolDocumentation
 import dev.codex.kotlinls.index.indexedSymbolQuality
 import dev.codex.kotlinls.protocol.SymbolKind
 import dev.codex.kotlinls.protocol.CompletionItem
@@ -939,8 +941,8 @@ class CompletionService {
             item = CompletionItem(
                 label = symbol.name,
                 kind = completionKind(symbol),
-                detail = completionDetail(symbol),
-                documentation = symbol.documentation?.let { MarkupContent("markdown", it) },
+                detail = indexedSymbolCompletionDetail(symbol),
+                documentation = indexedSymbolDocumentation(symbol),
                 sortText = scoreToSortKey(score),
                 filterText = symbol.name,
                 insertText = insertText,
@@ -958,15 +960,6 @@ class CompletionService {
             score = score,
         )
     }
-
-    private fun completionDetail(symbol: IndexedSymbol): String =
-        symbol.documentation
-            ?.lineSequence()
-            ?.map(String::trim)
-            ?.firstOrNull { it.isNotBlank() }
-            ?.takeIf { it != "/**" }
-            ?.let { summary -> "${symbol.signature} - $summary" }
-            ?: symbol.signature
 
     private fun completionCandidateKey(symbol: IndexedSymbol): String =
         symbol.fqName?.takeIf { it.isNotBlank() }

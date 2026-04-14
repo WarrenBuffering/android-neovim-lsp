@@ -60,6 +60,8 @@ internal interface SemanticEngine : AutoCloseable {
         activeDocument: TextDocumentSnapshot?,
         openDocuments: Collection<TextDocumentSnapshot>,
         projectGeneration: Int,
+        syncDocuments: Boolean = true,
+        startBridge: Boolean = false,
     )
 
     fun complete(
@@ -123,6 +125,8 @@ internal class DisabledSemanticEngine(
         activeDocument: TextDocumentSnapshot?,
         openDocuments: Collection<TextDocumentSnapshot>,
         projectGeneration: Int,
+        syncDocuments: Boolean,
+        startBridge: Boolean,
     ) = Unit
 
     override fun complete(
@@ -197,6 +201,8 @@ internal class BridgeK2SemanticEngine private constructor(
     private val pendingDocumentSyncs = linkedMapOf<String, PendingBridgeSync>()
     private var syncDrainGeneration = 0L
     private var pendingSyncDrain: ScheduledFuture<*>? = null
+    @Volatile
+    private var bridgeStartupScheduled = false
 
     override val available: Boolean
         get() = acquireBridge() != null
@@ -216,6 +222,7 @@ internal class BridgeK2SemanticEngine private constructor(
             syncDrainGeneration += 1
             pendingSyncDrain?.cancel(false)
             pendingSyncDrain = null
+            bridgeStartupScheduled = false
         }
         val currentBridge = bridge
         bridge = null
@@ -236,8 +243,14 @@ internal class BridgeK2SemanticEngine private constructor(
         activeDocument: TextDocumentSnapshot?,
         openDocuments: Collection<TextDocumentSnapshot>,
         projectGeneration: Int,
+        syncDocuments: Boolean,
+        startBridge: Boolean,
     ) {
         enqueueProjectWarmup(project.root)
+        if (startBridge) {
+            scheduleBridgeStartup()
+        }
+        if (!syncDocuments) return
         val targets = prefetchTargets(project, activeDocument, openDocuments)
         if (targets.isEmpty()) return
         synchronized(pendingSyncLock) {
@@ -404,6 +417,7 @@ internal class BridgeK2SemanticEngine private constructor(
             syncDrainGeneration += 1
             pendingSyncDrain?.cancel(false)
             pendingSyncDrain = null
+            bridgeStartupScheduled = false
         }
         requestExecutor.shutdownNow()
         syncExecutor.shutdownNow()
@@ -429,6 +443,28 @@ internal class BridgeK2SemanticEngine private constructor(
             pendingProjectWarmups.add(projectRoot)
             if (bridge != null) {
                 scheduleSyncDrainLocked(if (immediate) 0L else liveSyncDebounceMillis)
+            }
+        }
+    }
+
+    private fun scheduleBridgeStartup() {
+        synchronized(pendingSyncLock) {
+            if (bridge != null || bridgeStartupScheduled) return
+            bridgeStartupScheduled = true
+        }
+        try {
+            syncExecutor.execute {
+                try {
+                    acquireBridge()
+                } finally {
+                    synchronized(pendingSyncLock) {
+                        bridgeStartupScheduled = false
+                    }
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            synchronized(pendingSyncLock) {
+                bridgeStartupScheduled = false
             }
         }
     }

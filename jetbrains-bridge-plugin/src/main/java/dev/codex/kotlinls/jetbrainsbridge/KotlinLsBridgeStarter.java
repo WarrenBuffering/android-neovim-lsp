@@ -8,8 +8,6 @@ import com.intellij.codeInsight.lookup.Lookup;
 import com.intellij.codeInsight.lookup.LookupElement;
 import com.intellij.codeInsight.lookup.LookupElementPresentation;
 import com.intellij.codeInsight.lookup.LookupManager;
-import com.intellij.ide.impl.OpenProjectTask;
-import com.intellij.ide.impl.ProjectUtil;
 import com.intellij.ide.trustedProjects.TrustedProjects;
 import com.intellij.openapi.application.Application;
 import com.intellij.openapi.application.ApplicationManager;
@@ -22,11 +20,11 @@ import com.intellij.openapi.editor.EditorFactory;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.project.DumbService;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ex.ProjectManagerEx;
 import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.util.TextRange;
 import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
-import com.intellij.openapi.wm.ex.WindowManagerEx;
 import com.intellij.psi.PsiClass;
 import com.intellij.psi.PsiDocumentManager;
 import com.intellij.psi.PsiDocCommentOwner;
@@ -149,7 +147,7 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         } finally {
             openProjects.values().forEach(project -> {
                 if (project != null && !project.isDisposed()) {
-                    ProjectUtil.closeAndDispose(project);
+                    ProjectManagerEx.getInstanceEx().forceCloseProject(project, true);
                 }
             });
             Application application = ApplicationManager.getApplication();
@@ -199,6 +197,13 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         if (handle == null) {
             return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
         }
+        ApplicationManager.getApplication().runReadAction((Computable<Void>) () -> {
+            PsiFile psiFile = PsiManager.getInstance(project).findFile(handle.virtualFile());
+            if (psiFile != null) {
+                psiFile.getTextLength();
+            }
+            return null;
+        });
         return new BridgeResponse(request.id(), true, "synced", List.of(), List.of(), null, null, null);
     }
 
@@ -261,23 +266,13 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             }
             Path root = Path.of(projectRoot);
             TrustedProjects.setProjectTrusted(root, true);
-            Project project = ProjectUtil.openOrImport(root, OpenProjectTask.build().withForceOpenInNewFrame(false));
+            Project project = ProjectManagerEx.getInstanceEx().loadProject(root);
             if (project == null) {
                 throw new IllegalStateException("Unable to open project: " + projectRoot);
             }
             TrustedProjects.setProjectTrusted(project, true);
-            hideProjectFrame(project);
             return project;
         });
-    }
-
-    private void hideProjectFrame(Project project) {
-        ApplicationManager.getApplication().invokeLater(() -> {
-            var frame = WindowManagerEx.getInstanceEx().getFrame(project);
-            if (frame != null) {
-                frame.setVisible(false);
-            }
-        }, ModalityState.nonModal());
     }
 
     private void replaceDocumentText(Project project, Document document, String text) {

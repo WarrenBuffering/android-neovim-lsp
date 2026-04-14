@@ -15,6 +15,8 @@ import dev.codex.kotlinls.index.SourceIndexLookup
 import dev.codex.kotlinls.index.SupportSymbolIndexBuilder
 import dev.codex.kotlinls.index.WorkspaceIndex
 import dev.codex.kotlinls.index.WorkspaceIndexBuilder
+import dev.codex.kotlinls.index.indexedSymbolCompletionDetail
+import dev.codex.kotlinls.index.indexedSymbolDocumentation
 import dev.codex.kotlinls.navigation.NavigationService
 import dev.codex.kotlinls.projectimport.GradleProjectImporter
 import dev.codex.kotlinls.projectimport.ImportedModule
@@ -129,6 +131,7 @@ class KotlinLanguageServer(
     private var supportCacheManifestAvailable: Boolean? = null
 
     private val loadedSupportPackages = linkedSetOf<String>()
+    private val supportPackagesByUri = linkedMapOf<String, Set<String>>()
 
     @Volatile
     private var moduleSemanticFingerprints: Map<String, String> = emptyMap()
@@ -264,17 +267,19 @@ class KotlinLanguageServer(
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
                     project?.let { currentProject ->
-                        primeSupportPackagesFromCache(currentProject, params.textDocument.text)
-                        scheduleSupportRefresh(
+                        refreshSupportPackages(
                             project = currentProject,
-                            projectGeneration = currentProjectGeneration,
-                            packageNames = supportPackagesForText(params.textDocument.text),
+                            uri = params.textDocument.uri,
+                            text = params.textDocument.text,
+                            force = true,
                         )
                         semanticEngine.prefetch(
                             project = currentProject,
                             activeDocument = documents.get(params.textDocument.uri),
                             openDocuments = documents.openDocuments(),
                             projectGeneration = currentProjectGeneration,
+                            syncDocuments = false,
+                            startBridge = true,
                         )
                     }
                     scheduleSemanticRefresh(params.textDocument.uri)
@@ -282,16 +287,15 @@ class KotlinLanguageServer(
                 "textDocument/didChange" -> {
                     val params = read(message.params, DidChangeTextDocumentParams::class.java)
                     documents.applyChanges(params)
-                    updateLiveSourceIndex(params.textDocument.uri)
+                    updateLiveSourceIndex(params.textDocument.uri, publishDiagnostics = false)
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
                     project?.let { currentProject ->
                         documents.get(params.textDocument.uri)?.text?.let { currentText ->
-                            primeSupportPackagesFromCache(currentProject, currentText)
-                            scheduleSupportRefresh(
+                            refreshSupportPackages(
                                 project = currentProject,
-                                projectGeneration = currentProjectGeneration,
-                                packageNames = supportPackagesForText(currentText),
+                                uri = params.textDocument.uri,
+                                text = currentText,
                             )
                         }
                         semanticEngine.prefetch(
@@ -299,6 +303,8 @@ class KotlinLanguageServer(
                             activeDocument = documents.get(params.textDocument.uri),
                             openDocuments = documents.openDocuments(),
                             projectGeneration = currentProjectGeneration,
+                            syncDocuments = false,
+                            startBridge = true,
                         )
                     }
                 }
@@ -306,6 +312,9 @@ class KotlinLanguageServer(
                     val uri = read(message.params, DidCloseTextDocumentParams::class.java).textDocument.uri
                     documents.close(uri)
                     semanticEngine.invalidate(uri)
+                    synchronized(supportRefreshLock) {
+                        supportPackagesByUri.remove(uri)
+                    }
                     rebuildCombinedIndex()
                     clearDiagnostics(uri)
                 }
@@ -333,6 +342,8 @@ class KotlinLanguageServer(
                                 activeDocument = documents.get(uri),
                                 openDocuments = documents.openDocuments(),
                                 projectGeneration = currentProjectGeneration,
+                                syncDocuments = false,
+                                startBridge = true,
                             )
                         }
                         scheduleSemanticRefresh(uri)
@@ -789,7 +800,7 @@ class KotlinLanguageServer(
         rebuildCombinedIndex()
     }
 
-    private fun updateLiveSourceIndex(uri: String) {
+    private fun updateLiveSourceIndex(uri: String, publishDiagnostics: Boolean = true) {
         val currentProject = project ?: return
         val source = sourceView(uri) ?: return
         if (!isSourceFile(source.first)) return
@@ -800,7 +811,9 @@ class KotlinLanguageServer(
             currentIndex = lightweightIndex,
         )
         rebuildCombinedIndex()
-        publishOpenDiagnostics()
+        if (publishDiagnostics) {
+            publishOpenDiagnostics()
+        }
     }
 
     private fun scheduleRefresh(
@@ -814,7 +827,7 @@ class KotlinLanguageServer(
             refreshReimportRequested = refreshReimportRequested || reimportProject
             refreshFastIndexRequested = refreshFastIndexRequested || rebuildFastIndex || reimportProject
             semanticUri?.let {
-                pendingSemanticUris += it
+                collapsePendingSemanticUri(it)
                 refreshInteractiveSemanticRequested = refreshInteractiveSemanticRequested || interactiveSemanticRefresh
             }
             if (refreshRunning) {
@@ -1080,6 +1093,8 @@ class KotlinLanguageServer(
                 activeDocument = activeDocument,
                 openDocuments = documents.openDocuments(),
                 projectGeneration = currentProjectGeneration,
+                syncDocuments = false,
+                startBridge = true,
             )
         }
         rebuildCombinedIndex()
@@ -1620,8 +1635,30 @@ class KotlinLanguageServer(
         combinedIndexGeneration += 1
     }
 
-    private fun primeSupportPackagesFromCache(project: ImportedProject, text: String) {
-        val requestedPackages = supportPackagesForText(text)
+    private fun refreshSupportPackages(
+        project: ImportedProject,
+        uri: String,
+        text: String,
+        force: Boolean = false,
+    ) {
+        val path = documentUriToPath(uri)
+        val requestedPackages = supportPackagesForText(path, text)
+        val shouldRefresh = synchronized(supportRefreshLock) {
+            val previousPackages = supportPackagesByUri[uri]
+            supportPackagesByUri[uri] = requestedPackages
+            force || previousPackages != requestedPackages
+        }
+        if (!shouldRefresh) return
+        primeSupportPackagesFromCache(project, path, text)
+        scheduleSupportRefresh(
+            project = project,
+            projectGeneration = currentProjectGeneration,
+            packageNames = requestedPackages,
+        )
+    }
+
+    private fun primeSupportPackagesFromCache(project: ImportedProject, path: Path, text: String) {
+        val requestedPackages = supportPackagesForText(path, text)
         if (requestedPackages.isEmpty() || supportCacheFullyLoaded || supportCacheManifestAvailable == false) {
             return
         }
@@ -1642,6 +1679,19 @@ class KotlinLanguageServer(
             supportIndex = mergeIndices(listOf(supportIndex, partialLayer.toWorkspaceIndex()))
             rebuildCombinedIndex()
         }
+    }
+
+    private fun collapsePendingSemanticUri(uri: String) {
+        val currentProject = project
+        if (currentProject != null) {
+            val modulePath = currentProject.moduleForPath(documentUriToPath(uri))?.gradlePath
+            if (modulePath != null) {
+                pendingSemanticUris.removeIf { pendingUri ->
+                    currentProject.moduleForPath(documentUriToPath(pendingUri))?.gradlePath == modulePath
+                }
+            }
+        }
+        pendingSemanticUris += uri
     }
 
     private fun semanticStateEligibleForIndex(state: ModuleSemanticState): Boolean {
@@ -1842,15 +1892,11 @@ class KotlinLanguageServer(
 
     private fun supportPackagesForDocuments(documents: Collection<TextDocumentSnapshot>): Set<String> =
         documents.asSequence()
-            .flatMap { document -> supportPackagesForText(document.text).asSequence() }
+            .flatMap { document -> supportPackagesForText(documentUriToPath(document.uri), document.text).asSequence() }
             .toSet()
 
-    private fun supportPackagesForText(text: String): Set<String> =
-        SourceIndexLookup.imports(text)
-            .mapNotNull { sourceImport ->
-                sourceImport.fqName.substringBeforeLast('.', missingDelimiterValue = "").takeIf { it.isNotBlank() }
-            }
-            .toSet()
+    private fun supportPackagesForText(path: Path, text: String): Set<String> =
+        SourceIndexLookup.supportPackages(path, text)
 
     private fun moduleLabel(module: ImportedModule): String =
         module.gradlePath.removePrefix(":").ifBlank { module.name }
@@ -1873,8 +1919,8 @@ class KotlinLanguageServer(
         val symbolId = item.data?.get("symbolId") ?: return item
         val symbol = currentIndex().symbolsById[symbolId] ?: return item
         return item.copy(
-            detail = item.detail?.takeUnless { it.isBlank() || it == "/**" } ?: symbol.signature,
-            documentation = symbol.documentation?.let { dev.codex.kotlinls.protocol.MarkupContent("markdown", it) },
+            detail = item.detail?.takeUnless { it.isBlank() || it == "/**" } ?: indexedSymbolCompletionDetail(symbol),
+            documentation = item.documentation ?: indexedSymbolDocumentation(symbol),
         )
     }
 

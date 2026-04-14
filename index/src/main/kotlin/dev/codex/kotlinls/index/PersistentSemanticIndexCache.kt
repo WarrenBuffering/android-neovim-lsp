@@ -89,6 +89,9 @@ class PersistentSemanticIndexCache(
                             resultType = symbol.resultType,
                             parameterCount = symbol.parameterCount,
                             supertypes = symbol.supertypes,
+                            parameters = symbol.parameters,
+                            enumEntries = symbol.enumEntries,
+                            enumValue = symbol.enumValue,
                         )
                     },
                     references = index.references.map { reference ->
@@ -127,7 +130,7 @@ class PersistentSemanticIndexCache(
             .joinToString("") { byte -> "%02x".format(byte) }
 
     companion object {
-        private const val SCHEMA_VERSION = 1
+        private const val SCHEMA_VERSION = 2
 
         private fun defaultSemanticCacheRoot(): Path {
             val userHome = Path.of(System.getProperty("user.home"))
@@ -172,6 +175,9 @@ private data class PersistedSemanticIndexCache(
                     resultType = symbol.resultType,
                     parameterCount = symbol.parameterCount,
                     supertypes = symbol.supertypes,
+                    parameters = symbol.parameters,
+                    enumEntries = symbol.enumEntries,
+                    enumValue = symbol.enumValue,
                 )
             },
             references = references.map { reference ->
@@ -214,6 +220,9 @@ private data class PersistedSemanticIndexedSymbol(
     val resultType: String?,
     val parameterCount: Int,
     val supertypes: List<String>,
+    val parameters: List<IndexedParameter> = emptyList(),
+    val enumEntries: List<IndexedEnumEntry> = emptyList(),
+    val enumValue: IndexedEnumEntry? = null,
 )
 
 private data class PersistedSemanticIndexedReference(
