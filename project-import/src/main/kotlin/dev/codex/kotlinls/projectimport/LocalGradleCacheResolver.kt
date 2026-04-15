@@ -244,9 +244,7 @@ class LocalGradleCacheResolver(
         val fingerprint = buildString {
             append(aar.normalize())
             append(':')
-            append(runCatching { aar.getLastModifiedTime().toMillis() }.getOrDefault(0L))
-            append(':')
-            append(runCatching { aar.fileSize() }.getOrDefault(0L))
+            append(StableArtifactFingerprint.fingerprint(aar))
         }.hashCode().toUInt().toString(16)
         val targetDir = extractionCacheRoot.resolve("${aar.fileName}-$fingerprint")
         val extracted = targetDir.resolve("extracted")

@@ -33,7 +33,18 @@ class LightweightWorkspaceIndexBuilder(
         val rootEntries = projectRoots(project)
         var dirty = pruneStaleRootManifests(projectCache, rootEntries)
         val manifestReady = hasCompleteRootManifests(projectCache, rootEntries)
-        val (workItems, manifestDirty) = if (manifestReady) {
+        val manifestsFresh = manifestReady && rootEntries.none { entry ->
+            rootManifestHasUntrackedSources(
+                root = entry.root,
+                knownPaths = projectCache.roots[entry.root]
+                    ?.filePaths
+                    .orEmpty()
+                    .asSequence()
+                    .map(Path::normalize)
+                    .toSet(),
+            )
+        }
+        val (workItems, manifestDirty) = if (manifestReady && manifestsFresh) {
             workItemsFromManifests(projectCache, rootEntries)
         } else {
             scanProjectRoots(rootEntries, projectCache)
@@ -112,7 +123,11 @@ class LightweightWorkspaceIndexBuilder(
         if (!hasCompleteRootManifests(projectCache, rootEntries)) return true
         return rootEntries.any { entry ->
             val manifest = projectCache.roots[entry.root] ?: return@any true
-            manifest.filePaths.any { candidate -> candidate !in projectCache.files }
+            manifest.filePaths.any { candidate -> candidate !in projectCache.files } ||
+                rootManifestHasUntrackedSources(
+                    root = entry.root,
+                    knownPaths = manifest.filePaths.asSequence().map(Path::normalize).toSet(),
+                )
         }
     }
 
@@ -128,6 +143,63 @@ class LightweightWorkspaceIndexBuilder(
         val mergedSymbols = buildList {
             addAll(currentIndex.symbols.filter { it.path.normalize() != normalized })
             addAll(parsed)
+        }
+        return WorkspaceIndex(
+            symbols = mergedSymbols.distinctBy { it.id }.sortedWith(compareBy({ it.name }, { it.path.toString() })),
+            references = currentIndex.references,
+            callEdges = currentIndex.callEdges,
+        )
+    }
+
+    fun hydratePackageNeighborhood(
+        project: ImportedProject,
+        packageName: String,
+        currentIndex: WorkspaceIndex,
+        documents: TextDocumentStore,
+        preferredPath: Path? = null,
+    ): WorkspaceIndex {
+        if (packageName.isBlank()) return currentIndex
+        val projectRoot = project.root.normalize()
+        val projectCache = synchronized(cacheLock) {
+            projectCaches.getOrPut(projectRoot) { loadProjectCache(projectRoot) }
+        }
+        val preferredModuleName = preferredPath
+            ?.normalize()
+            ?.let(project::moduleForPath)
+            ?.name
+        val workItems = packageNeighborhoodWorkItems(project, packageName, preferredModuleName)
+        if (workItems.isEmpty()) return currentIndex
+
+        var dirty = false
+        var contentChanged = false
+        val indexedByPath = linkedMapOf<Path, List<IndexedSymbol>>()
+        workItems.forEach { workItem ->
+            val normalized = workItem.path.normalize()
+            val (indexedSymbols, fileDirty) = indexSymbols(projectCache, workItem, documents)
+            indexedByPath[normalized] = indexedSymbols
+            dirty = dirty || fileDirty
+            if (currentIndex.symbolsByPath[normalized].orEmpty() != indexedSymbols) {
+                contentChanged = true
+            }
+        }
+
+        synchronized(cacheLock) {
+            workItems.forEach { workItem ->
+                if (Files.exists(workItem.path)) {
+                    dirty = updateRootManifestsForPath(projectCache, project, workItem.moduleName, workItem.path) || dirty
+                }
+            }
+        }
+
+        if (dirty) {
+            saveProjectCache(projectRoot, projectCache)
+        }
+        if (!contentChanged) return currentIndex
+
+        val affectedPaths = indexedByPath.keys
+        val mergedSymbols = buildList {
+            addAll(currentIndex.symbols.filter { it.path.normalize() !in affectedPaths })
+            indexedByPath.values.forEach(::addAll)
         }
         return WorkspaceIndex(
             symbols = mergedSymbols.distinctBy { it.id }.sortedWith(compareBy({ it.name }, { it.path.toString() })),
@@ -279,7 +351,8 @@ class LightweightWorkspaceIndexBuilder(
         project: ImportedProject,
         moduleName: String,
         path: Path,
-    ) {
+    ): Boolean {
+        var changed = false
         projectRoots(project)
             .filter { entry -> entry.moduleName == moduleName && path.startsWith(entry.root) }
             .forEach { entry ->
@@ -293,9 +366,73 @@ class LightweightWorkspaceIndexBuilder(
                 if (path !in manifest.filePaths) {
                     manifest.filePaths.add(path)
                     manifest.filePaths.sortBy(Path::toString)
+                    changed = true
                 }
             }
+        return changed
     }
+
+    private fun packageNeighborhoodWorkItems(
+        project: ImportedProject,
+        packageName: String,
+        preferredModuleName: String?,
+    ): List<IndexedWorkItem> =
+        orderedProjectRoots(project, preferredModuleName)
+            .asSequence()
+            .flatMap { entry ->
+                packageNeighborhoodFiles(entry.root, packageName)
+                    .asSequence()
+                    .map { path -> IndexedWorkItem(moduleName = entry.moduleName, path = path) }
+            }
+            .distinctBy { it.path.normalize() }
+            .sortedBy { it.path.toString() }
+            .toList()
+
+    private fun orderedProjectRoots(
+        project: ImportedProject,
+        preferredModuleName: String?,
+    ): List<RootEntry> =
+        projectRoots(project).sortedWith(
+            compareByDescending<RootEntry> { it.moduleName == preferredModuleName }
+                .thenBy { it.root.toString() },
+        )
+
+    private fun packageNeighborhoodFiles(root: Path, packageName: String): List<Path> {
+        val baseDirectory = root.resolve(packageName.replace('.', '/')).normalize()
+        if (!Files.exists(baseDirectory)) return emptyList()
+        val directories = buildList {
+            add(baseDirectory)
+            addAll(immediateDirectories(baseDirectory))
+        }
+        return directories
+            .asSequence()
+            .flatMap { directory -> immediateSourceFiles(directory).asSequence() }
+            .distinct()
+            .sortedBy(Path::toString)
+            .toList()
+    }
+
+    private fun immediateDirectories(path: Path): List<Path> =
+        runCatching {
+            Files.list(path).use { entries ->
+                entries
+                    .filter(Files::isDirectory)
+                    .map(Path::normalize)
+                    .sorted()
+                    .toList()
+            }
+        }.getOrDefault(emptyList())
+
+    private fun immediateSourceFiles(path: Path): List<Path> =
+        runCatching {
+            Files.list(path).use { entries ->
+                entries
+                    .filter { candidate -> candidate.isRegularFile() && candidate.extension in SOURCE_FILE_EXTENSIONS }
+                    .map(Path::normalize)
+                    .sorted()
+                    .toList()
+            }
+        }.getOrDefault(emptyList())
 
     private fun pruneStaleRootManifests(
         projectCache: CachedProjectIndex,
@@ -323,6 +460,17 @@ class LightweightWorkspaceIndexBuilder(
             val manifest = projectCache.roots[entry.root] ?: return@all false
             manifest.moduleName == entry.moduleName && manifest.rootKind == entry.rootKind
         }
+
+    private fun rootManifestHasUntrackedSources(
+        root: Path,
+        knownPaths: Set<Path>,
+    ): Boolean {
+        if (!Files.exists(root)) return false
+        return root.walk()
+            .filter { path -> path.isRegularFile() && path.extension in SOURCE_FILE_EXTENSIONS }
+            .map(Path::normalize)
+            .any { path -> path !in knownPaths }
+    }
 
     private fun projectRoots(project: ImportedProject): List<RootEntry> =
         buildList {
@@ -377,6 +525,9 @@ class LightweightWorkspaceIndexBuilder(
                                 resultType = symbol.resultType,
                                 parameterCount = symbol.parameterCount,
                                 supertypes = symbol.supertypes,
+                                parameters = symbol.parameters,
+                                enumEntries = symbol.enumEntries,
+                                enumValue = symbol.enumValue,
                             )
                         },
                     )
@@ -439,6 +590,9 @@ class LightweightWorkspaceIndexBuilder(
                                     resultType = symbol.resultType,
                                     parameterCount = symbol.parameterCount,
                                     supertypes = symbol.supertypes,
+                                    parameters = symbol.parameters,
+                                    enumEntries = symbol.enumEntries,
+                                    enumValue = symbol.enumValue,
                                 )
                             },
                         )
@@ -470,7 +624,8 @@ class LightweightWorkspaceIndexBuilder(
         current == 1 || current == total || current % 50 == 0
 
     companion object {
-        private const val SCHEMA_VERSION = 2
+        private const val SCHEMA_VERSION = 5
+        private val SOURCE_FILE_EXTENSIONS = setOf("kt", "kts", "java")
 
         private fun defaultIndexCacheRoot(): Path {
             val userHome = Path.of(System.getProperty("user.home"))
@@ -561,4 +716,7 @@ private data class PersistedIndexedSymbol(
     val resultType: String?,
     val parameterCount: Int,
     val supertypes: List<String>,
+    val parameters: List<IndexedParameter> = emptyList(),
+    val enumEntries: List<IndexedEnumEntry> = emptyList(),
+    val enumValue: IndexedEnumEntry? = null,
 )

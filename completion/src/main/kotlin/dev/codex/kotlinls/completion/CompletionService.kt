@@ -1,11 +1,15 @@
 package dev.codex.kotlinls.completion
 
 import dev.codex.kotlinls.analysis.WorkspaceAnalysisSnapshot
+import dev.codex.kotlinls.index.IndexedParameter
 import dev.codex.kotlinls.index.IndexedSymbol
 import dev.codex.kotlinls.index.SourceIndexLookup
 import dev.codex.kotlinls.index.SymbolResolver
 import dev.codex.kotlinls.index.WorkspaceIndex
+import dev.codex.kotlinls.index.indexedSymbolCompletionDetail
+import dev.codex.kotlinls.index.indexedSymbolDocumentation
 import dev.codex.kotlinls.index.indexedSymbolQuality
+import dev.codex.kotlinls.index.preferredIndexedSymbolComparator
 import dev.codex.kotlinls.protocol.SymbolKind
 import dev.codex.kotlinls.protocol.CompletionItem
 import dev.codex.kotlinls.protocol.CompletionItemKind
@@ -16,8 +20,11 @@ import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
 import dev.codex.kotlinls.protocol.TextEdit
 import dev.codex.kotlinls.workspace.LineIndex
+import java.nio.file.Path
+import org.jetbrains.kotlin.descriptors.CallableDescriptor
 import org.jetbrains.kotlin.psi.KtDotQualifiedExpression
 import org.jetbrains.kotlin.psi.KtBinaryExpression
+import org.jetbrains.kotlin.psi.KtCallExpression
 import org.jetbrains.kotlin.psi.KtExpression
 import org.jetbrains.kotlin.psi.KtIfExpression
 import org.jetbrains.kotlin.psi.KtIsExpression
@@ -28,15 +35,15 @@ import org.jetbrains.kotlin.psi.KtParameter
 import org.jetbrains.kotlin.psi.KtParenthesizedExpression
 import org.jetbrains.kotlin.psi.KtProperty
 import org.jetbrains.kotlin.psi.KtSafeQualifiedExpression
+import org.jetbrains.kotlin.psi.KtValueArgument
 import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
 import org.jetbrains.kotlin.psi.psiUtil.parentsWithSelf
 import org.jetbrains.kotlin.lexer.KtTokens
-import java.nio.file.Path
+import org.jetbrains.kotlin.resolve.BindingContext
 
 class CompletionService {
-    private val jetBrainsBridge: JetBrainsCompletionBridge? by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-        JetBrainsCompletionBridge.detect()
-    }
+    @Volatile
+    private var jetBrainsBridge: JetBrainsCompletionBridge? = null
     private val keywords = listOf(
         "class", "interface", "object", "fun", "val", "var", "when", "if", "else", "return", "null",
         "true", "false", "package", "import", "data", "sealed", "enum", "companion", "override", "suspend",
@@ -46,6 +53,7 @@ class CompletionService {
         snapshot: WorkspaceAnalysisSnapshot,
         index: WorkspaceIndex,
         params: CompletionParams,
+        allowBridge: Boolean = false,
     ): CompletionList {
         val file = snapshot.filesByUri[params.textDocument.uri] ?: return CompletionList(false, emptyList())
         val lineIndex = LineIndex.build(file.text)
@@ -55,23 +63,29 @@ class CompletionService {
         val importedFqNames = file.ktFile.importDirectives.mapNotNull { it.importedFqName?.asString() }.toSet()
         val importContext = context.importContext
         if (importContext != null) {
-            jetBrainsBridge?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
-                val filtered = bridged.filter { bridgeMatchesImportContext(it, importContext) }
-                if (filtered.isNotEmpty()) {
-                    return CompletionList(
-                        isIncomplete = false,
-                        items = bridgeItems(file, filtered, importedFqNames),
-                    )
+            if (allowBridge) {
+                acquireJetBrainsBridge(snapshot.project.root)?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
+                    val filtered = bridged.filter { bridgeMatchesImportContext(it, importContext) }
+                    if (filtered.isNotEmpty()) {
+                        return CompletionList(
+                            isIncomplete = false,
+                            items = bridgeItems(file, filtered, importedFqNames),
+                        )
+                    }
                 }
             }
             return importCompletionList(index, file.text, importContext)
         }
-        jetBrainsBridge?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
-            if (bridged.isNotEmpty()) {
-                return CompletionList(
-                    isIncomplete = false,
-                    items = bridgeItems(file, bridged, importedFqNames),
-                )
+        semanticNamedArgumentCompletions(snapshot, params)?.let { return it }
+        namedArgumentCompletionsFromIndex(index, file.originalPath, file.text, params)?.let { return it }
+        if (allowBridge) {
+            acquireJetBrainsBridge(snapshot.project.root)?.complete(snapshot.project.root, file.originalPath, file.text, offset)?.let { bridged ->
+                if (bridged.isNotEmpty()) {
+                    return CompletionList(
+                        isIncomplete = false,
+                        items = bridgeItems(file, bridged, importedFqNames),
+                    )
+                }
             }
         }
         val localCandidates = visibleLocals(file, offset)
@@ -153,10 +167,15 @@ class CompletionService {
     ): CompletionList {
         val lineIndex = LineIndex.build(text)
         val offset = lineIndex.offset(params.position)
+        val packageContext = packageCompletionContext(text, offset)
+        if (packageContext != null) {
+            return packageCompletionList(index, packageContext)
+        }
         val importContext = importCompletionContext(text, offset)
         if (importContext != null) {
             return importCompletionList(index, text, importContext)
         }
+        namedArgumentCompletionsFromIndex(index, path, text, params, resultLimit)?.let { return it }
         val importedFqNames = SourceIndexLookup.imports(text).mapTo(linkedSetOf()) { it.fqName }
         val prefix = currentPrefix(text, offset)
         if (isMemberAccessContext(text, offset)) {
@@ -221,6 +240,221 @@ class CompletionService {
         )
     }
 
+    fun semanticNamedArgumentCompletions(
+        snapshot: WorkspaceAnalysisSnapshot,
+        params: CompletionParams,
+        resultLimit: Int = 100,
+    ): CompletionList? {
+        val file = snapshot.filesByUri[params.textDocument.uri] ?: return null
+        val offset = LineIndex.build(file.text).offset(params.position)
+        val context = namedArgumentCompletionContext(snapshot, file, offset) ?: return null
+        val items = context.descriptor.valueParameters
+            .asSequence()
+            .mapNotNull { parameter ->
+                val parameterName = parameter.name.asString().takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                if (parameterName in context.usedParameterNames) return@mapNotNull null
+                if (context.prefix.isNotBlank() && !parameterName.startsWith(context.prefix)) return@mapNotNull null
+                val score = when {
+                    parameterName == context.prefix -> 980
+                    context.prefix.isBlank() -> 930
+                    parameterName.startsWith(context.prefix) -> 950
+                    else -> 900
+                }
+                CompletionItem(
+                    label = parameterName,
+                    kind = CompletionItemKind.PROPERTY,
+                    detail = parameter.type.toString(),
+                    sortText = scoreToSortKey(score),
+                    filterText = parameterName,
+                    insertText = "$parameterName = ",
+                    insertTextFormat = 1,
+                    data = mapOf(
+                        "provider" to "semantic-named-arg",
+                        "parameter" to parameterName,
+                    ),
+                )
+            }
+            .sortedWith(compareBy<CompletionItem> { it.sortText }.thenBy { it.label })
+            .take(resultLimit)
+            .toList()
+        return items.takeIf { it.isNotEmpty() }?.let { CompletionList(isIncomplete = false, items = it) }
+    }
+
+    fun namedArgumentCompletionsFromIndex(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        params: CompletionParams,
+        resultLimit: Int = 100,
+    ): CompletionList? {
+        val offset = LineIndex.build(text).offset(params.position)
+        val context = indexedNamedArgumentCompletionContext(text, offset) ?: return null
+        val ranked = linkedMapOf<String, RankedCompletion>()
+        indexedNamedArgumentCandidates(index, path, text, context.calleeName)
+            .forEachIndexed { candidateIndex, symbol ->
+                symbol.parameters.forEach { parameter ->
+                    if (parameter.name.isBlank()) return@forEach
+                    if (parameter.name in context.usedParameterNames) return@forEach
+                    if (context.prefix.isNotBlank() && !parameter.name.startsWith(context.prefix, ignoreCase = true)) {
+                        return@forEach
+                    }
+                    val score = 320 - (candidateIndex * 10) +
+                        when {
+                            parameter.name == context.prefix -> 40
+                            parameter.name.startsWith(context.prefix, ignoreCase = true) -> 20
+                            context.prefix.isBlank() -> 10
+                            else -> 0
+                        } +
+                        indexedSymbolQuality(symbol) / 25
+                    mergeRankedCompletion(
+                        ranked = ranked,
+                        key = "indexed-named-arg::${parameter.name}",
+                        candidate = RankedCompletion(
+                            item = CompletionItem(
+                                label = parameter.name,
+                                kind = CompletionItemKind.PROPERTY,
+                                detail = indexedNamedArgumentDetail(parameter, symbol),
+                                sortText = scoreToSortKey(score),
+                                filterText = parameter.name,
+                                insertText = "${parameter.name} = ",
+                                insertTextFormat = 1,
+                                data = mapOf(
+                                    "provider" to "index-named-arg",
+                                    "symbolId" to symbol.id,
+                                    "callee" to context.calleeName,
+                                ),
+                            ),
+                            score = score,
+                        ),
+                    )
+                }
+            }
+        if (ranked.isEmpty()) return null
+        return CompletionList(
+            isIncomplete = false,
+            items = ranked.values
+                .sortedWith(compareByDescending<RankedCompletion> { it.score }.thenBy { it.item.label })
+                .take(resultLimit)
+                .map { it.item },
+        )
+    }
+
+    fun classifyCompletionRoute(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        params: CompletionParams,
+        bridgeAvailable: Boolean,
+    ): CompletionRoutingDecision {
+        if (!bridgeAvailable) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "bridge-unavailable",
+            )
+        }
+        val offset = LineIndex.build(text).offset(params.position)
+        if (packageCompletionContext(text, offset) != null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "package-context",
+            )
+        }
+        if (importCompletionContext(text, offset) != null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "import-context",
+            )
+        }
+        if (isTypePositionContext(text, offset)) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "type-position",
+            )
+        }
+        if (isExpectedTypeSensitiveExpression(text, offset)) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "expected-type-sensitive-expression",
+            )
+        }
+        if (isFlowSensitiveExpression(text, offset)) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "flow-sensitive-expression",
+            )
+        }
+        if (!isMemberAccessContext(text, offset)) {
+            if (isLexicalScopeSensitiveContext(text, offset)) {
+                return CompletionRoutingDecision(
+                    route = CompletionRoute.BRIDGE,
+                    reason = "lexical-scope-sensitive-context",
+                )
+            }
+            return CompletionRoutingDecision(
+                route = CompletionRoute.INDEX,
+                reason = "top-level-or-lexical",
+            )
+        }
+        val chain = receiverAccessChain(text, offset)
+        if (chain == null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "unknown-member-chain",
+            )
+        }
+        if (chain.size > 1) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "chained-member-access",
+                chainDepth = chain.size,
+            )
+        }
+        val receiverName = chain.firstOrNull()
+        if (receiverName != null && inferSmartCastTypeFromText(receiverName, text, offset) != null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "flow-sensitive-smart-cast",
+                chainDepth = chain.size,
+            )
+        }
+        val prefix = currentPrefix(text, offset)
+        val receiverType = inferReceiverChainType(index, path, text, chain, offset)
+            ?: fallbackNumericReceiverType(chain)
+        if (receiverType == null) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "unknown-receiver-type",
+                chainDepth = chain.size,
+            )
+        }
+        val indexedCandidates = inferredReceiverCandidates(index, path, text, offset, prefix)
+        val syntheticCandidates = syntheticMemberCompletions(index, path, text, offset, prefix)
+        if (indexedCandidates.isEmpty() && syntheticCandidates.isEmpty()) {
+            return CompletionRoutingDecision(
+                route = CompletionRoute.BRIDGE,
+                reason = "no-indexed-member-candidates",
+                receiverType = receiverType,
+                chainDepth = chain.size,
+            )
+        }
+        return CompletionRoutingDecision(
+            route = CompletionRoute.INDEX,
+            reason = "simple-member-access",
+            receiverType = receiverType,
+            chainDepth = chain.size,
+        )
+    }
+
+    fun fastIndexHydrationPackage(
+        text: String,
+        params: CompletionParams,
+    ): String? {
+        val offset = LineIndex.build(text).offset(params.position)
+        packageCompletionContext(text, offset)?.let { return it.qualifier }
+        importCompletionContext(text, offset)?.let { return it.qualifier }
+        return null
+    }
+
     private fun memberCompletionListFromIndex(
         index: WorkspaceIndex,
         path: Path,
@@ -279,110 +513,6 @@ class CompletionService {
                 .take(resultLimit)
                 .map { it.item },
         )
-    }
-
-    fun mergeSemanticAndIndexCompletions(
-        index: WorkspaceIndex,
-        path: Path,
-        text: String,
-        params: CompletionParams,
-        semantic: CompletionList,
-    ): CompletionList {
-        val fallback = completeFromIndex(
-            index = index,
-            path = path,
-            text = text,
-            params = params,
-            resultLimit = 250,
-        )
-        if (fallback.items.isEmpty()) return semantic
-        val offset = LineIndex.build(text).offset(params.position)
-        val prefix = currentPrefix(text, offset)
-        val memberAccess = isMemberAccessContext(text, offset)
-        val imports = SourceIndexLookup.imports(text)
-        val importedVisibleNames = imports.mapTo(linkedSetOf()) { it.visibleName }
-        val importedFqNames = imports.mapTo(linkedSetOf()) { it.fqName }
-        val merged = linkedMapOf<String, RankedCompletion>()
-
-        semantic.items.forEachIndexed { indexInSemantic, item ->
-            val score = mergedCompletionScore(
-                item = item,
-                prefix = prefix,
-                memberAccess = memberAccess,
-                importedVisibleNames = importedVisibleNames,
-                importedFqNames = importedFqNames,
-                primarySource = true,
-                duplicate = false,
-                ordinal = indexInSemantic,
-            )
-            merged[completionKey(item)] = RankedCompletion(
-                item = item.copy(sortText = scoreToSortKey(score)),
-                score = score,
-            )
-        }
-
-        fallback.items.forEachIndexed { indexInFallback, item ->
-            val key = completionKey(item)
-            val existing = merged[key]
-            val mergedItem = mergeCompletionItems(existing?.item, item)
-            val score = mergedCompletionScore(
-                item = mergedItem,
-                prefix = prefix,
-                memberAccess = memberAccess,
-                importedVisibleNames = importedVisibleNames,
-                importedFqNames = importedFqNames,
-                primarySource = false,
-                duplicate = existing != null,
-                ordinal = indexInFallback,
-            )
-            val candidate = RankedCompletion(
-                item = mergedItem.copy(sortText = scoreToSortKey(score)),
-                score = score,
-            )
-            merged[key] = when {
-                existing == null -> candidate
-                candidate.score > existing.score -> candidate
-                else -> existing.copy(
-                    item = mergeCompletionItems(existing.item, item).copy(sortText = existing.item.sortText),
-                )
-            }
-        }
-
-        return CompletionList(
-            isIncomplete = semantic.isIncomplete || fallback.isIncomplete,
-            items = merged.values
-                .sortedWith(compareByDescending<RankedCompletion> { it.score }.thenBy { it.item.label })
-                .take(100)
-                .map { it.item },
-        )
-    }
-
-    fun isMemberAccessCompletion(
-        text: String,
-        params: CompletionParams,
-    ): Boolean {
-        val offset = LineIndex.build(text).offset(params.position)
-        return isMemberAccessContext(text, offset)
-    }
-
-    fun shouldPreferIndexCompletions(
-        text: String,
-        params: CompletionParams,
-        indexed: CompletionList,
-    ): Boolean {
-        if (indexed.items.isEmpty()) return false
-        val offset = LineIndex.build(text).offset(params.position)
-        val prefix = currentPrefix(text, offset)
-        if (importCompletionContext(text, offset) != null) return true
-        if (isMemberAccessContext(text, offset)) return true
-        val strongPrefixMatch = indexed.items.take(8).any { item ->
-            val filter = item.filterText ?: item.label
-            filter.startsWith(prefix) ||
-                item.label.startsWith(prefix) ||
-                (item.insertText?.startsWith(prefix) == true)
-        }
-        if (!strongPrefixMatch) return false
-        return isMemberAccessContext(text, offset) || prefix.length >= 2
     }
 
     private fun bridgeItems(
@@ -465,7 +595,10 @@ class CompletionService {
                         sortText = scoreToSortKey(score),
                         filterText = packageName,
                         insertText = packageName,
-                        data = mapOf("package" to fqName),
+                        data = mapOf(
+                            "provider" to "index",
+                            "package" to fqName,
+                        ),
                     ),
                     score = score,
                 ),
@@ -481,23 +614,80 @@ class CompletionService {
             }
             .take(200)
             .forEach { symbol ->
+                val importName = importCompletionName(symbol)
                 val score = when {
-                    symbol.name == context.segmentPrefix -> 230
-                    symbol.name.startsWith(context.segmentPrefix) -> 200
+                    importName == context.segmentPrefix -> 230
+                    importName.startsWith(context.segmentPrefix) -> 200
                     else -> 160
-                } + if (symbol.kind == dev.codex.kotlinls.protocol.SymbolKind.CLASS) 10 else 0
+                } +
+                    if (symbol.kind == dev.codex.kotlinls.protocol.SymbolKind.CLASS) 10 else 0 +
+                    if (importName != symbol.name) -20 else 0
                 val normalizedScore = score + indexedSymbolQuality(symbol) / 25
-                val candidate = rankedSymbol(
-                    text = text,
-                    symbol = symbol,
-                    needsImport = false,
+                val candidate = RankedCompletion(
+                    item = CompletionItem(
+                        label = importName,
+                        kind = CompletionItemKind.TEXT,
+                        detail = indexedSymbolCompletionDetail(symbol),
+                        documentation = indexedSymbolDocumentation(symbol),
+                        sortText = scoreToSortKey(normalizedScore),
+                        filterText = importName,
+                        insertText = importName,
+                        insertTextFormat = 1,
+                        data = mapOf(
+                            "provider" to "index",
+                            "symbolId" to symbol.id,
+                            "uri" to symbol.uri,
+                            "fqName" to (symbol.fqName ?: ""),
+                            "importContext" to "true",
+                        ),
+                    ),
                     score = normalizedScore,
-                    insertText = symbol.name,
                 )
                 mergeRankedCompletion(
                     ranked = ranked,
-                    key = completionCandidateKey(symbol),
+                    key = importCompletionCandidateKey(symbol),
                     candidate = candidate,
+                )
+            }
+        return CompletionList(
+            isIncomplete = false,
+            items = ranked.values
+                .sortedWith(compareByDescending<RankedCompletion> { it.score }.thenBy { it.item.label })
+                .take(100)
+                .map { it.item },
+        )
+    }
+
+    private fun packageCompletionList(
+        index: WorkspaceIndex,
+        context: PackageCompletionContext,
+    ): CompletionList {
+        val ranked = linkedMapOf<String, RankedCompletion>()
+        packageSegmentCandidates(index, context.qualifier, context.segmentPrefix)
+            .forEach { packageName ->
+                val score = when {
+                    packageName == context.segmentPrefix -> 240
+                    packageName.startsWith(context.segmentPrefix) -> 220
+                    else -> 180
+                }
+                val fqName = listOf(context.qualifier, packageName).filter { it.isNotBlank() }.joinToString(".")
+                ranked.putIfAbsent(
+                    "package::$fqName",
+                    RankedCompletion(
+                        item = CompletionItem(
+                            label = packageName,
+                            kind = CompletionItemKind.MODULE,
+                            detail = fqName,
+                            sortText = scoreToSortKey(score),
+                            filterText = packageName,
+                            insertText = packageName,
+                            data = mapOf(
+                                "provider" to "index",
+                                "package" to fqName,
+                            ),
+                        ),
+                        score = score,
+                    ),
                 )
             }
         return CompletionList(
@@ -513,9 +703,16 @@ class CompletionService {
         index: WorkspaceIndex,
         context: ImportCompletionContext,
     ): List<String> =
+        packageSegmentCandidates(index, context.qualifier, context.segmentPrefix)
+
+    private fun packageSegmentCandidates(
+        index: WorkspaceIndex,
+        qualifier: String,
+        segmentPrefix: String,
+    ): List<String> =
         index.packageNames.asSequence()
-            .mapNotNull { packageName -> directImportPackageChild(packageName, context.qualifier) }
-            .filter { child -> child.startsWith(context.segmentPrefix) }
+            .mapNotNull { packageName -> directImportPackageChild(packageName, qualifier) }
+            .filter { child -> child.startsWith(segmentPrefix) }
             .distinct()
             .sorted()
             .take(100)
@@ -549,6 +746,24 @@ class CompletionService {
         val qualifier = importedPath.substringBeforeLast('.', "")
         val segmentPrefix = importedPath.substringAfterLast('.', importedPath)
         return ImportCompletionContext(
+            qualifier = qualifier,
+            segmentPrefix = segmentPrefix,
+        )
+    }
+
+    private fun packageCompletionContext(text: String, offset: Int): PackageCompletionContext? {
+        val safeOffset = offset.coerceIn(0, text.length)
+        val lineStart = text.lastIndexOf('\n', (safeOffset - 1).coerceAtLeast(0)).let { index ->
+            if (index == -1) 0 else index + 1
+        }
+        val linePrefix = text.substring(lineStart, safeOffset)
+        val trimmed = linePrefix.trimStart()
+        if (!trimmed.startsWith("package ")) return null
+        val packagePath = trimmed.removePrefix("package ").trim()
+        if (packagePath.any { !it.isLetterOrDigit() && it != '_' && it != '.' }) return null
+        val qualifier = packagePath.substringBeforeLast('.', "")
+        val segmentPrefix = packagePath.substringAfterLast('.', packagePath)
+        return PackageCompletionContext(
             qualifier = qualifier,
             segmentPrefix = segmentPrefix,
         )
@@ -934,8 +1149,8 @@ class CompletionService {
             item = CompletionItem(
                 label = symbol.name,
                 kind = completionKind(symbol),
-                detail = completionDetail(symbol),
-                documentation = symbol.documentation?.let { MarkupContent("markdown", it) },
+                detail = indexedSymbolCompletionDetail(symbol),
+                documentation = indexedSymbolDocumentation(symbol),
                 sortText = scoreToSortKey(score),
                 filterText = symbol.name,
                 insertText = insertText,
@@ -945,6 +1160,7 @@ class CompletionService {
                     null
                 },
                 data = mapOf(
+                    "provider" to "index",
                     "symbolId" to symbol.id,
                     "uri" to symbol.uri,
                     "fqName" to (symbol.fqName ?: ""),
@@ -954,19 +1170,29 @@ class CompletionService {
         )
     }
 
-    private fun completionDetail(symbol: IndexedSymbol): String =
-        symbol.documentation
-            ?.lineSequence()
-            ?.map(String::trim)
-            ?.firstOrNull { it.isNotBlank() }
-            ?.takeIf { it != "/**" }
-            ?.let { summary -> "${symbol.signature} - $summary" }
-            ?: symbol.signature
-
     private fun completionCandidateKey(symbol: IndexedSymbol): String =
         symbol.fqName?.takeIf { it.isNotBlank() }
             ?: buildString {
                 append(symbol.name)
+                append("::")
+                append(symbol.kind)
+                append("::")
+                append(symbol.containerFqName ?: symbol.packageName)
+            }
+
+    private fun importCompletionName(symbol: IndexedSymbol): String =
+        if (symbol.kind == SymbolKind.FUNCTION && symbol.importable && '-' in symbol.name) {
+            symbol.name.substringBefore('-')
+        } else {
+            symbol.name
+        }
+
+    private fun importCompletionCandidateKey(symbol: IndexedSymbol): String =
+        symbol.fqName
+            ?.substringBefore('-')
+            ?.takeIf { it.isNotBlank() }
+            ?: buildString {
+                append(importCompletionName(symbol))
                 append("::")
                 append(symbol.kind)
                 append("::")
@@ -1051,64 +1277,6 @@ class CompletionService {
                 newText = importText,
             ),
         )
-    }
-
-    private fun completionKey(item: CompletionItem): String =
-        item.data?.get("symbolId")
-            ?: item.data?.get("fqName")
-            ?: buildString {
-                append(item.label)
-                append("::")
-                append(item.kind ?: -1)
-                append("::")
-                append(item.detail ?: "")
-            }
-
-    private fun mergedCompletionScore(
-        item: CompletionItem,
-        prefix: String,
-        memberAccess: Boolean,
-        importedVisibleNames: Set<String>,
-        importedFqNames: Set<String>,
-        primarySource: Boolean,
-        duplicate: Boolean,
-        ordinal: Int,
-    ): Int {
-        val filter = item.filterText ?: item.label
-        val fqName = item.data?.get("fqName").orEmpty().ifBlank { null }
-        val imported = item.label in importedVisibleNames || (fqName != null && fqName in importedFqNames)
-        var score = when {
-            filter == prefix || item.label == prefix -> 320
-            filter.startsWith(prefix) || item.label.startsWith(prefix) -> 260
-            filter.contains(prefix, ignoreCase = true) || item.label.contains(prefix, ignoreCase = true) -> 160
-            else -> 80
-        }
-        score += if (primarySource) 180 else 120
-        score += if (duplicate) 140 else 0
-        score += if (item.data?.get("smart") == "true") 70 else 0
-        score += if (imported) 120 else 0
-        score += if (item.additionalTextEdits.isNullOrEmpty()) 20 else -10
-        score += if (memberAccess) {
-            when (item.kind) {
-                CompletionItemKind.FUNCTION,
-                CompletionItemKind.PROPERTY,
-                CompletionItemKind.VARIABLE,
-                -> 35
-
-                CompletionItemKind.CLASS,
-                CompletionItemKind.MODULE,
-                -> -35
-
-                else -> 0
-            }
-        } else {
-            0
-        }
-        score += when {
-            primarySource -> (140 - ordinal).coerceAtLeast(0)
-            else -> (90 - ordinal).coerceAtLeast(0)
-        }
-        return score
     }
 
     private fun mergeCompletionItems(primary: CompletionItem?, secondary: CompletionItem): CompletionItem {
@@ -1418,6 +1586,564 @@ class CompletionService {
         return cursor > 0 && text[cursor - 1] == '.'
     }
 
+    private fun isTypePositionContext(text: String, offset: Int): Boolean {
+        val tokenStart = (offset - currentPrefix(text, offset).length).coerceIn(0, text.length)
+        val lineStart = text.lastIndexOf('\n', (tokenStart - 1).coerceAtLeast(0)).let { index ->
+            if (index == -1) 0 else index + 1
+        }
+        val prefix = text.substring(lineStart, tokenStart).trimEnd()
+        return prefix.endsWith(":") ||
+            prefix.endsWith(" as") ||
+            prefix.endsWith(" is") ||
+            prefix.endsWith("<")
+    }
+
+    private fun isExpectedTypeSensitiveExpression(text: String, offset: Int): Boolean {
+        val tokenStart = (offset - currentPrefix(text, offset).length).coerceIn(0, text.length)
+        val lineStart = text.lastIndexOf('\n', (tokenStart - 1).coerceAtLeast(0)).let { index ->
+            if (index == -1) 0 else index + 1
+        }
+        val linePrefix = text.substring(lineStart, tokenStart).trimEnd()
+        if (linePrefix.startsWith("return ")) return true
+        if (!linePrefix.endsWith("=")) return false
+        val leftHandSide = linePrefix.removeSuffix("=").trimEnd()
+        if (leftHandSide.contains('(') && !leftHandSide.contains(':')) return false
+        return leftHandSide.startsWith("val ") ||
+            leftHandSide.startsWith("var ") ||
+            leftHandSide.contains(':')
+    }
+
+    private fun isFlowSensitiveExpression(text: String, offset: Int): Boolean {
+        val prefix = text.substring(0, offset.coerceIn(0, text.length))
+        return FLOW_SENSITIVE_IF_REGEX.containsMatchIn(prefix) ||
+            FLOW_SENSITIVE_WHEN_REGEX.containsMatchIn(prefix)
+    }
+
+    private fun isLexicalScopeSensitiveContext(text: String, offset: Int): Boolean {
+        val tokenStart = (offset - currentPrefix(text, offset).length).coerceIn(0, text.length)
+        if (tokenStart <= 0) return false
+        val structure = structuralContext(text, tokenStart)
+        return structure.parenthesisDepth > 0 || structure.braceDepth > 0
+    }
+
+    private fun namedArgumentCompletionContext(
+        snapshot: WorkspaceAnalysisSnapshot,
+        file: dev.codex.kotlinls.analysis.AnalyzedFile,
+        offset: Int,
+    ): NamedArgumentCompletionContext? {
+        val leaf = file.ktFile.findElementAt((offset - 1).coerceAtLeast(0))
+            ?: file.ktFile.findElementAt(offset.coerceIn(0, file.text.length.coerceAtLeast(1) - 1))
+            ?: return null
+        val call = leaf.parentsWithSelf
+            .filterIsInstance<KtCallExpression>()
+            .firstOrNull { candidate ->
+                val range = candidate.valueArgumentList?.textRange ?: return@firstOrNull false
+                offset in (range.startOffset + 1)..range.endOffset
+            }
+            ?: return null
+        val argumentList = call.valueArgumentList ?: return null
+        val segment = argumentSegmentBeforeCursor(file.text, argumentList.textRange.startOffset + 1, offset) ?: return null
+        if (segment.contains('=')) return null
+        if (segment.any { !it.isWhitespace() && !it.isJavaIdentifierPart() }) return null
+        val descriptor = resolvedCallDescriptor(snapshot, call) ?: return null
+        val currentArgument = call.valueArguments.firstOrNull { offset in it.textRange.startOffset..it.textRange.endOffset }
+        val editingParameterName = currentArgument
+            ?.takeIf { isEditingNamedArgumentName(file.text, it, offset) }
+            ?.getArgumentName()
+            ?.asName
+            ?.asString()
+        val usedParameterNames = call.valueArguments
+            .mapNotNull { argument -> argument.getArgumentName()?.asName?.asString() }
+            .filterNot { parameterName -> parameterName == editingParameterName }
+            .toSet()
+        return NamedArgumentCompletionContext(
+            descriptor = descriptor,
+            prefix = currentPrefix(file.text, offset),
+            usedParameterNames = usedParameterNames,
+        )
+    }
+
+    private fun indexedNamedArgumentCompletionContext(
+        text: String,
+        offset: Int,
+    ): IndexedNamedArgumentCompletionContext? {
+        val callOpenOffset = enclosingCallParenthesis(text, offset) ?: return null
+        val calleeName = callNameBeforeParenthesis(text, callOpenOffset) ?: return null
+        val segment = argumentSegmentBeforeCursor(text, callOpenOffset + 1, offset) ?: return null
+        if (segment.contains('=')) return null
+        if (segment.any { !it.isWhitespace() && !it.isJavaIdentifierPart() }) return null
+        val usedParameterNames = topLevelArgumentSegments(text, callOpenOffset + 1, offset)
+            .mapNotNull { argument ->
+                argument.substringBefore('=', missingDelimiterValue = "")
+                    .trim()
+                    .takeIf { it.isNotBlank() && argument.contains('=') }
+            }
+            .toSet()
+        return IndexedNamedArgumentCompletionContext(
+            calleeName = calleeName,
+            prefix = currentPrefix(text, offset),
+            usedParameterNames = usedParameterNames,
+        )
+    }
+
+    private fun indexedNamedArgumentCandidates(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        calleeName: String,
+    ): List<IndexedSymbol> {
+        val normalizedPath = path.normalize()
+        val samePathSymbols = index.symbolsByPath[normalizedPath].orEmpty()
+        val currentModuleName = samePathSymbols.firstOrNull()?.moduleName
+        val currentPackageName = SourceIndexLookup.packageName(text)
+        val visiblePackages = SourceIndexLookup.supportPackages(normalizedPath, text)
+        val importedCandidates = SourceIndexLookup.imports(text)
+            .asSequence()
+            .filter { imported -> imported.visibleName == calleeName }
+            .mapNotNull { imported -> index.symbolsByFqName[imported.fqName] }
+        val nameCandidates = index.symbolsByName[calleeName].orEmpty().asSequence()
+        return (
+            samePathSymbols.asSequence().filter { symbol -> symbol.name == calleeName } +
+                importedCandidates +
+                nameCandidates.filter { symbol ->
+                    symbol.name == calleeName && (
+                        symbol.packageName == currentPackageName ||
+                            symbol.packageName in visiblePackages ||
+                            (currentModuleName != null && symbol.moduleName == currentModuleName)
+                        )
+                }
+            )
+            .filter(::supportsIndexedNamedArguments)
+            .distinctBy { symbol -> symbol.id }
+            .sortedWith(preferredIndexedSymbolComparator())
+            .toList()
+    }
+
+    private fun supportsIndexedNamedArguments(symbol: IndexedSymbol): Boolean =
+        symbol.receiverType == null &&
+            symbol.parameters.isNotEmpty() &&
+            symbol.kind in setOf(SymbolKind.FUNCTION, SymbolKind.CONSTRUCTOR, SymbolKind.CLASS)
+
+    private fun indexedNamedArgumentDetail(
+        parameter: IndexedParameter,
+        symbol: IndexedSymbol,
+    ): String = buildString {
+        append(parameter.type ?: "Any?")
+        parameter.defaultValue?.takeIf { it.isNotBlank() }?.let { defaultValue ->
+            append(" = ")
+            append(defaultValue)
+        }
+        append("  ")
+        append(symbol.name)
+    }
+
+    private fun argumentSegmentBeforeCursor(
+        text: String,
+        argumentListStart: Int,
+        offset: Int,
+    ): String? {
+        if (offset < argumentListStart) return null
+        var parenthesisDepth = 0
+        var braceDepth = 0
+        var bracketDepth = 0
+        var segmentStart = argumentListStart
+        var cursor = argumentListStart
+        while (cursor < offset) {
+            val current = text[cursor]
+            val next = text.getOrNull(cursor + 1)
+            when {
+                current == '/' && next == '/' -> {
+                    cursor += 2
+                    while (cursor < offset && text[cursor] != '\n') {
+                        cursor++
+                    }
+                }
+
+                current == '/' && next == '*' -> {
+                    cursor += 2
+                    while (cursor + 1 < offset && !(text[cursor] == '*' && text[cursor + 1] == '/')) {
+                        cursor++
+                    }
+                    if (cursor + 1 < offset) {
+                        cursor += 2
+                    }
+                }
+
+                current == '"' && text.startsWith("\"\"\"", cursor) -> {
+                    cursor += 3
+                    while (cursor + 2 < offset && !text.startsWith("\"\"\"", cursor)) {
+                        cursor++
+                    }
+                    if (cursor + 2 < offset) {
+                        cursor += 3
+                    }
+                }
+
+                current == '"' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < offset) {
+                        val ch = text[cursor]
+                        if (ch == '"' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                current == '\'' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < offset) {
+                        val ch = text[cursor]
+                        if (ch == '\'' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                else -> {
+                    when (current) {
+                        '(' -> parenthesisDepth++
+                        ')' -> parenthesisDepth = (parenthesisDepth - 1).coerceAtLeast(0)
+                        '{' -> braceDepth++
+                        '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
+                        '[' -> bracketDepth++
+                        ']' -> bracketDepth = (bracketDepth - 1).coerceAtLeast(0)
+                        ',' -> if (parenthesisDepth == 0 && braceDepth == 0 && bracketDepth == 0) {
+                            segmentStart = cursor + 1
+                        }
+                    }
+                    cursor++
+                }
+            }
+        }
+        return text.substring(segmentStart, offset).trimStart()
+    }
+
+    private fun isEditingNamedArgumentName(
+        text: String,
+        argument: KtValueArgument,
+        offset: Int,
+    ): Boolean {
+        val argumentName = argument.getArgumentName() ?: return false
+        val nameRange = argumentName.textRange
+        if (offset > nameRange.endOffset) return false
+        val segment = text.substring(argument.textRange.startOffset, offset.coerceAtMost(argument.textRange.endOffset))
+        return '=' !in segment
+    }
+
+    private fun resolvedCallDescriptor(
+        snapshot: WorkspaceAnalysisSnapshot,
+        call: KtCallExpression,
+    ): CallableDescriptor? {
+        val callee = call.calleeExpression
+        val callInfo = callee?.let { snapshot.bindingContext[BindingContext.CALL, it] }
+            ?: snapshot.bindingContext[BindingContext.CALL, call]
+            ?: return null
+        return snapshot.bindingContext[BindingContext.RESOLVED_CALL, callInfo]?.resultingDescriptor as? CallableDescriptor
+    }
+
+    private fun enclosingCallParenthesis(
+        text: String,
+        offset: Int,
+    ): Int? {
+        val openParentheses = ArrayDeque<Int>()
+        var cursor = 0
+        while (cursor < offset.coerceIn(0, text.length)) {
+            val current = text[cursor]
+            val next = text.getOrNull(cursor + 1)
+            when {
+                current == '/' && next == '/' -> {
+                    cursor += 2
+                    while (cursor < offset && text[cursor] != '\n') {
+                        cursor++
+                    }
+                }
+
+                current == '/' && next == '*' -> {
+                    cursor += 2
+                    while (cursor + 1 < offset && !(text[cursor] == '*' && text[cursor + 1] == '/')) {
+                        cursor++
+                    }
+                    if (cursor + 1 < offset) {
+                        cursor += 2
+                    }
+                }
+
+                current == '"' && text.startsWith("\"\"\"", cursor) -> {
+                    cursor += 3
+                    while (cursor + 2 < offset && !text.startsWith("\"\"\"", cursor)) {
+                        cursor++
+                    }
+                    if (cursor + 2 < offset) {
+                        cursor += 3
+                    }
+                }
+
+                current == '"' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < offset) {
+                        val ch = text[cursor]
+                        if (ch == '"' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                current == '\'' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < offset) {
+                        val ch = text[cursor]
+                        if (ch == '\'' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                else -> {
+                    when (current) {
+                        '(' -> openParentheses.addLast(cursor)
+                        ')' -> if (openParentheses.isNotEmpty()) {
+                            openParentheses.removeLast()
+                        }
+                    }
+                    cursor++
+                }
+            }
+        }
+        return openParentheses.lastOrNull()
+    }
+
+    private fun callNameBeforeParenthesis(
+        text: String,
+        parenthesisOffset: Int,
+    ): String? {
+        var cursor = parenthesisOffset - 1
+        while (cursor >= 0 && text[cursor].isWhitespace()) {
+            cursor--
+        }
+        while (cursor >= 0 && text[cursor] == '>') {
+            cursor--
+            var depth = 1
+            while (cursor >= 0 && depth > 0) {
+                when (text[cursor]) {
+                    '>' -> depth++
+                    '<' -> depth--
+                }
+                cursor--
+            }
+            while (cursor >= 0 && text[cursor].isWhitespace()) {
+                cursor--
+            }
+        }
+        if (cursor < 0 || !text[cursor].isJavaIdentifierPart()) return null
+        var start = cursor
+        while (start > 0 && text[start - 1].isJavaIdentifierPart()) {
+            start--
+        }
+        return text.substring(start, cursor + 1)
+    }
+
+    private fun topLevelArgumentSegments(
+        text: String,
+        argumentListStart: Int,
+        offset: Int,
+    ): List<String> {
+        val segments = mutableListOf<String>()
+        var parenthesisDepth = 0
+        var braceDepth = 0
+        var bracketDepth = 0
+        var segmentStart = argumentListStart
+        var cursor = argumentListStart
+        while (cursor < offset.coerceIn(argumentListStart, text.length)) {
+            val current = text[cursor]
+            val next = text.getOrNull(cursor + 1)
+            when {
+                current == '/' && next == '/' -> {
+                    cursor += 2
+                    while (cursor < offset && text[cursor] != '\n') {
+                        cursor++
+                    }
+                }
+
+                current == '/' && next == '*' -> {
+                    cursor += 2
+                    while (cursor + 1 < offset && !(text[cursor] == '*' && text[cursor + 1] == '/')) {
+                        cursor++
+                    }
+                    if (cursor + 1 < offset) {
+                        cursor += 2
+                    }
+                }
+
+                current == '"' && text.startsWith("\"\"\"", cursor) -> {
+                    cursor += 3
+                    while (cursor + 2 < offset && !text.startsWith("\"\"\"", cursor)) {
+                        cursor++
+                    }
+                    if (cursor + 2 < offset) {
+                        cursor += 3
+                    }
+                }
+
+                current == '"' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < offset) {
+                        val ch = text[cursor]
+                        if (ch == '"' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                current == '\'' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < offset) {
+                        val ch = text[cursor]
+                        if (ch == '\'' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                else -> {
+                    when (current) {
+                        '(' -> parenthesisDepth++
+                        ')' -> parenthesisDepth = (parenthesisDepth - 1).coerceAtLeast(0)
+                        '{' -> braceDepth++
+                        '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
+                        '[' -> bracketDepth++
+                        ']' -> bracketDepth = (bracketDepth - 1).coerceAtLeast(0)
+                        ',' -> if (parenthesisDepth == 0 && braceDepth == 0 && bracketDepth == 0) {
+                            segments += text.substring(segmentStart, cursor).trim()
+                            segmentStart = cursor + 1
+                        }
+                    }
+                    cursor++
+                }
+            }
+        }
+        val trailing = text.substring(segmentStart, offset.coerceIn(segmentStart, text.length)).trim()
+        if (trailing.isNotBlank()) {
+            segments += trailing
+        }
+        return segments
+    }
+
+    private fun structuralContext(text: String, limit: Int): StructuralContext {
+        var parenthesisDepth = 0
+        var braceDepth = 0
+        var bracketDepth = 0
+        var cursor = 0
+        while (cursor < limit) {
+            val current = text[cursor]
+            val next = text.getOrNull(cursor + 1)
+            when {
+                current == '/' && next == '/' -> {
+                    cursor += 2
+                    while (cursor < limit && text[cursor] != '\n') {
+                        cursor++
+                    }
+                }
+
+                current == '/' && next == '*' -> {
+                    cursor += 2
+                    while (cursor + 1 < limit && !(text[cursor] == '*' && text[cursor + 1] == '/')) {
+                        cursor++
+                    }
+                    if (cursor + 1 < limit) {
+                        cursor += 2
+                    }
+                }
+
+                current == '"' && text.startsWith("\"\"\"", cursor) -> {
+                    cursor += 3
+                    while (cursor + 2 < limit && !text.startsWith("\"\"\"", cursor)) {
+                        cursor++
+                    }
+                    if (cursor + 2 < limit) {
+                        cursor += 3
+                    }
+                }
+
+                current == '"' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < limit) {
+                        val ch = text[cursor]
+                        if (ch == '"' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                current == '\'' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < limit) {
+                        val ch = text[cursor]
+                        if (ch == '\'' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                else -> {
+                    when (current) {
+                        '(' -> parenthesisDepth++
+                        ')' -> parenthesisDepth = (parenthesisDepth - 1).coerceAtLeast(0)
+                        '{' -> braceDepth++
+                        '}' -> braceDepth = (braceDepth - 1).coerceAtLeast(0)
+                        '[' -> bracketDepth++
+                        ']' -> bracketDepth = (bracketDepth - 1).coerceAtLeast(0)
+                    }
+                    cursor++
+                }
+            }
+        }
+        return StructuralContext(
+            parenthesisDepth = parenthesisDepth,
+            braceDepth = braceDepth,
+            bracketDepth = bracketDepth,
+        )
+    }
+
     private fun scoreToSortKey(score: Int): String = (1000 - score).coerceAtLeast(0).toString().padStart(4, '0')
 
     private data class RankedCompletion(
@@ -1440,8 +2166,63 @@ class CompletionService {
         val segmentPrefix: String,
     )
 
+    private data class PackageCompletionContext(
+        val qualifier: String,
+        val segmentPrefix: String,
+    )
+
     private data class ReceiverTypeHierarchy(
         val fqNames: Set<String>,
         val shortNames: Set<String>,
     )
+
+    private data class StructuralContext(
+        val parenthesisDepth: Int,
+        val braceDepth: Int,
+        val bracketDepth: Int,
+    )
+
+    private data class NamedArgumentCompletionContext(
+        val descriptor: CallableDescriptor,
+        val prefix: String,
+        val usedParameterNames: Set<String>,
+    )
+
+    private data class IndexedNamedArgumentCompletionContext(
+        val calleeName: String,
+        val prefix: String,
+        val usedParameterNames: Set<String>,
+    )
+
+    private fun acquireJetBrainsBridge(projectRoot: Path): JetBrainsCompletionBridge? {
+        jetBrainsBridge?.let { return it }
+        return synchronized(this) {
+            jetBrainsBridge ?: JetBrainsCompletionBridge.detect(projectRoot = projectRoot)?.also { detected ->
+                jetBrainsBridge = detected
+            }
+        }
+    }
+
+    private companion object {
+        val FLOW_SENSITIVE_IF_REGEX = Regex(
+            """\bif\s*\([^)]*\bis\s+[A-Za-z_][A-Za-z0-9_.<>?]*[^)]*\)\s*\{[\s\S]*$""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
+        )
+        val FLOW_SENSITIVE_WHEN_REGEX = Regex(
+            """\bwhen\s*\([^)]*\)\s*\{[\s\S]*\bis\s+[A-Za-z_][A-Za-z0-9_.<>?]*\s*->[\s\S]*$""",
+            setOf(RegexOption.DOT_MATCHES_ALL),
+        )
+    }
 }
+
+enum class CompletionRoute {
+    INDEX,
+    BRIDGE,
+}
+
+data class CompletionRoutingDecision(
+    val route: CompletionRoute,
+    val reason: String,
+    val receiverType: String? = null,
+    val chainDepth: Int? = null,
+)

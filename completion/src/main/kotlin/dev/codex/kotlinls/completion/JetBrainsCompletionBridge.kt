@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.readValue
 import dev.codex.kotlinls.protocol.Json
 import dev.codex.kotlinls.protocol.Hover
+import dev.codex.kotlinls.protocol.IntellijHomeLocator
 import dev.codex.kotlinls.protocol.Location
 import dev.codex.kotlinls.protocol.MarkupContent
 import dev.codex.kotlinls.protocol.Position
@@ -32,6 +33,7 @@ class JetBrainsCompletionBridge private constructor(
     private val classpath: List<Path>,
     private val mainClass: String,
     private val ideaHome: Path,
+    private val androidSdk: Path?,
     private val pluginJar: Path,
     private val extraPluginJars: List<Path>,
 ) : AutoCloseable {
@@ -46,7 +48,7 @@ class JetBrainsCompletionBridge private constructor(
         val pluginDir = preparePluginDir()
         val serverSocket = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
         serverSocket.soTimeout = 15_000
-        process = ProcessBuilder(
+        val builder = ProcessBuilder(
             buildList {
                 add(javaBinary.toString())
                 addAll(vmOptions)
@@ -67,6 +69,11 @@ class JetBrainsCompletionBridge private constructor(
                 add(serverSocket.localPort.toString())
             },
         )
+        androidSdk?.let { sdk ->
+            builder.environment()["ANDROID_SDK_ROOT"] = sdk.toString()
+            builder.environment()["ANDROID_HOME"] = sdk.toString()
+        }
+        process = builder
             .redirectErrorStream(true)
             .start()
         drainProcessOutput(process.inputStream)
@@ -300,13 +307,11 @@ class JetBrainsCompletionBridge private constructor(
     }
 
     companion object {
-        fun detect(forceEnable: Boolean = false): JetBrainsCompletionBridge? {
-            val configured = System.getProperty("kotlinls.intellijHome")
-                ?: System.getenv("KOTLINLS_INTELLIJ_HOME")
-            if (!configured.isNullOrBlank()) {
+        fun detect(forceEnable: Boolean = false, projectRoot: Path? = null): JetBrainsCompletionBridge? {
+            IntellijHomeLocator.configuredIdeaHome(projectRoot)?.let { configured ->
                 val pluginJar = locatePluginJar() ?: return null
                 val extraPluginJars = locateSupplementalPluginJars()
-                return fromIdeaHome(Path.of(configured), pluginJar, extraPluginJars)
+                return fromIdeaHome(configured, projectRoot, pluginJar, extraPluginJars)
             }
             if (!forceEnable && !intellijBridgeEnabled()) {
                 return null
@@ -321,7 +326,7 @@ class JetBrainsCompletionBridge private constructor(
             val homes = buildList {
                 addAll(commonIdeaHomes())
             }
-            return homes.firstNotNullOfOrNull { fromIdeaHome(it, pluginJar, extraPluginJars) }
+            return homes.firstNotNullOfOrNull { fromIdeaHome(it, projectRoot, pluginJar, extraPluginJars) }
         }
 
         private fun intellijBridgeEnabled(): Boolean =
@@ -331,6 +336,7 @@ class JetBrainsCompletionBridge private constructor(
 
         private fun fromIdeaHome(
             ideaHome: Path,
+            projectRoot: Path?,
             pluginJar: Path,
             extraPluginJars: List<Path>,
         ): JetBrainsCompletionBridge? {
@@ -389,6 +395,7 @@ class JetBrainsCompletionBridge private constructor(
                     classpath = (bootClasspath + kotlinPluginJars).distinct(),
                     mainClass = launch.mainClass,
                     ideaHome = normalizedHome,
+                    androidSdk = IntellijHomeLocator.configuredAndroidSdk(projectRoot),
                     pluginJar = pluginJar,
                     extraPluginJars = extraPluginJars,
                 )

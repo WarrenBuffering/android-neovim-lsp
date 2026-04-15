@@ -11,6 +11,7 @@ import org.jetbrains.kotlin.descriptors.ConstructorDescriptor
 import org.jetbrains.kotlin.descriptors.DeclarationDescriptor
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
 import org.jetbrains.kotlin.descriptors.PropertyDescriptor
+import org.jetbrains.kotlin.descriptors.ValueParameterDescriptor
 import org.jetbrains.kotlin.descriptors.VariableDescriptor
 import org.jetbrains.kotlin.psi.KtCallableDeclaration
 import org.jetbrains.kotlin.psi.KtClass
@@ -155,6 +156,12 @@ class WorkspaceIndexBuilder(
             resultType = resultType(descriptor?.descriptor),
             parameterCount = parameterCount(descriptor?.descriptor),
             supertypes = supertypes,
+            parameters = indexedParameters(this, descriptor?.descriptor),
+            enumEntries = (this as? KtClass)
+                ?.takeIf { it.isEnum() }
+                ?.indexedEnumEntries()
+                .orEmpty(),
+            enumValue = (this as? KtEnumEntry)?.toIndexedEnumEntry(),
         )
     }
 
@@ -162,11 +169,11 @@ class WorkspaceIndexBuilder(
         declaration: KtNamedDeclaration,
         descriptor: DeclarationDescriptor?,
     ): Int = when {
+        declaration is KtEnumEntry -> SymbolKind.ENUM_MEMBER
         declaration is KtClass && declaration.isInterface() -> SymbolKind.INTERFACE
         declaration is KtClass && declaration.isEnum() -> SymbolKind.ENUM
-        declaration is KtClassOrObject -> SymbolKind.CLASS
         declaration is KtObjectDeclaration -> SymbolKind.OBJECT
-        declaration is KtEnumEntry -> SymbolKind.ENUM_MEMBER
+        declaration is KtClassOrObject -> SymbolKind.CLASS
         declaration is KtNamedFunction -> SymbolKind.FUNCTION
         declaration is KtConstructor<*> || descriptor is ConstructorDescriptor -> SymbolKind.CONSTRUCTOR
         declaration is KtProperty && declaration.isLocal -> SymbolKind.VARIABLE
@@ -226,6 +233,68 @@ class WorkspaceIndexBuilder(
 
     private fun parameterCount(descriptor: DeclarationDescriptor?): Int =
         (descriptor as? CallableDescriptor)?.valueParameters?.size ?: 0
+
+    private fun indexedParameters(
+        declaration: KtNamedDeclaration,
+        descriptor: DeclarationDescriptor?,
+    ): List<IndexedParameter> = when (declaration) {
+        is KtNamedFunction -> declaration.valueParameters.mapIndexed { index, parameter ->
+            parameter.toIndexedParameter((descriptor as? CallableDescriptor)?.valueParameters?.getOrNull(index))
+        }
+
+        is KtConstructor<*> -> declaration.valueParameters.mapIndexed { index, parameter ->
+            parameter.toIndexedParameter((descriptor as? CallableDescriptor)?.valueParameters?.getOrNull(index))
+        }
+
+        is KtClass -> declaration.primaryConstructorParameters.mapIndexed { index, parameter ->
+            val constructorDescriptor = descriptor as? ClassDescriptor
+            parameter.toIndexedParameter(constructorDescriptor?.constructors?.firstOrNull()?.valueParameters?.getOrNull(index))
+        }
+
+        else -> emptyList()
+    }
+
+    private fun KtParameter.toIndexedParameter(descriptor: ValueParameterDescriptor?): IndexedParameter =
+        IndexedParameter(
+            name = name ?: descriptor?.name?.asString() ?: "<anonymous>",
+            type = typeReference?.text ?: descriptor?.type?.toString(),
+            defaultValue = defaultValue?.text?.trim(),
+            isVararg = isVarArg,
+            isNullable = typeReference?.text?.contains('?') == true || descriptor?.type?.isMarkedNullable == true,
+        )
+
+    private fun KtClass.indexedEnumEntries(): List<IndexedEnumEntry> =
+        body?.declarations
+            ?.filterIsInstance<KtEnumEntry>()
+            ?.map { entry -> entry.toIndexedEnumEntry() }
+            .orEmpty()
+
+    private fun KtEnumEntry.toIndexedEnumEntry(): IndexedEnumEntry {
+        val arguments = enumEntryArguments(text, name)
+        return IndexedEnumEntry(
+            name = name ?: "<anonymous>",
+            arguments = arguments,
+            stringValue = arguments.firstNotNullOfOrNull(::stringLiteralValue),
+        )
+    }
+
+    private fun enumEntryArguments(text: String, name: String?): List<String> {
+        val resolvedName = name ?: return emptyList()
+        val firstLine = text.lineSequence().firstOrNull()?.trim().orEmpty()
+        val remainder = firstLine.removePrefix(resolvedName).trimStart()
+        if (!remainder.startsWith("(")) return emptyList()
+        val closing = remainder.lastIndexOf(')')
+        if (closing <= 1) return emptyList()
+        return remainder.substring(1, closing)
+            .split(',')
+            .map(String::trim)
+            .filter(String::isNotBlank)
+    }
+
+    private fun stringLiteralValue(argument: String): String? =
+        argument
+            .takeIf { it.length >= 2 && it.startsWith('"') && it.endsWith('"') }
+            ?.substring(1, argument.length - 1)
 
 }
 

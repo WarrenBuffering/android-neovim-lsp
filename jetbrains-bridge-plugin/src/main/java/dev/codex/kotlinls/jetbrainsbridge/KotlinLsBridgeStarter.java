@@ -8,8 +8,6 @@ import com.intellij.codeInsight.lookup.Lookup;
 import com.intellij.codeInsight.lookup.LookupElement;
 import com.intellij.codeInsight.lookup.LookupElementPresentation;
 import com.intellij.codeInsight.lookup.LookupManager;
-import com.intellij.ide.impl.OpenProjectTask;
-import com.intellij.ide.impl.ProjectUtil;
 import com.intellij.ide.trustedProjects.TrustedProjects;
 import com.intellij.openapi.application.Application;
 import com.intellij.openapi.application.ApplicationManager;
@@ -22,12 +20,13 @@ import com.intellij.openapi.editor.EditorFactory;
 import com.intellij.openapi.fileEditor.FileDocumentManager;
 import com.intellij.openapi.project.DumbService;
 import com.intellij.openapi.project.Project;
+import com.intellij.openapi.project.ex.ProjectManagerEx;
 import com.intellij.openapi.util.Computable;
 import com.intellij.openapi.util.TextRange;
 import com.intellij.openapi.vfs.LocalFileSystem;
 import com.intellij.openapi.vfs.VirtualFile;
-import com.intellij.openapi.wm.ex.WindowManagerEx;
 import com.intellij.psi.PsiClass;
+import com.intellij.psi.PsiComment;
 import com.intellij.psi.PsiDocumentManager;
 import com.intellij.psi.PsiDocCommentOwner;
 import com.intellij.psi.PsiElement;
@@ -47,6 +46,9 @@ import org.jetbrains.kotlin.descriptors.DeclarationDescriptor;
 import org.jetbrains.kotlin.idea.decompiler.navigation.SourceNavigationHelper;
 import org.jetbrains.kotlin.idea.references.KtReference;
 import org.jetbrains.kotlin.idea.references.ReferenceUtilKt;
+import org.jetbrains.kotlin.kdoc.psi.api.KDoc;
+import org.jetbrains.kotlin.kdoc.psi.impl.KDocSection;
+import org.jetbrains.kotlin.kdoc.psi.impl.KDocTag;
 import org.jetbrains.kotlin.psi.KtCallableDeclaration;
 import org.jetbrains.kotlin.psi.KtCallExpression;
 import org.jetbrains.kotlin.psi.KtClass;
@@ -149,7 +151,7 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         } finally {
             openProjects.values().forEach(project -> {
                 if (project != null && !project.isDisposed()) {
-                    ProjectUtil.closeAndDispose(project);
+                    ProjectManagerEx.getInstanceEx().forceCloseProject(project, true);
                 }
             });
             Application application = ApplicationManager.getApplication();
@@ -199,6 +201,13 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         if (handle == null) {
             return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
         }
+        ApplicationManager.getApplication().runReadAction((Computable<Void>) () -> {
+            PsiFile psiFile = PsiManager.getInstance(project).findFile(handle.virtualFile());
+            if (psiFile != null) {
+                psiFile.getTextLength();
+            }
+            return null;
+        });
         return new BridgeResponse(request.id(), true, "synced", List.of(), List.of(), null, null, null);
     }
 
@@ -261,23 +270,13 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             }
             Path root = Path.of(projectRoot);
             TrustedProjects.setProjectTrusted(root, true);
-            Project project = ProjectUtil.openOrImport(root, OpenProjectTask.build().withForceOpenInNewFrame(false));
+            Project project = ProjectManagerEx.getInstanceEx().loadProject(root);
             if (project == null) {
                 throw new IllegalStateException("Unable to open project: " + projectRoot);
             }
             TrustedProjects.setProjectTrusted(project, true);
-            hideProjectFrame(project);
             return project;
         });
-    }
-
-    private void hideProjectFrame(Project project) {
-        ApplicationManager.getApplication().invokeLater(() -> {
-            var frame = WindowManagerEx.getInstanceEx().getFrame(project);
-            if (frame != null) {
-                frame.setVisible(false);
-            }
-        }, ModalityState.nonModal());
     }
 
     private void replaceDocumentText(Project project, Document document, String text) {
@@ -566,7 +565,11 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
 
     private String extractLeadingDocText(PsiElement element, AnalysisHandle sourceHandle) {
         if (element instanceof PsiDocCommentOwner owner && owner.getDocComment() != null) {
-            return stripDocComment(owner.getDocComment().getText());
+            PsiComment comment = owner.getDocComment();
+            if (comment instanceof KDoc kDoc) {
+                return renderKDocMarkdown(kDoc);
+            }
+            return stripDocComment(comment.getText());
         }
         if (element == null || element.getContainingFile() == null || element.getTextRange() == null) {
             return null;
@@ -589,6 +592,10 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         int docStart = prefix.lastIndexOf("/**", docEnd);
         if (docStart < 0) {
             return null;
+        }
+        PsiComment comment = element.getContainingFile().findElementAt(docStart) instanceof PsiComment psiComment ? psiComment : null;
+        if (comment instanceof KDoc kDoc) {
+            return renderKDocMarkdown(kDoc);
         }
         return stripDocComment(fullText.substring(docStart, docEnd + 2));
     }
@@ -613,8 +620,143 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         return stripped.isEmpty() ? null : stripped;
     }
 
+<<<<<<< HEAD
     private AnalysisHandle loadAnalysisHandle(Project project, String filePath, String requestedText) {
         VirtualFile sourceVirtualFile = ApplicationManager.getApplication().runReadAction(
+=======
+    private String renderKDocMarkdown(KDoc kDoc) {
+        if (kDoc == null) {
+            return null;
+        }
+        KDocSection defaultSection = kDoc.getDefaultSection();
+        List<String> sections = new ArrayList<>();
+        String description = sanitizeKDocText(defaultSection.getContent());
+        if (!description.isBlank()) {
+            sections.add(description);
+        }
+        addKDocCodeBlockSection(sections, "Parameters", defaultSection.findTagsByName("param"));
+        addKDocCodeBlockSection(sections, "Receiver", defaultSection.findTagsByName("receiver"));
+        addKDocCodeBlockSection(sections, "Properties", defaultSection.findTagsByName("property"));
+        addKDocCodeBlockSection(sections, "Constructor", defaultSection.findTagsByName("constructor"));
+        addKDocSingleCodeBlockSection(sections, "Returns", defaultSection.findTagByName("return"));
+        addKDocListSection(sections, "Throws", concatTags(defaultSection.findTagsByName("throws"), defaultSection.findTagsByName("exception")));
+        addKDocListSection(sections, "See Also", defaultSection.findTagsByName("see"));
+        addKDocListSection(sections, "Samples", defaultSection.findTagsByName("sample"));
+        addKDocListSection(sections, "Authors", defaultSection.findTagsByName("author"));
+        addKDocSingleSection(sections, "Since", defaultSection.findTagByName("since"));
+        String markdown = String.join("\n\n", sections).strip();
+        return markdown.isBlank() ? null : markdown;
+    }
+
+    private void addKDocCodeBlockSection(List<String> sections, String title, List<KDocTag> tags) {
+        if (tags == null || tags.isEmpty()) {
+            return;
+        }
+        List<String> rendered = new ArrayList<>();
+        for (KDocTag tag : tags) {
+            String line = renderKDocSignatureLine(tag);
+            if (!line.isBlank()) {
+                rendered.add(line);
+            }
+        }
+        if (rendered.isEmpty()) {
+            return;
+        }
+        sections.add("### " + title + "\n```kotlin\n" + String.join("\n", rendered) + "\n```");
+    }
+
+    private void addKDocSingleCodeBlockSection(List<String> sections, String title, KDocTag tag) {
+        String content = sanitizeKDocText(tag == null ? null : tag.getContent());
+        if (content.isBlank()) {
+            return;
+        }
+        sections.add("### " + title + "\n```kotlin\n" + content + "\n```");
+    }
+
+    private void addKDocListSection(List<String> sections, String title, List<KDocTag> tags) {
+        if (tags == null || tags.isEmpty()) {
+            return;
+        }
+        List<String> rendered = new ArrayList<>();
+        for (KDocTag tag : tags) {
+            String line = renderKDocListLine(tag);
+            if (!line.isBlank()) {
+                rendered.add(line);
+            }
+        }
+        if (rendered.isEmpty()) {
+            return;
+        }
+        sections.add("### " + title + "\n" + String.join("\n", rendered));
+    }
+
+    private void addKDocSingleSection(List<String> sections, String title, KDocTag tag) {
+        String content = sanitizeKDocText(tag == null ? null : tag.getContent());
+        if (content.isBlank()) {
+            return;
+        }
+        sections.add("### " + title + "\n" + content);
+    }
+
+    private String renderKDocSignatureLine(KDocTag tag) {
+        String subject = tag.getSubjectName() == null ? "" : tag.getSubjectName().trim();
+        String content = sanitizeKDocText(tag.getContent());
+        if (!subject.isBlank() && !content.isBlank()) {
+            return subject + ": " + content;
+        }
+        if (!subject.isBlank()) {
+            return subject;
+        }
+        return content;
+    }
+
+    private String renderKDocListLine(KDocTag tag) {
+        String subject = tag.getSubjectName() == null ? "" : tag.getSubjectName().trim();
+        String content = sanitizeKDocText(tag.getContent());
+        if (!subject.isBlank() && !content.isBlank()) {
+            return "- `" + subject + "`: " + content;
+        }
+        if (!subject.isBlank()) {
+            return "- `" + subject + "`";
+        }
+        if (!content.isBlank()) {
+            return "- " + content;
+        }
+        return "";
+    }
+
+    private String sanitizeKDocText(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+        String normalized = text.replace("\r\n", "\n");
+        List<String> lines = new ArrayList<>();
+        for (String line : normalized.split("\\R")) {
+            lines.add(line.stripTrailing());
+        }
+        String joined = String.join("\n", lines).strip();
+        if (joined.isBlank()) {
+            return "";
+        }
+        return joined
+            .replaceAll("\\[(.+?)]\\[(.+?)]", "`$1`")
+            .replaceAll("\\[(.+?)](?!\\()", "`$1`");
+    }
+
+    private List<KDocTag> concatTags(List<KDocTag> first, List<KDocTag> second) {
+        List<KDocTag> all = new ArrayList<>();
+        if (first != null) {
+            all.addAll(first);
+        }
+        if (second != null) {
+            all.addAll(second);
+        }
+        return all;
+    }
+
+    private DocumentHandle loadDocumentHandle(String filePath) {
+        VirtualFile virtualFile = ApplicationManager.getApplication().runReadAction(
+>>>>>>> 2949bac (Checkpoint current diagnostics and indexing work)
             (Computable<VirtualFile>) () -> LocalFileSystem.getInstance().refreshAndFindFileByNioFile(Path.of(filePath))
         );
         if (sourceVirtualFile == null) {

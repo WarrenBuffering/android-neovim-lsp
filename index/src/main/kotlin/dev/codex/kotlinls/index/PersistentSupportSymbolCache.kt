@@ -94,6 +94,9 @@ class PersistentSupportSymbolCache(
                                 resultType = symbol.resultType,
                                 parameterCount = symbol.parameterCount,
                                 supertypes = symbol.supertypes,
+                                parameters = symbol.parameters,
+                                enumEntries = symbol.enumEntries,
+                                enumValue = symbol.enumValue,
                             )
                         },
                     )
@@ -193,6 +196,9 @@ class PersistentSupportSymbolCache(
                 resultType = symbol.resultType,
                 parameterCount = symbol.parameterCount,
                 supertypes = symbol.supertypes,
+                parameters = symbol.parameters,
+                enumEntries = symbol.enumEntries,
+                enumValue = symbol.enumValue,
             )
         }
         synchronized(cacheLock) {
@@ -251,7 +257,7 @@ class PersistentSupportSymbolCache(
             .joinToString("") { byte -> "%02x".format(byte) }
 
     companion object {
-        private const val SCHEMA_VERSION = 2
+        private const val SCHEMA_VERSION = 3
 
         private fun defaultSupportCacheRoot(): Path {
             val userHome = Path.of(System.getProperty("user.home"))
@@ -297,4 +303,7 @@ private data class PersistedSupportIndexedSymbol(
     val resultType: String?,
     val parameterCount: Int,
     val supertypes: List<String>,
+    val parameters: List<IndexedParameter> = emptyList(),
+    val enumEntries: List<IndexedEnumEntry> = emptyList(),
+    val enumValue: IndexedEnumEntry? = null,
 )

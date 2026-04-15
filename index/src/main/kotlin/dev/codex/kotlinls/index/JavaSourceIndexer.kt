@@ -32,6 +32,7 @@ internal object JavaSourceIndexer {
         }.toList()
         if (classes.isEmpty()) return emptyList()
         val primaryClass = classes.first()
+        val classesByName = classes.associateBy { it.name }
         val classSymbols = classes.map { classMatch ->
             IndexedSymbol(
                 id = classMatch.fqName,
@@ -51,8 +52,33 @@ internal object JavaSourceIndexer {
                 supertypes = classMatch.supertypes,
             )
         }
+        val constructorSymbols = CONSTRUCTOR_REGEX.findAll(text).mapNotNull { match ->
+            val ownerClass = classesByName[match.groupValues[1]] ?: return@mapNotNull null
+            val selectionStart = match.range.first + match.value.indexOf(ownerClass.name)
+            val parametersText = match.groupValues[2].trim()
+            IndexedSymbol(
+                id = "${ownerClass.fqName}#<init>@${match.range.first}",
+                name = ownerClass.name,
+                fqName = ownerClass.fqName,
+                kind = SymbolKind.CONSTRUCTOR,
+                path = path,
+                uri = path.toDocumentUri(),
+                range = lineIndex.range(match.range.first, match.range.last + 1),
+                selectionRange = lineIndex.range(selectionStart, selectionStart + ownerClass.name.length),
+                containerName = ownerClass.name,
+                containerFqName = ownerClass.fqName,
+                signature = match.value.lineSequence().first().trim(),
+                documentation = extractLeadingDoc(text, match.range.first),
+                packageName = packageName,
+                moduleName = moduleName,
+                importable = false,
+                resultType = ownerClass.fqName,
+                parameterCount = parametersText.split(',').map { it.trim() }.count { it.isNotBlank() },
+            )
+        }.toList()
         val methodSymbols = METHOD_REGEX.findAll(text).mapNotNull { match ->
             val name = match.groupValues[2]
+            if (name in classesByName) return@mapNotNull null
             val fqName = "${primaryClass.fqName}.$name"
             val selectionStart = match.range.first + match.value.indexOf(name)
             val parametersText = match.groupValues[3].trim()
@@ -60,7 +86,7 @@ internal object JavaSourceIndexer {
                 id = "$fqName@${match.range.first}",
                 name = name,
                 fqName = fqName,
-                kind = if (name == primaryClass.name) SymbolKind.CONSTRUCTOR else SymbolKind.FUNCTION,
+                kind = SymbolKind.FUNCTION,
                 path = path,
                 uri = path.toDocumentUri(),
                 range = lineIndex.range(match.range.first, match.range.last + 1),
@@ -72,11 +98,11 @@ internal object JavaSourceIndexer {
                 packageName = packageName,
                 moduleName = moduleName,
                 importable = false,
-                resultType = match.groupValues[1].takeIf { it.isNotBlank() && name != primaryClass.name },
+                resultType = match.groupValues[1].takeIf { it.isNotBlank() },
                 parameterCount = parametersText.split(',').map { it.trim() }.count { it.isNotBlank() },
             )
         }.toList()
-        return classSymbols + methodSymbols
+        return classSymbols + constructorSymbols + methodSymbols
     }
 
     private fun extractLeadingDoc(text: String, declarationOffset: Int): String? {
@@ -112,5 +138,8 @@ internal object JavaSourceIndexer {
     )
     private val METHOD_REGEX = Regex(
         """(?m)^\s*(?:public|protected|private|static|final|abstract|synchronized|native|default|strictfp|\s)*([A-Za-z0-9_$.<>\[\]?]+)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?:throws\s+[^{;]+)?[;{]""",
+    )
+    private val CONSTRUCTOR_REGEX = Regex(
+        """(?m)^\s*(?:public|protected|private|\s)*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?:throws\s+[^{;]+)?[;{]""",
     )
 }

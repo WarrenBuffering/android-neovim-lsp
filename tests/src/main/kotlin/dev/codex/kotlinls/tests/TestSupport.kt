@@ -15,7 +15,15 @@ data class TestSuite(
 fun runSuites(suites: List<TestSuite>, selectedMode: String) {
     val filtered = when (selectedMode) {
         "smoke" -> suites.filter { it.name in setOf("protocol-smoke", "import") }
-        else -> suites
+        "all" -> suites
+        else -> {
+            val requested = selectedMode
+                .split(",")
+                .map(String::trim)
+                .filter(String::isNotEmpty)
+                .toSet()
+            suites.filter { it.name in requested }
+        }
     }
     var failures = 0
     filtered.forEach { suite ->
@@ -47,4 +55,3 @@ fun <T> assertEquals(expected: T, actual: T, lazyMessage: () -> String = { "Expe
 fun assertContains(haystack: String, needle: String) {
     assertTrue(haystack.contains(needle)) { "Expected <$haystack> to contain <$needle>" }
 }
-

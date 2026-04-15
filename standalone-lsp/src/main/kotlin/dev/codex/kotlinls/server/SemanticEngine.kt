@@ -12,6 +12,7 @@ import dev.codex.kotlinls.protocol.CompletionParams
 import dev.codex.kotlinls.protocol.DocumentFormattingParams
 import dev.codex.kotlinls.protocol.DocumentRangeFormattingParams
 import dev.codex.kotlinls.protocol.Hover
+import dev.codex.kotlinls.protocol.IntellijHomeLocator
 import dev.codex.kotlinls.protocol.Location
 import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
@@ -60,6 +61,8 @@ internal interface SemanticEngine : AutoCloseable {
         activeDocument: TextDocumentSnapshot?,
         openDocuments: Collection<TextDocumentSnapshot>,
         projectGeneration: Int,
+        syncDocuments: Boolean = true,
+        startBridge: Boolean = false,
     )
 
     fun complete(
@@ -123,6 +126,8 @@ internal class DisabledSemanticEngine(
         activeDocument: TextDocumentSnapshot?,
         openDocuments: Collection<TextDocumentSnapshot>,
         projectGeneration: Int,
+        syncDocuments: Boolean,
+        startBridge: Boolean,
     ) = Unit
 
     override fun complete(
@@ -197,6 +202,8 @@ internal class BridgeK2SemanticEngine private constructor(
     private val pendingDocumentSyncs = linkedMapOf<String, PendingBridgeSync>()
     private var syncDrainGeneration = 0L
     private var pendingSyncDrain: ScheduledFuture<*>? = null
+    @Volatile
+    private var bridgeStartupScheduled = false
 
     override val available: Boolean
         get() = acquireBridge() != null
@@ -216,6 +223,7 @@ internal class BridgeK2SemanticEngine private constructor(
             syncDrainGeneration += 1
             pendingSyncDrain?.cancel(false)
             pendingSyncDrain = null
+            bridgeStartupScheduled = false
         }
         val currentBridge = bridge
         bridge = null
@@ -236,8 +244,14 @@ internal class BridgeK2SemanticEngine private constructor(
         activeDocument: TextDocumentSnapshot?,
         openDocuments: Collection<TextDocumentSnapshot>,
         projectGeneration: Int,
+        syncDocuments: Boolean,
+        startBridge: Boolean,
     ) {
         enqueueProjectWarmup(project.root)
+        if (startBridge) {
+            scheduleBridgeStartup()
+        }
+        if (!syncDocuments) return
         val targets = prefetchTargets(project, activeDocument, openDocuments)
         if (targets.isEmpty()) return
         synchronized(pendingSyncLock) {
@@ -404,6 +418,7 @@ internal class BridgeK2SemanticEngine private constructor(
             syncDrainGeneration += 1
             pendingSyncDrain?.cancel(false)
             pendingSyncDrain = null
+            bridgeStartupScheduled = false
         }
         requestExecutor.shutdownNow()
         syncExecutor.shutdownNow()
@@ -412,10 +427,10 @@ internal class BridgeK2SemanticEngine private constructor(
         runCatching { currentBridge?.close() }
     }
 
-    private fun acquireBridge(): JetBrainsCompletionBridge? {
+    private fun acquireBridge(preferredProjectRoot: Path? = null): JetBrainsCompletionBridge? {
         bridge?.let { return it }
         return synchronized(this) {
-            bridge ?: JetBrainsCompletionBridge.detect(forceEnable = true)?.also { detected ->
+            bridge ?: JetBrainsCompletionBridge.detect(forceEnable = true, projectRoot = preferredProjectRoot)?.also { detected ->
                 bridge = detected
                 synchronized(pendingSyncLock) {
                     scheduleSyncDrainLocked(0L)
@@ -429,6 +444,30 @@ internal class BridgeK2SemanticEngine private constructor(
             pendingProjectWarmups.add(projectRoot)
             if (bridge != null) {
                 scheduleSyncDrainLocked(if (immediate) 0L else liveSyncDebounceMillis)
+            }
+        }
+    }
+
+    private fun scheduleBridgeStartup() {
+        var preferredProjectRoot: Path? = null
+        synchronized(pendingSyncLock) {
+            if (bridge != null || bridgeStartupScheduled) return
+            bridgeStartupScheduled = true
+            preferredProjectRoot = pendingProjectWarmups.firstOrNull() ?: pendingDocumentSyncs.values.firstOrNull()?.projectRoot
+        }
+        try {
+            syncExecutor.execute {
+                try {
+                    acquireBridge(preferredProjectRoot)
+                } finally {
+                    synchronized(pendingSyncLock) {
+                        bridgeStartupScheduled = false
+                    }
+                }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            synchronized(pendingSyncLock) {
+                bridgeStartupScheduled = false
             }
         }
     }
@@ -656,15 +695,9 @@ internal class BridgeK2SemanticEngine private constructor(
         }
 
         private fun detectFormatterBridge() =
-            configuredIdeaHome()
+            IntellijHomeLocator.configuredIdeaHome()
                 ?.let(JetBrainsFormatterBridge::fromIdeaHome)
                 ?: commonIdeaHomes().firstNotNullOfOrNull(JetBrainsFormatterBridge::fromIdeaHome)
-
-        private fun configuredIdeaHome(): Path? {
-            val configured = System.getProperty("kotlinls.intellijHome")
-                ?: System.getenv("KOTLINLS_INTELLIJ_HOME")
-            return configured?.takeIf { it.isNotBlank() }?.let(Path::of)?.normalize()
-        }
 
         private fun commonIdeaHomes(): List<Path> =
             listOf(

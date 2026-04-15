@@ -82,6 +82,7 @@ fun importSuite(): TestSuite {
                 val root = Files.createTempDirectory("kotlinls-kmp-import-fixture")
                 val gradleHome = root.resolve("gradle-home")
                 val projectRoot = root.resolve("project").also { it.createDirectories() }
+                FixtureSupport.seedLocalProperties(projectRoot)
                 projectRoot.resolve("settings.gradle.kts").writeText("""include(":app")""")
                 projectRoot.resolve("gradle").createDirectories()
                 projectRoot.resolve("gradle/libs.versions.toml").writeText(
@@ -171,6 +172,7 @@ fun importSuite(): TestSuite {
             TestCase("adds generated Android class directories for BuildConfig-style symbols") {
                 val root = Files.createTempDirectory("kotlinls-android-generated-classes")
                 val projectRoot = root.resolve("project").also { it.createDirectories() }
+                FixtureSupport.seedLocalProperties(projectRoot)
                 val appDir = projectRoot.resolve("app").also { it.createDirectories() }
                 projectRoot.resolve("settings.gradle.kts").writeText("""include(":app")""" + "\n")
                 appDir.resolve("build.gradle.kts").writeText(

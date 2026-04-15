@@ -3,6 +3,7 @@ package dev.codex.kotlinls.formatting
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import dev.codex.kotlinls.protocol.IntellijHomeLocator
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Locale
@@ -62,11 +63,9 @@ class JetBrainsFormatterBridge private constructor(
     companion object {
         private val mapper = jacksonObjectMapper()
 
-        fun detect(): FormatterBridge? {
-            val configured = System.getProperty("kotlinls.intellijHome")
-                ?: System.getenv("KOTLINLS_INTELLIJ_HOME")
-            if (!configured.isNullOrBlank()) {
-                fromIdeaHome(Path.of(configured))?.let { return it }
+        fun detect(projectRoot: Path? = null): FormatterBridge? {
+            IntellijHomeLocator.configuredIdeaHome(projectRoot)?.let { configured ->
+                fromIdeaHome(configured)?.let { return it }
             }
             if (!intellijBridgeEnabled()) {
                 return null

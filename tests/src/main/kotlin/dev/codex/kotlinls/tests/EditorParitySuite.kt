@@ -2,10 +2,14 @@ package dev.codex.kotlinls.tests
 
 import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.codeactions.CodeActionService
+import dev.codex.kotlinls.completion.CompletionService
 import dev.codex.kotlinls.hover.HoverAndSignatureService
 import dev.codex.kotlinls.index.LightweightWorkspaceIndexBuilder
+import dev.codex.kotlinls.index.SupportSymbolIndexBuilder
+import dev.codex.kotlinls.index.WorkspaceIndex
 import dev.codex.kotlinls.index.WorkspaceIndexBuilder
 import dev.codex.kotlinls.navigation.NavigationService
+import dev.codex.kotlinls.protocol.CompletionParams
 import dev.codex.kotlinls.projectimport.GradleProjectImporter
 import dev.codex.kotlinls.projectimport.LocalGradleCacheResolver
 import dev.codex.kotlinls.protocol.CodeActionContext
@@ -31,19 +35,57 @@ fun editorParitySuite(): TestSuite {
     val analyzer = KotlinWorkspaceAnalyzer()
     val indexBuilder = WorkspaceIndexBuilder()
     val lightweightIndexBuilder = LightweightWorkspaceIndexBuilder()
+    val supportIndexBuilder = SupportSymbolIndexBuilder()
     val navigationService = NavigationService()
     val hoverService = HoverAndSignatureService()
     val codeActionService = CodeActionService()
+    val completionService = CompletionService()
     return TestSuite(
         name = "editor-parity",
         cases = listOf(
+            TestCase("offers enum entry completions from the lightweight source index") {
+                val root = FixtureSupport.fixtureCopy("simple-jvm-app")
+                val project = importer.importProject(root)
+                val file = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    enum class SheetVisibilityState {
+                        Peek,
+                        Fit,
+                        Expanded,
+                        Full,
+                    }
+
+                    fun demo() {
+                        val state = SheetVisibilityState.Fi
+                    }
+                """.trimIndent() + "\n"
+                file.writeText(content)
+                val index = lightweightIndexBuilder.build(project, TextDocumentStore())
+                val line = content.lines().indexOfFirst { it.contains("SheetVisibilityState.Fi") }
+                val column = content.lines()[line].indexOf("Fi") + 2
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = file,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(file.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                )
+                val labels = completions.items.map { it.label }
+                assertTrue(labels.firstOrNull() == "Fit") {
+                    "Expected lightweight enum entry completions, got ${labels.take(10)}"
+                }
+            },
             TestCase("resolves workspace definitions from the lightweight source index") {
                 val root = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(root)
                 val index = lightweightIndexBuilder.build(project, TextDocumentStore())
                 val file = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
                 val content = file.readText()
-                val line = content.lines().indexOfFirst { it.contains("Greeting().say") }
+                val line = content.lines().indexOfFirst { it.contains("fun demo(): Greeting") }
                 val column = content.lines()[line].indexOf("Greeting") + 2
                 val locations = navigationService.definitionFromIndex(
                     index = index,
@@ -64,7 +106,7 @@ fun editorParitySuite(): TestSuite {
                 val index = lightweightIndexBuilder.build(project, TextDocumentStore())
                 val file = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
                 val content = file.readText()
-                val line = content.lines().indexOfFirst { it.contains("Greeting().say") }
+                val line = content.lines().indexOfFirst { it.contains("fun demo(): Greeting") }
                 val column = content.lines()[line].indexOf("Greeting") + 2
                 val hover = hoverService.hoverFromIndex(
                     index = index,
@@ -183,6 +225,55 @@ fun editorParitySuite(): TestSuite {
                     ),
                 )
                 assertContains(hover?.contents?.value ?: "", "Greets from source jar.")
+            },
+            TestCase("resolves default-import Kotlin stdlib symbols from the support index") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val supportLayer = supportIndexBuilder.build(project)
+                val index = WorkspaceIndex(
+                    symbols = supportLayer.symbols,
+                    references = emptyList(),
+                    callEdges = emptyList(),
+                )
+                assertTrue(index.symbolsByFqName["kotlin.String"] != null) {
+                    "Expected support index to include kotlin.String"
+                }
+                val file = root.resolve("src/main/kotlin/demo/DefaultImportsProbe.kt")
+                val content = """
+                    package demo
+
+                    fun probe(count: Int, label: String): String {
+                        return count.toFloat().toString() + label
+                    }
+                """.trimIndent()
+                val stringLine = content.lines().indexOfFirst { it.contains("label: String") }
+                val stringColumn = content.lines()[stringLine].indexOf("String") + 2
+                val stringDefinition = navigationService.definitionFromIndex(
+                    index = index,
+                    path = file,
+                    text = content,
+                    params = dev.codex.kotlinls.protocol.TextDocumentPositionParams(
+                        textDocument = TextDocumentIdentifier(file.toUri().toString()),
+                        position = Position(stringLine, stringColumn),
+                    ),
+                )
+                assertTrue(stringDefinition.any { it.uri.contains("/kotlin/String.kt") }) {
+                    "Expected default-import String definition in extracted stdlib sources, got $stringDefinition"
+                }
+                val hoverLine = content.lines().indexOfFirst { it.contains("count.toFloat()") }
+                val hoverColumn = content.lines()[hoverLine].indexOf("toFloat") + 3
+                val hover = hoverService.hoverFromIndex(
+                    index = index,
+                    path = file,
+                    text = content,
+                    params = dev.codex.kotlinls.protocol.TextDocumentPositionParams(
+                        textDocument = TextDocumentIdentifier(file.toUri().toString()),
+                        position = Position(hoverLine, hoverColumn),
+                    ),
+                )
+                val hoverText = hover?.contents?.value ?: error("Expected stdlib hover from support index")
+                assertContains(hoverText, "Parses the string as a `Float` number")
+                assertContains(hoverText, "Float")
             },
             TestCase("offers explicit type and return type code actions") {
                 val root = FixtureSupport.fixture("simple-jvm-app")

@@ -31,6 +31,7 @@ import org.jetbrains.kotlin.psi.KtPsiFactory
 import org.jetbrains.kotlin.psi.KtTypeAlias
 import org.jetbrains.kotlin.psi.psiUtil.containingClassOrObject
 import org.jetbrains.kotlin.psi.psiUtil.parentsWithSelf
+import org.jetbrains.kotlin.lexer.KtTokens
 import java.nio.file.Path
 
 class KotlinSourceIndexer : AutoCloseable {
@@ -76,6 +77,12 @@ class KotlinSourceIndexer : AutoCloseable {
                         ?.superTypeListEntries
                         ?.mapNotNull { it.typeReference?.text }
                         .orEmpty(),
+                    parameters = declaration.indexedParameters(),
+                    enumEntries = (declaration as? KtClass)
+                        ?.takeIf { it.isEnum() }
+                        ?.indexedEnumEntries()
+                        .orEmpty(),
+                    enumValue = (declaration as? KtEnumEntry)?.toIndexedEnumEntry(),
                 )
             }
     }
@@ -90,6 +97,11 @@ class KotlinSourceIndexer : AutoCloseable {
                 is KtNamedDeclaration -> add(this@collectIndexableDeclarations)
             }
             if (this@collectIndexableDeclarations is KtClassOrObject) {
+                if (this@collectIndexableDeclarations is KtClass && isEnum()) {
+                    body?.children
+                        ?.filterIsInstance<KtEnumEntry>()
+                        ?.forEach { entry -> add(entry) }
+                }
                 declarations.forEach { child ->
                     addAll(child.collectIndexableDeclarations())
                 }
@@ -100,6 +112,7 @@ class KotlinSourceIndexer : AutoCloseable {
 
     private fun KtNamedDeclaration.isIndexCandidate(): Boolean {
         if (this is KtProperty && isLocal) return false
+        if (this is KtEnumEntry) return true
         val parent = parent
         return parent is KtFile || parent is KtClassOrObject || this is KtConstructor<*>
     }
@@ -122,11 +135,11 @@ class KotlinSourceIndexer : AutoCloseable {
     }
 
     private fun KtNamedDeclaration.indexedKind(): Int = when {
+        this is KtEnumEntry -> SymbolKind.ENUM_MEMBER
         this is KtClass && isInterface() -> SymbolKind.INTERFACE
         this is KtClass && isEnum() -> SymbolKind.ENUM
         this is KtObjectDeclaration -> SymbolKind.OBJECT
         this is KtClassOrObject -> SymbolKind.CLASS
-        this is KtEnumEntry -> SymbolKind.ENUM_MEMBER
         this is KtNamedFunction -> SymbolKind.FUNCTION
         this is KtConstructor<*> -> SymbolKind.CONSTRUCTOR
         this is KtProperty -> SymbolKind.PROPERTY
@@ -178,8 +191,58 @@ class KotlinSourceIndexer : AutoCloseable {
     private fun KtNamedDeclaration.parameterCount(): Int = when (this) {
         is KtNamedFunction -> valueParameters.size
         is KtConstructor<*> -> valueParameters.size
+        is KtClass -> primaryConstructorParameters.size
         else -> 0
     }
+
+    private fun KtNamedDeclaration.indexedParameters(): List<IndexedParameter> = when (this) {
+        is KtNamedFunction -> valueParameters.map { it.toIndexedParameter() }
+        is KtConstructor<*> -> valueParameters.map { it.toIndexedParameter() }
+        is KtClass -> primaryConstructorParameters.map { it.toIndexedParameter() }
+        else -> emptyList()
+    }
+
+    private fun KtParameter.toIndexedParameter(): IndexedParameter =
+        IndexedParameter(
+            name = name ?: "<anonymous>",
+            type = typeReference?.text,
+            defaultValue = defaultValue?.text?.trim(),
+            isVararg = hasModifier(KtTokens.VARARG_KEYWORD),
+            isNullable = typeReference?.text?.contains('?') == true,
+        )
+
+    private fun KtClass.indexedEnumEntries(): List<IndexedEnumEntry> =
+        body?.children
+            ?.filterIsInstance<KtEnumEntry>()
+            ?.map { entry -> entry.toIndexedEnumEntry() }
+            .orEmpty()
+
+    private fun KtEnumEntry.toIndexedEnumEntry(): IndexedEnumEntry {
+        val arguments = enumEntryArguments(text, name)
+        return IndexedEnumEntry(
+            name = name ?: "<anonymous>",
+            arguments = arguments,
+            stringValue = arguments.firstNotNullOfOrNull(::stringLiteralValue),
+        )
+    }
+
+    private fun enumEntryArguments(text: String, name: String?): List<String> {
+        val resolvedName = name ?: return emptyList()
+        val firstLine = text.lineSequence().firstOrNull()?.trim().orEmpty()
+        val remainder = firstLine.removePrefix(resolvedName).trimStart()
+        if (!remainder.startsWith("(")) return emptyList()
+        val closing = remainder.lastIndexOf(')')
+        if (closing <= 1) return emptyList()
+        return remainder.substring(1, closing)
+            .split(',')
+            .map(String::trim)
+            .filter(String::isNotBlank)
+    }
+
+    private fun stringLiteralValue(argument: String): String? =
+        argument
+            .takeIf { it.length >= 2 && it.startsWith('"') && it.endsWith('"') }
+            ?.substring(1, argument.length - 1)
 
     private fun KtDeclaration.signatureText(): String =
         text.lineSequence()

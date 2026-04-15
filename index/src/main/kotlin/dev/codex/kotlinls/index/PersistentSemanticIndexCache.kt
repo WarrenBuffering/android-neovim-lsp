@@ -11,7 +11,7 @@ import kotlin.io.path.exists
 class PersistentSemanticIndexCache(
     private val cacheRoot: Path = defaultSemanticCacheRoot(),
 ) {
-    fun loadAll(projectRoot: Path): Map<String, WorkspaceIndex> {
+    fun loadAllEntries(projectRoot: Path): Map<String, SemanticIndexCacheEntry> {
         val projectDir = cacheRoot.resolve(projectKey(projectRoot))
         if (!projectDir.exists()) return emptyMap()
         return runCatching {
@@ -26,7 +26,7 @@ class PersistentSemanticIndexCache(
                         }.getOrNull() ?: return@mapNotNull null
                         if (persisted.schemaVersion != SCHEMA_VERSION) return@mapNotNull null
                         if (persisted.projectRoot != projectRoot.normalize().toString()) return@mapNotNull null
-                        persisted.moduleGradlePath to persisted.toWorkspaceIndex()
+                        persisted.moduleGradlePath to persisted.toEntry()
                     }
                     .toList()
                     .toMap()
@@ -34,11 +34,15 @@ class PersistentSemanticIndexCache(
         }.getOrDefault(emptyMap())
     }
 
-    fun load(
+    fun loadAll(projectRoot: Path): Map<String, WorkspaceIndex> {
+        return loadAllEntries(projectRoot).mapValues { (_, entry) -> entry.index }
+    }
+
+    fun loadEntry(
         projectRoot: Path,
         moduleGradlePath: String,
         fingerprint: String,
-    ): WorkspaceIndex? {
+    ): SemanticIndexCacheEntry? {
         val cacheFile = cacheFile(projectRoot, moduleGradlePath)
         if (!cacheFile.exists()) return null
         return runCatching {
@@ -47,8 +51,16 @@ class PersistentSemanticIndexCache(
             if (persisted.projectRoot != projectRoot.normalize().toString()) return null
             if (persisted.moduleGradlePath != moduleGradlePath) return null
             if (persisted.fingerprint != fingerprint) return null
-            persisted.toWorkspaceIndex()
+            persisted.toEntry()
         }.getOrNull()
+    }
+
+    fun load(
+        projectRoot: Path,
+        moduleGradlePath: String,
+        fingerprint: String,
+    ): WorkspaceIndex? {
+        return loadEntry(projectRoot, moduleGradlePath, fingerprint)?.index
     }
 
     fun save(
@@ -56,6 +68,7 @@ class PersistentSemanticIndexCache(
         moduleGradlePath: String,
         fingerprint: String,
         index: WorkspaceIndex,
+        fileContentHashes: Map<String, String> = emptyMap(),
     ) {
         val cacheFile = cacheFile(projectRoot, moduleGradlePath)
         runCatching {
@@ -68,6 +81,7 @@ class PersistentSemanticIndexCache(
                     fingerprint = fingerprint,
                     projectRoot = projectRoot.normalize().toString(),
                     moduleGradlePath = moduleGradlePath,
+                    fileContentHashes = fileContentHashes,
                     symbols = index.symbols.map { symbol ->
                         PersistedSemanticIndexedSymbol(
                             id = symbol.id,
@@ -89,6 +103,9 @@ class PersistentSemanticIndexCache(
                             resultType = symbol.resultType,
                             parameterCount = symbol.parameterCount,
                             supertypes = symbol.supertypes,
+                            parameters = symbol.parameters,
+                            enumEntries = symbol.enumEntries,
+                            enumValue = symbol.enumValue,
                         )
                     },
                     references = index.references.map { reference ->
@@ -127,7 +144,7 @@ class PersistentSemanticIndexCache(
             .joinToString("") { byte -> "%02x".format(byte) }
 
     companion object {
-        private const val SCHEMA_VERSION = 1
+        private const val SCHEMA_VERSION = 3
 
         private fun defaultSemanticCacheRoot(): Path {
             val userHome = Path.of(System.getProperty("user.home"))
@@ -140,11 +157,17 @@ class PersistentSemanticIndexCache(
     }
 }
 
+data class SemanticIndexCacheEntry(
+    val index: WorkspaceIndex,
+    val fileContentHashes: Map<String, String> = emptyMap(),
+)
+
 private data class PersistedSemanticIndexCache(
     val schemaVersion: Int,
     val fingerprint: String,
     val projectRoot: String,
     val moduleGradlePath: String,
+    val fileContentHashes: Map<String, String> = emptyMap(),
     val symbols: List<PersistedSemanticIndexedSymbol>,
     val references: List<PersistedSemanticIndexedReference>,
     val callEdges: List<PersistedSemanticCallEdge>,
@@ -172,6 +195,9 @@ private data class PersistedSemanticIndexCache(
                     resultType = symbol.resultType,
                     parameterCount = symbol.parameterCount,
                     supertypes = symbol.supertypes,
+                    parameters = symbol.parameters,
+                    enumEntries = symbol.enumEntries,
+                    enumValue = symbol.enumValue,
                 )
             },
             references = references.map { reference ->
@@ -191,6 +217,12 @@ private data class PersistedSemanticIndexCache(
                     path = Path.of(edge.path),
                 )
             },
+        )
+
+    fun toEntry(): SemanticIndexCacheEntry =
+        SemanticIndexCacheEntry(
+            index = toWorkspaceIndex(),
+            fileContentHashes = fileContentHashes,
         )
 }
 
@@ -214,6 +246,9 @@ private data class PersistedSemanticIndexedSymbol(
     val resultType: String?,
     val parameterCount: Int,
     val supertypes: List<String>,
+    val parameters: List<IndexedParameter> = emptyList(),
+    val enumEntries: List<IndexedEnumEntry> = emptyList(),
+    val enumValue: IndexedEnumEntry? = null,
 )
 
 private data class PersistedSemanticIndexedReference(

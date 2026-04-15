@@ -15,7 +15,9 @@ import kotlin.reflect.jvm.kotlinFunction
 import kotlin.io.path.extension
 import kotlin.io.path.isRegularFile
 
-class BinaryClasspathSymbolIndexer {
+class BinaryClasspathSymbolIndexer(
+    private val runtimeSourceMirror: RuntimeClassSourceMirror = RuntimeClassSourceMirror(),
+) {
     fun index(
         jar: Path,
         moduleName: String,
@@ -37,22 +39,47 @@ class BinaryClasspathSymbolIndexer {
                     .flatMap { className ->
                         val runtimeClass = runCatching { Class.forName(className, false, classLoader) }.getOrNull()
                             ?: return@flatMap emptySequence<IndexedSymbol>()
-                        buildSymbols(normalizedJar, moduleName, runtimeClass).asSequence()
+                        buildSymbols(
+                            moduleName = moduleName,
+                            runtimeClass = runtimeClass,
+                            classPath = syntheticPath(normalizedJar, runtimeClass.name),
+                            classUri = syntheticUri(normalizedJar, runtimeClass.name),
+                        ).asSequence()
                     }
                     .toList()
             }
         }
     }
 
+    fun indexRuntimeClasses(
+        originPath: Path,
+        moduleName: String,
+        classNames: Sequence<String>,
+    ): List<IndexedSymbol> {
+        val classLoader = ClassLoader.getPlatformClassLoader()
+        return classNames
+            .flatMap { className ->
+                val runtimeClass = runCatching { Class.forName(className, false, classLoader) }.getOrNull()
+                    ?: return@flatMap emptySequence<IndexedSymbol>()
+                val mirroredSource = runCatching { runtimeSourceMirror.materialize(runtimeClass) }.getOrNull()
+                buildSymbols(
+                    moduleName = moduleName,
+                    runtimeClass = runtimeClass,
+                    classPath = mirroredSource ?: runtimePath(originPath, runtimeClass.name),
+                    classUri = mirroredSource?.toUri()?.toString() ?: runtimeUri(runtimeClass),
+                ).asSequence()
+            }
+            .toList()
+    }
+
     private fun buildSymbols(
-        jar: Path,
         moduleName: String,
         runtimeClass: Class<*>,
+        classPath: Path,
+        classUri: String,
     ): List<IndexedSymbol> {
         if (!Modifier.isPublic(runtimeClass.modifiers) && !runtimeClass.isEnum) return emptyList()
         val packageName = runtimeClass.packageName.orEmpty()
-        val classPath = syntheticPath(jar, runtimeClass.name)
-        val classUri = syntheticUri(jar, runtimeClass.name)
         val classFqName = runtimeClass.name.replace('$', '.')
         val classSymbol = IndexedSymbol(
             id = "binary::$classFqName",
@@ -77,16 +104,26 @@ class BinaryClasspathSymbolIndexer {
                 runtimeClass.superclass?.name?.replace('$', '.')?.let(::add)
                 runtimeClass.interfaces.map { it.name.replace('$', '.') }.forEach(::add)
             },
+            enumEntries = runtimeClass.enumConstants
+                ?.mapNotNull { constant ->
+                    (constant as? Enum<*>)?.let { enumValue ->
+                        IndexedEnumEntry(
+                            name = enumValue.name,
+                            stringValue = enumValue.toString(),
+                        )
+                    }
+                }
+                .orEmpty(),
         )
         val constructorSymbols = runtimeClass.constructors
             .asSequence()
             .filter { Modifier.isPublic(it.modifiers) }
-            .mapIndexed { index, constructor -> constructorSymbol(jar, moduleName, runtimeClass, constructor, index) }
+            .mapIndexed { index, constructor -> constructorSymbol(moduleName, runtimeClass, constructor, index, classPath, classUri) }
             .toList()
         val fieldSymbols = runtimeClass.fields
             .asSequence()
             .filter { field -> Modifier.isPublic(field.modifiers) && !field.isSynthetic }
-            .map { field -> fieldSymbol(jar, moduleName, runtimeClass, field) }
+            .map { field -> fieldSymbol(moduleName, runtimeClass, field, classPath, classUri) }
             .toList()
         val methodSymbols = runtimeClass.methods
             .asSequence()
@@ -95,27 +132,32 @@ class BinaryClasspathSymbolIndexer {
                     !method.isSynthetic &&
                     method.declaringClass != Any::class.java
             }
-            .map { method -> methodSymbol(jar, moduleName, runtimeClass, method) }
+            .map { method -> methodSymbol(moduleName, runtimeClass, method, classPath, classUri) }
             .toList()
         return listOf(classSymbol) + constructorSymbols + fieldSymbols + methodSymbols
     }
 
     private fun constructorSymbol(
-        jar: Path,
         moduleName: String,
         runtimeClass: Class<*>,
         constructor: Constructor<*>,
         index: Int,
+        classPath: Path,
+        classUri: String,
     ): IndexedSymbol {
         val ownerFqName = runtimeClass.name.replace('$', '.')
         val ownerName = runtimeClass.simpleName.ifBlank { ownerFqName.substringAfterLast('.') }
+        val kotlinValueParameters = runCatching {
+            constructor.kotlinFunction?.parameters
+                ?.filter { kotlinParameter -> kotlinParameter.kind.name == "VALUE" }
+        }.getOrNull()
         return IndexedSymbol(
             id = "binary::$ownerFqName#<init>/$index",
             name = ownerName,
             fqName = ownerFqName,
             kind = SymbolKind.CONSTRUCTOR,
-            path = syntheticPath(jar, ownerFqName),
-            uri = syntheticUri(jar, ownerFqName),
+            path = classPath,
+            uri = classUri,
             range = ZERO_RANGE,
             selectionRange = ZERO_RANGE,
             containerName = ownerName,
@@ -132,14 +174,28 @@ class BinaryClasspathSymbolIndexer {
             importable = false,
             resultType = ownerFqName,
             parameterCount = constructor.parameterCount,
+            parameters = constructor.parameters.mapIndexed { index, parameter ->
+                IndexedParameter(
+                    name = kotlinValueParameters
+                        ?.getOrNull(index)
+                        ?.name
+                        ?: parameter.name.takeUnless { it.isNullOrBlank() }
+                        ?: "arg${index + 1}",
+                    type = constructor.genericParameterTypes.getOrNull(index)?.typeName?.normalizeBinaryType()
+                        ?: parameter.type.typeName.normalizeBinaryType(),
+                    isVararg = constructor.isVarArgs && index == constructor.parameterCount - 1,
+                    isNullable = false,
+                )
+            },
         )
     }
 
     private fun fieldSymbol(
-        jar: Path,
         moduleName: String,
         runtimeClass: Class<*>,
         field: Field,
+        classPath: Path,
+        classUri: String,
     ): IndexedSymbol {
         val ownerFqName = runtimeClass.name.replace('$', '.')
         val ownerName = runtimeClass.simpleName.ifBlank { ownerFqName.substringAfterLast('.') }
@@ -147,9 +203,9 @@ class BinaryClasspathSymbolIndexer {
             id = "binary::$ownerFqName#field:${field.name}",
             name = field.name,
             fqName = "$ownerFqName.${field.name}",
-            kind = SymbolKind.PROPERTY,
-            path = syntheticPath(jar, ownerFqName),
-            uri = syntheticUri(jar, ownerFqName),
+            kind = if (field.isEnumConstant) SymbolKind.ENUM_MEMBER else SymbolKind.PROPERTY,
+            path = classPath,
+            uri = classUri,
             range = ZERO_RANGE,
             selectionRange = ZERO_RANGE,
             containerName = ownerName,
@@ -160,14 +216,24 @@ class BinaryClasspathSymbolIndexer {
             moduleName = moduleName,
             importable = false,
             resultType = field.type.typeName.normalizeBinaryType(),
+            enumValue = field.takeIf { it.isEnumConstant }
+                ?.runCatching { get(null) as? Enum<*> }
+                ?.getOrNull()
+                ?.let { enumValue ->
+                    IndexedEnumEntry(
+                        name = enumValue.name,
+                        stringValue = enumValue.toString(),
+                    )
+                },
         )
     }
 
     private fun methodSymbol(
-        jar: Path,
         moduleName: String,
         runtimeClass: Class<*>,
         method: Method,
+        classPath: Path,
+        classUri: String,
     ): IndexedSymbol {
         val ownerFqName = runtimeClass.name.replace('$', '.')
         val ownerName = runtimeClass.simpleName.ifBlank { ownerFqName.substringAfterLast('.') }
@@ -192,8 +258,8 @@ class BinaryClasspathSymbolIndexer {
             name = method.name,
             fqName = fqName,
             kind = SymbolKind.FUNCTION,
-            path = syntheticPath(jar, ownerFqName),
-            uri = syntheticUri(jar, ownerFqName),
+            path = classPath,
+            uri = classUri,
             range = ZERO_RANGE,
             selectionRange = ZERO_RANGE,
             containerName = if (topLevelImportable) null else ownerName,
@@ -212,6 +278,20 @@ class BinaryClasspathSymbolIndexer {
             receiverType = receiverType,
             resultType = method.genericReturnType.typeName.normalizeBinaryType(),
             parameterCount = method.parameterCount,
+            parameters = method.parameters.mapIndexed { index, parameter ->
+                IndexedParameter(
+                    name = kotlinFunction?.parameters
+                        ?.filter { kotlinParameter -> kotlinParameter.kind.name == "VALUE" }
+                        ?.getOrNull(index)
+                        ?.name
+                        ?: parameter.name.takeUnless { it.isNullOrBlank() }
+                        ?: "arg${index + 1}",
+                    type = method.genericParameterTypes.getOrNull(index)?.typeName?.normalizeBinaryType()
+                        ?: parameter.type.typeName.normalizeBinaryType(),
+                    isVararg = method.isVarArgs && index == method.parameterCount - 1,
+                    isNullable = false,
+                )
+            },
         )
     }
 
@@ -232,6 +312,12 @@ class BinaryClasspathSymbolIndexer {
 
     private fun syntheticUri(jar: Path, className: String): String =
         "jar:${jar.toUri()}!/${className.replace('.', '/')}.class"
+
+    private fun runtimePath(originPath: Path, className: String): Path =
+        originPath.resolve(className.replace('.', '/') + ".class")
+
+    private fun runtimeUri(runtimeClass: Class<*>): String =
+        "jrt:/${runtimeClass.module?.name ?: "java.base"}/${runtimeClass.name.replace('.', '/')}.class"
 
     private fun indexableClassName(className: String): Boolean =
         className != "module-info" &&

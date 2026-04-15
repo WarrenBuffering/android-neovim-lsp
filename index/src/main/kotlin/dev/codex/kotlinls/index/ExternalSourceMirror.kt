@@ -1,9 +1,9 @@
 package dev.codex.kotlinls.index
 
+import dev.codex.kotlinls.projectimport.StableArtifactFingerprint
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.security.MessageDigest
 import java.util.jar.JarFile
 import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
@@ -40,11 +40,8 @@ class ExternalSourceMirror(
         val attributes = buildString {
             append(sourceJar.toAbsolutePath())
             append(':')
-            append(runCatching { Files.size(sourceJar) }.getOrDefault(0L))
-            append(':')
-            append(runCatching { Files.getLastModifiedTime(sourceJar).toMillis() }.getOrDefault(0L))
+            append(StableArtifactFingerprint.fingerprint(sourceJar))
         }
-        val digest = MessageDigest.getInstance("SHA-256").digest(attributes.toByteArray())
-        return digest.joinToString("") { "%02x".format(it) }.take(16) + "-" + sourceJar.name
+        return attributes.hashCode().toUInt().toString(16) + "-" + sourceJar.name
     }
 }

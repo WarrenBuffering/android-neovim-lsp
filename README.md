@@ -12,12 +12,11 @@ User-facing names:
 - a standalone stdio language server executable
 - Gradle-first Kotlin/Android project import
 - local workspace and library indexing
-- Neovim runtime files in [`nvim/`](nvim/)
-- a LazyVim example in [`lazyvim_example/`](lazyvim_example/)
+- a plugin entrypoint that can be loaded with `require("android_neovim_lsp").setup()`
 
 ## Install
 
-### Release Installer
+### Release Install
 
 For macOS and Linux, the quickest install path is:
 
@@ -39,37 +38,51 @@ ANDROID_NEOVIM_LSP_INSTALL_ROOT=/some/path \
 curl -fsSL https://raw.githubusercontent.com/WarrenBuffering/android-neovim-lsp/main/packaging/install-release.sh | bash
 ```
 
-### Build From Source
+After that, the minimal Neovim setup is just:
 
-Build the installable server:
-
-```bash
-./gradlew :server:installDist
+```lua
+vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
+require("android_neovim_lsp").setup()
 ```
 
-The launcher is created at:
+If you installed with the release script, you do not need to set `cmd` manually.
+
+### Local Dev Install
+
+If you are working from a checkout and want the same layout as a consumer install:
 
 ```bash
-./server/build/install/server/bin/android-neovim-lsp
+./packaging/install-local-dev.sh
 ```
 
-Build a local distributable bundle:
+That:
+
+- builds the local server
+- installs the bundle into `~/.local/share/android-neovim-lsp`
+- makes `android-neovim-lsp` available from `~/.local/bin`
+
+For repo-local testing:
 
 ```bash
-./packaging/build-package.sh
+nvim -u "$PWD/nvim/init.lua"
 ```
 
-Build a bridge-enabled bundle:
+That entrypoint intentionally exercises the same runtime path and setup flow a real user install sees.
 
-```bash
-ENABLE_JETBRAINS_BRIDGE=1 ./packaging/build-package.sh
-```
+## Requirements
 
-Refresh dependency lockfiles:
+- Java 21 available via `java` on `PATH` or `JAVA_HOME`
+- for Android projects, an Android SDK available via `local.properties`, `ANDROID_SDK_ROOT`, or `ANDROID_HOME`
+- Android Studio is optional, but recommended for bridge-backed semantic and formatting features
 
-```bash
-./gradlew --write-locks resolveAndLockAll
-```
+You can keep project-local machine paths in `local.properties` and keep them out of git. Start from [`local.properties.example`](local.properties.example).
+
+Useful keys:
+
+- `sdk.dir=/Users/yourname/Library/Android/sdk`
+- `kotlinls.intellijHome=/Applications/Android Studio.app/Contents`
+
+Core project import, indexing, and fast diagnostics run inside `android-neovim-lsp` itself. The JetBrains bridge is still used for some higher-parity semantic requests and JetBrains formatting when it is available.
 
 ## Neovim Setup
 
@@ -77,6 +90,25 @@ Minimal setup:
 
 ```lua
 vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
+require("android_neovim_lsp").setup()
+```
+
+If you use `lazy.nvim` or LazyVim, the normal plugin shape is:
+
+```lua
+return {
+  {
+    "WarrenBuffering/android-neovim-lsp",
+    main = "android_neovim_lsp",
+    dependencies = { "neovim/nvim-lspconfig" },
+    opts = {},
+  },
+}
+```
+
+The intended consumer experience is that users only need the plugin declaration plus:
+
+```lua
 require("android_neovim_lsp").setup()
 ```
 
@@ -89,25 +121,17 @@ The plugin looks for the server in this order:
 If you want to set `cmd` explicitly:
 
 ```lua
-local android_lsp_cmd = "/absolute/path/to/android-neovim-lsp/server/build/install/server/bin/android-neovim-lsp"
+local repo_root = vim.fn.getcwd()
+local android_lsp_cmd = repo_root .. "/server/build/install/server/bin/android-neovim-lsp"
 
-vim.opt.runtimepath:append("/absolute/path/to/android-neovim-lsp/nvim")
+vim.opt.runtimepath:append(repo_root .. "/nvim")
 
 require("android_neovim_lsp").setup({
   cmd = { android_lsp_cmd },
 })
 ```
 
-For local testing that matches the consumer install layout, run:
-
-```bash
-./packaging/install-local-dev.sh
-nvim -u /absolute/path/to/android-neovim-lsp/nvim/init.lua
-```
-
-That refreshes `~/.local/share/android-neovim-lsp` from your current checkout and keeps `nvim/init.lua` loading the installed runtime instead of the repo copy.
-
-That test entrypoint also bootstraps `lazy.nvim` and `nvim-lspconfig`, so it exercises a consumer-style plugin setup instead of depending on your existing editor config.
+The repo's [`nvim/init.lua`](nvim/init.lua) also bootstraps `lazy.nvim` and `nvim-lspconfig`, so `nvim -u "$PWD/nvim/init.lua"` exercises a consumer-style setup instead of depending on your existing editor config.
 
 The built-in root detection looks for:
 
@@ -126,17 +150,20 @@ return {
   {
     dir = vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"),
     name = "android-neovim-lsp",
+    main = "android_neovim_lsp",
     dependencies = { "neovim/nvim-lspconfig" },
-    config = function()
-      require("android_neovim_lsp").setup({
-      })
-    end,
+    opts = {},
   },
 }
 ```
 
 Use `require("android_neovim_lsp")`. The older `require("kotlin_neovim_lsp")` name is no longer valid.
 When the plugin is loaded from the installed bundle, you can omit `cmd` and let it auto-detect the sibling launcher.
+
+Useful plugin options:
+
+- `inlay_hints = false`
+- `format_on_save = true`
 
 ### Format On Save
 
@@ -155,6 +182,24 @@ This repo is not currently published to Mason. Until it is, users need either:
 
 - `android-neovim-lsp` on `PATH`
 - or a bundled release/package layout that keeps `nvim/` next to the installed server directory
+
+## Developer Notes
+
+For local development, install the repo into the same on-disk layout a normal user would run:
+
+```bash
+./packaging/install-local-dev.sh
+```
+
+That builds the local server, installs the bundle into `~/.local/share/android-neovim-lsp`, and refreshes the `android-neovim-lsp` launcher in `~/.local/bin`.
+
+For repo-local testing:
+
+```bash
+nvim -u "$PWD/nvim/init.lua"
+```
+
+That entrypoint is meant to exercise a consumer-style setup path rather than depend on your existing Neovim config.
 
 ## Project Layout
 
@@ -186,3 +231,7 @@ fun main() {
     runStdioKotlinLanguageServer()
 }
 ```
+
+## License
+
+This repository is licensed under BSD Zero Clause License. See [`LICENSE`](LICENSE).

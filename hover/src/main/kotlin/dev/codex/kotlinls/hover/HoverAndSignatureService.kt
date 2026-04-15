@@ -4,6 +4,7 @@ import dev.codex.kotlinls.analysis.WorkspaceAnalysisSnapshot
 import dev.codex.kotlinls.index.SourceIndexLookup
 import dev.codex.kotlinls.index.SymbolResolver
 import dev.codex.kotlinls.index.WorkspaceIndex
+import dev.codex.kotlinls.index.indexedSymbolMarkdown
 import dev.codex.kotlinls.protocol.Hover
 import dev.codex.kotlinls.protocol.InlayHint
 import dev.codex.kotlinls.protocol.InlayHintParams
@@ -44,13 +45,7 @@ class HoverAndSignatureService(
         val markdown = buildString {
             when {
                 symbol != null -> {
-                    appendLine("```kotlin")
-                    appendLine(symbol.signature)
-                    appendLine("```")
-                    if (!symbol.documentation.isNullOrBlank()) {
-                        appendLine()
-                        appendLine(symbol.documentation)
-                    }
+                    appendLine(indexedSymbolMarkdown(symbol))
                 }
 
                 descriptor != null -> {
@@ -80,15 +75,7 @@ class HoverAndSignatureService(
         params: TextDocumentPositionParams,
     ): Hover? {
         val symbol = SourceIndexLookup.resolveSymbol(index, path, text, params.position) ?: return null
-        val markdown = buildString {
-            appendLine("```kotlin")
-            appendLine(symbol.signature)
-            appendLine("```")
-            if (!symbol.documentation.isNullOrBlank()) {
-                appendLine()
-                appendLine(symbol.documentation)
-            }
-        }
+        val markdown = indexedSymbolMarkdown(symbol)
         return Hover(MarkupContent(kind = "markdown", value = markdown.trim()))
     }
 
