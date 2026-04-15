@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import dev.codex.kotlinls.protocol.IntellijHomeLocator
+import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Locale
@@ -38,7 +39,7 @@ class JetBrainsFormatterBridge private constructor(
                 add("-Didea.log.path=${sandboxRoot.resolve("log")}")
                 add("-Djava.awt.headless=true")
                 add("-cp")
-                add(classpath.joinToString(":"))
+                add(classpath.joinToString(File.pathSeparator))
                 add(mainClass)
                 add("format")
                 add("-allowDefaults")
@@ -92,14 +93,12 @@ class JetBrainsFormatterBridge private constructor(
                     if (Files.isDirectory(nested)) nested else ideaHome
                 }
             }.normalize()
-            val productInfoPath = normalizedHome.resolve("Resources/product-info.json")
-            if (!Files.isRegularFile(productInfoPath)) return null
+            val productInfoPath = resolveProductInfoPath(normalizedHome) ?: return null
             val productInfo = runCatching { mapper.readValue<ProductInfo>(productInfoPath.toFile()) }.getOrNull() ?: return null
             val launch = productInfo.launch.firstOrNull { candidate ->
                 candidate.os == currentOsName() && candidate.arch.equals(currentArchName(), ignoreCase = true)
             } ?: return null
-            val javaBinary = normalizedHome.resolve("jbr/Contents/Home/bin/java")
-            if (!Files.isRegularFile(javaBinary)) return null
+            val javaBinary = resolveJavaBinary(normalizedHome) ?: return null
             val vmOptionsPath = resolveResourcePath(productInfoPath, launch.vmOptionsFilePath)
             if (!Files.isRegularFile(vmOptionsPath)) return null
             val appPackage = if (normalizedHome.name == "Contents") normalizedHome.parent else normalizedHome
@@ -154,6 +153,19 @@ class JetBrainsFormatterBridge private constructor(
                 else -> arch
             }
 
+        private fun resolveProductInfoPath(ideaHome: Path): Path? =
+            listOf(
+                ideaHome.resolve("Resources/product-info.json"),
+                ideaHome.resolve("product-info.json"),
+            ).firstOrNull(Files::isRegularFile)
+
+        private fun resolveJavaBinary(ideaHome: Path): Path? =
+            listOf(
+                ideaHome.resolve("jbr/Contents/Home/bin/java"),
+                ideaHome.resolve("jbr/bin/java"),
+                ideaHome.resolve("jbr/bin/java.exe"),
+            ).firstOrNull(Files::isRegularFile)
+
         private fun resolveResourcePath(productInfoPath: Path, relativePath: String): Path =
             productInfoPath.parent.resolve(relativePath).normalize()
 
@@ -168,11 +180,25 @@ class JetBrainsFormatterBridge private constructor(
         }
 
         private fun commonIdeaHomes(): List<Path> =
-            listOf(
-                Path.of("/Applications/Android Studio.app/Contents"),
-                Path.of("/Applications/IntelliJ IDEA.app/Contents"),
-                Path.of("/Applications/IntelliJ IDEA CE.app/Contents"),
-            )
+            when (currentOsName()) {
+                "macOS" -> listOf(
+                    Path.of("/Applications/Android Studio.app/Contents"),
+                    Path.of("/Applications/IntelliJ IDEA.app/Contents"),
+                    Path.of("/Applications/IntelliJ IDEA CE.app/Contents"),
+                )
+                "linux" -> listOf(
+                    Path.of("/opt/android-studio"),
+                    Path.of("/opt/android-studio-community"),
+                    Path.of("/opt/idea"),
+                    Path.of("/opt/idea-IU"),
+                    Path.of("/opt/idea-IC"),
+                    Path.of(System.getProperty("user.home"), "android-studio"),
+                    Path.of(System.getProperty("user.home"), ".local", "share", "JetBrains", "Toolbox", "apps", "AndroidStudio"),
+                    Path.of(System.getProperty("user.home"), ".local", "share", "JetBrains", "Toolbox", "apps", "IDEA-U"),
+                    Path.of(System.getProperty("user.home"), ".local", "share", "JetBrains", "Toolbox", "apps", "IDEA-C"),
+                )
+                else -> emptyList()
+            }
     }
 }
 
