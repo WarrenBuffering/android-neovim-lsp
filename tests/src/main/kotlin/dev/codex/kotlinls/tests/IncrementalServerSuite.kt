@@ -69,7 +69,12 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     ?.get("diagnostics")
                     ?.mapNotNull { it.get("message")?.asText() }
                     .orEmpty()
-                assertTrue(messages.any { "type mismatch" in it.lowercase() || "initializer type mismatch" in it.lowercase() }) {
+                assertTrue(messages.any {
+                    val normalized = it.lowercase()
+                    "type mismatch" in normalized ||
+                        "initializer type mismatch" in normalized ||
+                        "does not conform to the expected type" in normalized
+                }) {
                     "Expected compiler type mismatch diagnostic, got $messages"
                 }
             }

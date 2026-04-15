@@ -1,5 +1,6 @@
 package dev.codex.kotlinls.tests
 
+import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.index.CallEdge
 import dev.codex.kotlinls.index.BinaryClasspathSymbolIndexer
 import dev.codex.kotlinls.index.IndexedReference
@@ -11,9 +12,11 @@ import dev.codex.kotlinls.index.RuntimeClassSourceMirror
 import dev.codex.kotlinls.index.SupportSymbolIndexBuilder
 import dev.codex.kotlinls.index.SupportSymbolLayer
 import dev.codex.kotlinls.index.WorkspaceIndex
+import dev.codex.kotlinls.index.WorkspaceIndexBuilder
 import dev.codex.kotlinls.projectimport.CompilerOptions
 import dev.codex.kotlinls.projectimport.ImportedModule
 import dev.codex.kotlinls.projectimport.ImportedProject
+import dev.codex.kotlinls.projectimport.GradleProjectImporter
 import dev.codex.kotlinls.protocol.Json
 import dev.codex.kotlinls.protocol.JsonRpcInboundMessage
 import dev.codex.kotlinls.protocol.JsonRpcTransport
@@ -24,6 +27,8 @@ import dev.codex.kotlinls.server.KotlinLanguageServer
 import dev.codex.kotlinls.workspace.TextDocumentStore
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import java.net.URI
@@ -31,6 +36,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.attribute.FileTime
+import java.security.MessageDigest
 import kotlin.concurrent.thread
 import kotlin.io.path.createDirectories
 import kotlin.io.path.readText
@@ -457,35 +463,9 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
         },
         TestCase("skips foreground semantic analysis for unchanged files when warm semantic cache exists") {
             val projectRoot = createSemanticPersistenceFixture()
-            val callerFile = projectRoot.resolve("app/src/main/kotlin/demo/app/Caller.kt")
             val calleeFile = projectRoot.resolve("app/src/main/kotlin/demo/app/Callee.kt")
             val cacheRoot = Files.createTempDirectory("kotlinls-semantic-open-cache")
-
-            withRunningServer(
-                serverFactory = { transport ->
-                    KotlinLanguageServer(
-                        transport = transport,
-                        semanticIndexCache = PersistentSemanticIndexCache(cacheRoot),
-                        refreshDebounceMillis = 0L,
-                        warmupStartDelayMillis = 0L,
-                    )
-                },
-            ) { server ->
-                initializeServer(server, projectRoot, initializationOptions = emptyMap())
-                openDocument(server, callerFile)
-                readUntil(server.reader, maxMessages = 120) { diagnosticUri(it) == callerFile.toUri().toString() }
-
-                val cached = waitForSemanticCacheEntry(
-                    cache = PersistentSemanticIndexCache(cacheRoot),
-                    projectRoot = projectRoot,
-                    moduleGradlePath = ":app",
-                )
-                assertTrue(cached != null) { "Expected background warmup to persist a semantic cache entry" }
-                val cachedUris = cached?.fileContentHashes?.keys.orEmpty()
-                assertTrue(callerFile.toUri().toString() in cachedUris && calleeFile.toUri().toString() in cachedUris) {
-                    "Expected warm semantic cache to capture both module files, got $cachedUris"
-                }
-            }
+            seedSemanticCache(projectRoot, cacheRoot, ":app")
 
             withRunningServer(
                 serverFactory = { transport ->
@@ -509,6 +489,107 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
                 assertTrue(!sawSemanticAnalysis) {
                     "Expected unchanged open file to reuse warm semantic cache without foreground semantic analysis"
                 }
+            }
+        },
+        TestCase("warms semantic caches for the full project in background on first startup") {
+            val projectRoot = createSemanticPersistenceMultiModuleFixture()
+            val cacheRoot = Files.createTempDirectory("kotlinls-semantic-full-project-cache")
+            val cache = PersistentSemanticIndexCache(cacheRoot)
+
+            withRunningServer(
+                serverFactory = { transport ->
+                    KotlinLanguageServer(
+                        transport = transport,
+                        semanticIndexCache = cache,
+                        refreshDebounceMillis = 0L,
+                        warmupStartDelayMillis = 0L,
+                    )
+                },
+            ) { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf(
+                            "mode" to "off",
+                        ),
+                    ),
+                )
+
+                val appCached = waitForSemanticCacheEntry(cache, projectRoot, ":app")
+                val libCached = waitForSemanticCacheEntry(cache, projectRoot, ":lib")
+                val toolsCached = waitForSemanticCacheEntry(cache, projectRoot, ":tools")
+
+                assertTrue(appCached != null) { "Expected startup warmup to cache the app module" }
+                assertTrue(libCached != null) { "Expected startup warmup to cache the library module" }
+                assertTrue(toolsCached != null) { "Expected startup warmup to cache unrelated modules across the whole project" }
+            }
+        },
+        TestCase("skips full-project background warmup when semantic cache fingerprints still match") {
+            val projectRoot = createSemanticPersistenceMultiModuleFixture()
+            val cacheRoot = Files.createTempDirectory("kotlinls-semantic-skip-rewarm-cache")
+            val cache = PersistentSemanticIndexCache(cacheRoot)
+
+            withRunningServer(
+                serverFactory = { transport ->
+                    KotlinLanguageServer(
+                        transport = transport,
+                        semanticIndexCache = cache,
+                        refreshDebounceMillis = 0L,
+                        warmupStartDelayMillis = 0L,
+                    )
+                },
+            ) { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf(
+                            "mode" to "off",
+                        ),
+                    ),
+                )
+                assertTrue(waitForSemanticCacheEntry(cache, projectRoot, ":app") != null) {
+                    "Expected initial startup warmup to populate the app cache"
+                }
+                assertTrue(waitForSemanticCacheEntry(cache, projectRoot, ":lib") != null) {
+                    "Expected initial startup warmup to populate the library cache"
+                }
+                assertTrue(waitForSemanticCacheEntry(cache, projectRoot, ":tools") != null) {
+                    "Expected initial startup warmup to populate the tools cache"
+                }
+            }
+
+            val timestampsBefore = semanticCacheFileTimestamps(cacheRoot)
+            assertTrue(timestampsBefore.isNotEmpty()) { "Expected semantic cache files after initial warmup" }
+
+            Thread.sleep(250)
+
+            withRunningServer(
+                serverFactory = { transport ->
+                    KotlinLanguageServer(
+                        transport = transport,
+                        semanticIndexCache = cache,
+                        refreshDebounceMillis = 0L,
+                        warmupStartDelayMillis = 0L,
+                    )
+                },
+            ) { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf(
+                            "mode" to "off",
+                        ),
+                    ),
+                )
+                Thread.sleep(1_500)
+            }
+
+            val timestampsAfter = semanticCacheFileTimestamps(cacheRoot)
+            assertEquals(timestampsBefore, timestampsAfter) {
+                "Expected validated semantic caches to skip whole-project background rewrites on the next launch"
             }
         },
     ),
@@ -652,6 +733,116 @@ private fun createSemanticPersistenceFixture(): Path {
     return root
 }
 
+private fun createSemanticPersistenceMultiModuleFixture(): Path {
+    val root = Files.createTempDirectory("kotlinls-semantic-persist-multi")
+    root.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "semantic-persist-multi"
+        include(":app")
+        include(":lib")
+        include(":tools")
+        """.trimIndent() + "\n",
+    )
+
+    root.resolve("app/build.gradle.kts").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            plugins {
+                kotlin("jvm")
+            }
+
+            repositories {
+                mavenCentral()
+            }
+
+            dependencies {
+                implementation(project(":lib"))
+            }
+
+            kotlin {
+                jvmToolchain(21)
+            }
+            """.trimIndent() + "\n",
+        )
+    }
+
+    root.resolve("lib/build.gradle.kts").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            plugins {
+                kotlin("jvm")
+            }
+
+            repositories {
+                mavenCentral()
+            }
+
+            kotlin {
+                jvmToolchain(21)
+            }
+            """.trimIndent() + "\n",
+        )
+    }
+
+    root.resolve("tools/build.gradle.kts").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            plugins {
+                kotlin("jvm")
+            }
+
+            repositories {
+                mavenCentral()
+            }
+
+            kotlin {
+                jvmToolchain(21)
+            }
+            """.trimIndent() + "\n",
+        )
+    }
+
+    root.resolve("app/src/main/kotlin/demo/app/AppEntry.kt").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            package demo.app
+
+            import demo.lib.sharedGreeting
+
+            fun appEntry(): String = sharedGreeting()
+            """.trimIndent() + "\n",
+        )
+    }
+
+    root.resolve("lib/src/main/kotlin/demo/lib/SharedGreeting.kt").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            package demo.lib
+
+            fun sharedGreeting(): String = "hello"
+            """.trimIndent() + "\n",
+        )
+    }
+
+    root.resolve("tools/src/main/kotlin/demo/tools/Tooling.kt").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            package demo.tools
+
+            fun toolingVersion(): String = "1.0"
+            """.trimIndent() + "\n",
+        )
+    }
+
+    return root
+}
+
 private fun writePayload(output: PipedOutputStream, payload: Any) {
     val bytes = Json.mapper.writeValueAsBytes(payload)
     val header = "Content-Length: ${bytes.size}\r\n\r\n".toByteArray(StandardCharsets.UTF_8)
@@ -689,7 +880,7 @@ private fun waitForSemanticCacheEntry(
     cache: PersistentSemanticIndexCache,
     projectRoot: Path,
     moduleGradlePath: String,
-    timeoutMillis: Long = 5_000L,
+    timeoutMillis: Long = 20_000L,
 ): dev.codex.kotlinls.index.SemanticIndexCacheEntry? {
     val deadline = System.currentTimeMillis() + timeoutMillis
     while (System.currentTimeMillis() < deadline) {
@@ -700,6 +891,58 @@ private fun waitForSemanticCacheEntry(
     }
     return null
 }
+
+private fun seedSemanticCache(
+    projectRoot: Path,
+    cacheRoot: Path,
+    moduleGradlePath: String,
+) {
+    val importer = GradleProjectImporter()
+    val analyzer = KotlinWorkspaceAnalyzer()
+    val indexBuilder = WorkspaceIndexBuilder()
+    val cache = PersistentSemanticIndexCache(cacheRoot)
+    val project = importer.importProject(projectRoot)
+    val module = requireNotNull(project.modulesByGradlePath[moduleGradlePath]) {
+        "Expected imported project to contain $moduleGradlePath"
+    }
+    val snapshot = analyzer.analyze(project.subsetForModules(listOf(module)), TextDocumentStore())
+    try {
+        val index = indexBuilder.build(snapshot)
+        val fileContentHashes = snapshot.files.associate { file -> file.uri to sha256(file.text) }
+        cache.save(
+            projectRoot = projectRoot,
+            moduleGradlePath = moduleGradlePath,
+            fingerprint = semanticModuleFingerprint(module),
+            index = index,
+            fileContentHashes = fileContentHashes,
+        )
+    } finally {
+        snapshot.close()
+    }
+}
+
+private fun semanticModuleFingerprint(module: ImportedModule): String {
+    val transport = JsonRpcTransport(
+        BufferedInputStream(ByteArrayInputStream(ByteArray(0))),
+        BufferedOutputStream(ByteArrayOutputStream()),
+    )
+    val server = KotlinLanguageServer(transport = transport)
+    val method = KotlinLanguageServer::class.java.getDeclaredMethod("fingerprintModule", ImportedModule::class.java)
+    method.isAccessible = true
+    return method.invoke(server, module) as String
+}
+
+private fun sha256(value: String): String =
+    MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray())
+        .joinToString("") { byte -> "%02x".format(byte) }
+
+private fun semanticCacheFileTimestamps(cacheRoot: Path): Map<String, Long> =
+    Files.walk(cacheRoot).use { paths ->
+        paths.iterator().asSequence()
+            .filter { Files.isRegularFile(it) && it.fileName.toString() == "semantic-index.json" }
+            .associate { path -> path.normalize().toString() to Files.getLastModifiedTime(path).toMillis() }
+    }
 
 private fun supportLayerFingerprint(
     builder: SupportSymbolIndexBuilder,

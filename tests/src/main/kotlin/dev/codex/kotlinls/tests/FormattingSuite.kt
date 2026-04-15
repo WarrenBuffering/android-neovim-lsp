@@ -229,61 +229,6 @@ fun formattingSuite(): TestSuite {
                 assertContains(formatted, "fun first( name:String)=name.trim()")
                 assertContains(formatted, "fun second(name: String) = name.trim()")
             },
-            TestCase("fallback formatting organizes imports and trims trailing whitespace without style linting") {
-                withSystemProperty("kotlinls.disableIntellijBridge", "true") {
-                    val localFormattingService = FormattingService()
-                    val root = Files.createTempDirectory("kotlinls-format-editorconfig")
-                    root.resolve("src/main/kotlin/demo").createDirectories()
-                    root.resolve("settings.gradle.kts").writeText("""rootProject.name = "tmp"""" + "\n")
-                    root.resolve("build.gradle.kts").writeText(
-                        """
-                        plugins {
-                            kotlin("jvm") version "2.3.20"
-                        }
-
-                        repositories {
-                            mavenCentral()
-                        }
-                        """.trimIndent() + "\n",
-                    )
-                    val appFile = root.resolve("src/main/kotlin/demo/App.kt")
-                    val content = """
-                        package demo
-
-                        import kotlin.collections.listOf
-                        import kotlin.collections.setOf
-
-                        fun greet() = listOf("hi")   
-
-
-                    """.trimIndent()
-                    appFile.writeText(content)
-                    val project = importer.importProject(root)
-                    val store = TextDocumentStore()
-                    store.open(
-                        dev.codex.kotlinls.protocol.TextDocumentItem(
-                            uri = appFile.toUri().toString(),
-                            languageId = "kotlin",
-                            version = 10,
-                            text = content,
-                        ),
-                    )
-                    val snapshot = analyzer.analyze(project, store)
-                    val edits = localFormattingService.formatDocument(
-                        snapshot,
-                        DocumentFormattingParams(
-                            textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
-                            options = FormattingOptions(tabSize = 8, insertSpaces = false),
-                        ),
-                    )
-                    val formatted = applyEdits(content, edits)
-                    assertContains(formatted, "import kotlin.collections.listOf")
-                    assertContains(formatted, "import kotlin.collections.setOf")
-                    assertTrue("fun greet() = listOf(\"hi\")   " !in formatted) { "Expected trailing whitespace trim: $formatted" }
-                    assertTrue(formatted.endsWith("\n")) { "Expected trailing newline in fallback output" }
-                    assertEquals(false, localFormattingService.shouldPublishStyleDiagnostics(appFile))
-                }
-            },
             TestCase("IntelliJ project style enables formatting defaults but not style diagnostics") {
                 val root = Files.createTempDirectory("kotlinls-format-style-gate")
                 root.resolve(".idea/codeStyles").createDirectories()

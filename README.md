@@ -2,10 +2,39 @@
 
 `android-neovim-lsp` is a Kotlin and Android language server for Neovim.
 
-Today it provides:
+## Quick Start
 
-- a standalone stdio server executable: `android-neovim-lsp`
-- a Neovim runtime module: `android_neovim_lsp`
+With `lazy.nvim` or LazyVim, this is enough:
+
+```lua
+return {
+  {
+    "WarrenBuffering/android-neovim-lsp",
+    main = "android_neovim_lsp",
+    dependencies = { "neovim/nvim-lspconfig" },
+    opts = {},
+  },
+}
+```
+
+If you are loading the installed runtime directly:
+
+```lua
+vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
+require("android_neovim_lsp").setup()
+```
+
+On first setup, the plugin looks for an existing `android-neovim-lsp` binary. If it cannot find one, it will:
+
+- build and install the server from the checkout when the full repo is available
+- otherwise fall back to the release installer path
+
+If you do not want that behavior, set `install = false` in `opts` and provide `cmd` yourself.
+
+## Overview
+
+- standalone stdio server executable: `android-neovim-lsp`
+- Neovim runtime module: `android_neovim_lsp`
 - Gradle-aware Kotlin and Android project import
 - local workspace and dependency indexing for fast completion, hover, and navigation
 - Android Studio bridge support for diagnostics, formatting, and higher-parity semantic requests
@@ -25,58 +54,7 @@ sdk.dir=/Users/yourname/Library/Android/sdk
 kotlinls.intellijHome=/Applications/Android Studio.app/Contents
 ```
 
-## Quick Start
-
-With `lazy.nvim` or LazyVim, this is enough:
-
-```lua
-return {
-  {
-    "WarrenBuffering/android-neovim-lsp",
-    main = "android_neovim_lsp",
-    dependencies = { "neovim/nvim-lspconfig" },
-    opts = {},
-  },
-}
-```
-
-On first setup, the plugin looks for an existing `android-neovim-lsp` binary. If it cannot find one, it will:
-
-- build and install the server from the checkout when the full repo is available
-- otherwise fall back to the release installer path
-
-If you do not want that behavior, set `install = false` in `opts` and provide `cmd` yourself.
-
-## Manual Install
-
-This project is currently installed from a checkout.
-
-```bash
-git clone git@github.com:WarrenBuffering/android-neovim-lsp.git
-cd android-neovim-lsp
-./packaging/install-local-dev.sh
-```
-
-That installs:
-
-- the server into `~/.local/share/android-neovim-lsp/android-neovim-lsp`
-- the Neovim runtime into `~/.local/share/android-neovim-lsp/nvim`
-- the launcher into `~/.local/bin/android-neovim-lsp`
-
-If you want the Android Studio bridge included in the local bundle:
-
-```bash
-ENABLE_JETBRAINS_BRIDGE=1 ./packaging/install-local-dev.sh
-```
-
 ## Neovim Setup
-
-If you are loading the installed runtime directly:
-
-```lua
-vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
-require("android_neovim_lsp").setup()
-```
 
 `android_neovim_lsp.setup()` looks for the server in this order:
 
@@ -94,21 +72,6 @@ require("android_neovim_lsp").setup({
   },
 })
 ```
-
-## `lazy.nvim` / LazyVim
-
-```lua
-return {
-  {
-    "WarrenBuffering/android-neovim-lsp",
-    main = "android_neovim_lsp",
-    dependencies = { "neovim/nvim-lspconfig" },
-    opts = {},
-  },
-}
-```
-
-The example plugin file lives at [`lazyvim_example/lua/plugins/android-neovim-lsp.lua`](lazyvim_example/lua/plugins/android-neovim-lsp.lua).
 
 ## Common Options
 
@@ -144,6 +107,43 @@ require("android_neovim_lsp").setup({
 ```
 
 Supported `install.method` values are `auto`, `build`, `release`, `build_or_release`, and `release_or_build`.
+
+## Manual Install
+
+This project can also be installed from a checkout.
+
+```bash
+git clone git@github.com:WarrenBuffering/android-neovim-lsp.git
+cd android-neovim-lsp
+./packaging/install-local-dev.sh
+```
+
+That installs:
+
+- the server into `~/.local/share/android-neovim-lsp/android-neovim-lsp`
+- the Neovim runtime into `~/.local/share/android-neovim-lsp/nvim`
+- the launcher into `~/.local/bin/android-neovim-lsp`
+
+If you want the Android Studio bridge included in the local bundle:
+
+```bash
+ENABLE_JETBRAINS_BRIDGE=1 ./packaging/install-local-dev.sh
+```
+
+## `lazy.nvim` / LazyVim
+
+```lua
+return {
+  {
+    "WarrenBuffering/android-neovim-lsp",
+    main = "android_neovim_lsp",
+    dependencies = { "neovim/nvim-lspconfig" },
+    opts = {},
+  },
+}
+```
+
+The example plugin file lives at [`lazyvim_example/lua/plugins/android-neovim-lsp.lua`](lazyvim_example/lua/plugins/android-neovim-lsp.lua).
 
 ## Local Testing
 

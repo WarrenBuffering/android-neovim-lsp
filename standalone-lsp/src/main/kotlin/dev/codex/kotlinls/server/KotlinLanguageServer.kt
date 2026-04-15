@@ -154,9 +154,6 @@ class KotlinLanguageServer(
     private val refreshExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "android-neovim-lsp-refresh").apply { isDaemon = true }
     }
-    private val warmupExecutor = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "android-neovim-lsp-warmup").apply { isDaemon = true }
-    }
     private val supportExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "android-neovim-lsp-support").apply { isDaemon = true }
     }
@@ -236,7 +233,6 @@ class KotlinLanguageServer(
         } finally {
             semanticEngine.close()
             refreshExecutor.shutdownNow()
-            warmupExecutor.shutdownNow()
             supportExecutor.shutdownNow()
             diagnosticExecutor.shutdownNow()
             persistExecutor.shutdownNow()
@@ -274,9 +270,9 @@ class KotlinLanguageServer(
                             )
                             if (usesLocalSemanticRuntime()) {
                                 val openDocuments = documents.openDocuments()
-                                val backgroundModules = likelyWarmupModules(currentProject)
+                                val backgroundModules = backgroundWarmupModules(currentProject)
                                 if (backgroundModules.isNotEmpty()) {
-                                    scheduleBackgroundWarmup(currentProject, backgroundModules)
+                                    scheduleBackgroundWarmup(currentProject, backgroundModules, includeOpenModules = true)
                                 }
                                 openDocuments.forEach { document ->
                                     scheduleSemanticRefresh(document.uri)
@@ -796,7 +792,7 @@ class KotlinLanguageServer(
                     ),
                 ),
             ),
-            serverInfo = ServerInfo(name = "android-neovim-lsp", version = "0.1.1"),
+            serverInfo = ServerInfo(name = "android-neovim-lsp", version = "0.1.2"),
         )
     }
 
@@ -1199,14 +1195,12 @@ class KotlinLanguageServer(
         scheduleDiagnosticsPublish()
         if (usesLocalSemanticRuntime()) {
             val semanticUris = requestedSemanticUris.ifEmpty { documents.openDocuments().map { it.uri }.toSet() }
+            val backgroundModules = backgroundWarmupModules(nextProject)
+            if (backgroundModules.isNotEmpty()) {
+                scheduleBackgroundWarmup(nextProject, backgroundModules, includeOpenModules = true)
+            }
             if (semanticUris.isNotEmpty()) {
                 refreshSemanticModules(nextProject, semanticUris, interactiveSemanticRefresh)
-            }
-            if (requiresImport || semanticStates.isEmpty()) {
-                val backgroundModules = likelyWarmupModules(nextProject)
-                if (backgroundModules.isNotEmpty()) {
-                    scheduleBackgroundWarmup(nextProject, backgroundModules)
-                }
             }
         }
         val activeDocument = documents.openDocuments().firstOrNull { it.uri in requestedSemanticUris }
@@ -1455,19 +1449,18 @@ class KotlinLanguageServer(
         return selected
     }
 
-    private fun likelyWarmupModules(project: ImportedProject): List<String> {
-        val openModules = documents.openDocuments()
-            .mapNotNull { document ->
-                project.moduleForPath(documentUriToPath(document.uri))
-            }
-            .distinctBy { it.gradlePath }
-        if (openModules.isEmpty()) return emptyList()
-        val openModulePaths = openModules.map { it.gradlePath }.toSet()
-        return project.moduleClosure(openModules)
+    private fun backgroundWarmupModules(project: ImportedProject): List<String> =
+        project.modules.asSequence()
+            .filter(::moduleHasSemanticSources)
             .map { it.gradlePath }
-            .filterNot(openModulePaths::contains)
-            .take(maxBackgroundWarmupModules)
-    }
+            .filter { modulePath ->
+                val state = semanticStates[modulePath]
+                state == null ||
+                    state.projectGeneration != currentProjectGeneration ||
+                    !state.validated ||
+                    !state.fullyIndexed
+            }
+            .toList()
 
     private fun lightIndexImportsForText(text: String): List<Path> =
         SourceIndexLookup.imports(text)
@@ -1498,6 +1491,10 @@ class KotlinLanguageServer(
                 warmupRunning = false
             }
             modulePaths.forEach { modulePath ->
+                val module = project.modulesByGradlePath[modulePath] ?: return@forEach
+                if (!moduleHasSemanticSources(module)) {
+                    return@forEach
+                }
                 val currentState = semanticStates[modulePath]
                 if (
                     currentState?.projectGeneration == generation &&
@@ -1516,76 +1513,81 @@ class KotlinLanguageServer(
             }
             warmupRunning = true
         }
-        try {
-            warmupExecutor.execute {
-                if (warmupStartDelayMillis > 0) {
-                    try {
-                        Thread.sleep(warmupStartDelayMillis)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        synchronized(warmupLock) {
-                            warmupRunning = false
-                        }
-                        return@execute
+        val worker = Thread({
+            if (warmupStartDelayMillis > 0) {
+                try {
+                    Thread.sleep(warmupStartDelayMillis)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    synchronized(warmupLock) {
+                        warmupRunning = false
                     }
-                }
-                while (true) {
-                    val nextModulePath = synchronized(warmupLock) {
-                        if (generation != currentProjectGeneration) {
-                            warmupRunning = false
-                            return@execute
-                        }
-                        val openModulePaths = documents.openDocuments()
-                            .mapNotNull { document ->
-                                project.moduleForPath(documentUriToPath(document.uri))?.gradlePath
-                            }
-                            .toSet()
-                        val modulePath = warmupQueuedModules.firstOrNull { candidate ->
-                            candidate !in openModulePaths || candidate in warmupAllowedOpenModules
-                        }
-                        if (modulePath == null) {
-                            warmupRunning = false
-                            return@execute
-                        }
-                        warmupQueuedModules.remove(modulePath)
-                        warmupAllowedOpenModules.remove(modulePath)
-                        modulePath
-                    }
-                    val currentProject = project.takeIf { generation == currentProjectGeneration } ?: break
-                    val module = currentProject.modulesByGradlePath[nextModulePath] ?: continue
-                    val currentState = semanticStates[nextModulePath]
-                    if (
-                        currentState?.validated == true &&
-                        currentState.projectGeneration == generation &&
-                        currentState.fullyIndexed &&
-                        currentState.snapshot != null
-                    ) {
-                        continue
-                    }
-                    runCatching {
-                        val snapshotState = analyzeModuleSnapshot(
-                            currentProject,
-                            module,
-                            focusedPaths = emptySet(),
-                            background = true,
-                        )
-                        buildSemanticIndex(
-                            state = snapshotState,
-                            focusedPaths = emptySet(),
-                            background = true,
-                        )
-                    }.onSuccess { state ->
-                        installSemanticState(state)
-                    }.onFailure { error ->
-                        if (isBenignCancellation(error)) {
-                            return@onFailure
-                        }
-                        System.err.println("[android-neovim-lsp] warmup failed for ${module.gradlePath}: ${error.message}")
-                        error.printStackTrace(System.err)
-                    }
+                    return@Thread
                 }
             }
-        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            while (true) {
+                val nextModulePath = synchronized(warmupLock) {
+                    if (generation != currentProjectGeneration) {
+                        warmupRunning = false
+                        return@Thread
+                    }
+                    val openModulePaths = documents.openDocuments()
+                        .mapNotNull { document ->
+                            project.moduleForPath(documentUriToPath(document.uri))?.gradlePath
+                        }
+                        .toSet()
+                    val modulePath = warmupQueuedModules.firstOrNull { candidate ->
+                        candidate !in openModulePaths || candidate in warmupAllowedOpenModules
+                    }
+                    if (modulePath == null) {
+                        warmupRunning = false
+                        return@Thread
+                    }
+                    warmupQueuedModules.remove(modulePath)
+                    warmupAllowedOpenModules.remove(modulePath)
+                    modulePath
+                }
+                val currentProject = project.takeIf { generation == currentProjectGeneration } ?: break
+                val module = currentProject.modulesByGradlePath[nextModulePath] ?: continue
+                val currentState = semanticStates[nextModulePath]
+                if (
+                    currentState?.validated == true &&
+                    currentState.projectGeneration == generation &&
+                    currentState.fullyIndexed &&
+                    currentState.snapshot != null
+                ) {
+                    continue
+                }
+                runCatching {
+                    val snapshotState = analyzeModuleSnapshot(
+                        currentProject,
+                        module,
+                        focusedPaths = emptySet(),
+                        background = true,
+                    )
+                    buildSemanticIndex(
+                        state = snapshotState,
+                        focusedPaths = emptySet(),
+                        background = true,
+                    )
+                }.onSuccess { state ->
+                    installSemanticState(state)
+                }.onFailure { error ->
+                    if (isBenignCancellation(error)) {
+                        return@onFailure
+                    }
+                    System.err.println("[android-neovim-lsp] warmup failed for ${module.gradlePath}: ${error.message}")
+                    error.printStackTrace(System.err)
+                }
+            }
+            synchronized(warmupLock) {
+                warmupRunning = false
+            }
+        }, "android-neovim-lsp-warmup")
+        worker.isDaemon = true
+        try {
+            worker.start()
+        } catch (_: IllegalThreadStateException) {
             synchronized(warmupLock) {
                 warmupRunning = false
             }
@@ -2270,6 +2272,9 @@ class KotlinLanguageServer(
         return openDocumentsForModule.all { document -> semanticStateCurrentForUri(state, document.uri) }
     }
 
+    private fun moduleHasSemanticSources(module: ImportedModule): Boolean =
+        module.sourceRoots.isNotEmpty() || module.javaSourceRoots.isNotEmpty()
+
     private fun nextSemanticRequestId(modulePath: String): Int =
         synchronized(semanticStateLock) {
             semanticRequestGeneration.incrementAndGet().also { requestId ->
@@ -2284,12 +2289,14 @@ class KotlinLanguageServer(
         allowBackgroundWarmup: Boolean = true,
         persistState: Boolean = true,
     ) {
+        var droppedAsStale = false
         val previousState = synchronized(semanticStateLock) {
             if (nextState.projectGeneration != currentProjectGeneration) {
                 null
             } else {
                 val latestRequestId = latestSemanticRequestIds[nextState.module.gradlePath] ?: Int.MIN_VALUE
                 if (nextState.requestId < latestRequestId) {
+                    droppedAsStale = true
                     null
                 } else {
                     val previous = semanticStates[nextState.module.gradlePath]
@@ -2303,6 +2310,9 @@ class KotlinLanguageServer(
         if (previousState == null) {
             val existing = semanticStates[nextState.module.gradlePath]
             if (existing !== nextState) {
+                if (droppedAsStale && persistState) {
+                    persistSemanticState(nextState)
+                }
                 nextState.snapshot?.close()
                 return
             }
