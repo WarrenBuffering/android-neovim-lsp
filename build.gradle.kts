@@ -9,7 +9,7 @@ plugins {
 }
 
 group = "dev.codex.kotlinls"
-version = "0.1.2"
+version = "0.1.3"
 
 val enableJetBrainsBridge = providers.gradleProperty("kotlinls.enableJetBrainsBridge")
     .map(String::toBoolean)

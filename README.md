@@ -93,7 +93,7 @@ require("android_neovim_lsp").setup({
 })
 ```
 
-When `install = true`, the runtime prefers building from the local checkout when available and otherwise falls back to the release installer. Set `version` to pin a specific GitHub release tag such as `"v-0.1.3"`. When `version` is set, the runtime installs that release bundle and skips re-downloading it if the managed install root already matches.
+When `install = true`, the runtime prefers building from the local checkout when available and otherwise falls back to the release installer. Set `version` to pin a specific GitHub release tag such as `"v0.1.3"`. When `version` is set, the runtime installs that release bundle and skips re-downloading it if the managed install root already matches.
 
 ## Manual Install
 
