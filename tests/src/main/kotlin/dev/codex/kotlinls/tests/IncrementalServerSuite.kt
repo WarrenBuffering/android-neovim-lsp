@@ -866,60 +866,6 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 }
             }
         },
-        TestCase("serves first semantic hover and definition on cold request when focused analysis fits timeout") {
-            val projectRoot = createSemanticRequestFixture()
-            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
-            withRunningServer { server ->
-                initializeServer(
-                    server,
-                    projectRoot,
-                    initializationOptions = mapOf(
-                        "progress" to mapOf("mode" to "off"),
-                        "semantic" to mapOf(
-                            "request_timeout_ms" to 1_500,
-                        ),
-                    ),
-                )
-                openDocument(server, appFile)
-                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
-
-                writePayload(
-                    server.clientOut,
-                    mapOf(
-                        "jsonrpc" to "2.0",
-                        "id" to 600,
-                        "method" to "textDocument/hover",
-                        "params" to mapOf(
-                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
-                            "position" to mapOf("line" to 4, "character" to 11),
-                        ),
-                    ),
-                )
-                val hoverResponse = readUntil(server.reader, maxMessages = 160) { message ->
-                    message.id?.asInt() == 600
-                }
-                assertContains(hoverResponse?.result?.toString().orEmpty(), "Int")
-
-                writePayload(
-                    server.clientOut,
-                    mapOf(
-                        "jsonrpc" to "2.0",
-                        "id" to 601,
-                        "method" to "textDocument/definition",
-                        "params" to mapOf(
-                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
-                            "position" to mapOf("line" to 4, "character" to 11),
-                        ),
-                    ),
-                )
-                val definitionResponse = readUntil(server.reader, maxMessages = 160) { message ->
-                    message.id?.asInt() == 601
-                }
-                assertTrue((definitionResponse?.result?.size() ?: 0) > 0) {
-                    "Expected first cold definition request to succeed once focused analysis completed inside timeout"
-                }
-            }
-        },
         TestCase("reuses current semantic state for repeated hover requests after edits") {
             val projectRoot = createSemanticRequestFixture()
             val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")

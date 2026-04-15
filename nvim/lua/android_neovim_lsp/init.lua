@@ -7,6 +7,7 @@ local bootstrap_state = {
 }
 
 local format_on_save_group = vim.api.nvim_create_augroup("AndroidNeovimLspFormatOnSave", { clear = false })
+local format_flash_namespace = vim.api.nvim_create_namespace("AndroidNeovimLspFormatFlash")
 local format_spinner = {
   active = 0,
 }
@@ -30,6 +31,8 @@ local flush_buffer_diagnostics
 local schedule_buffer_diagnostics_flush
 local complete_format
 local merge_changed_line_range
+local start_format_status
+local stop_format_status
 local function empty_map(value)
   if value == nil then
     return vim.empty_dict()
@@ -452,7 +455,7 @@ local function queue_next_buffer_diagnostics_flush(state, reason)
     return
   end
 
-  state.queued_flush_reason = reason or state.queued_flush_reason or "change"
+  state.queued_flush_reason = reason or "change"
 end
 
 local function perform_format_buffer(bufnr, before_text)
@@ -463,16 +466,15 @@ local function perform_format_buffer(bufnr, before_text)
   local ok, conform = pcall(require, "conform")
   if ok then
     start_format_status()
-    local attempted = conform.format({
+    local ok_format, attempted = pcall(conform.format, {
       bufnr = bufnr,
       async = false,
       quiet = format_request_quiet,
       lsp_format = format_lsp_mode,
       timeout_ms = format_request_timeout_ms,
-    }, function()
-      on_complete()
-    end)
-    if attempted == false then
+    })
+    on_complete()
+    if not ok_format or attempted == false then
       stop_format_status()
     end
     return
@@ -496,11 +498,6 @@ local function finish_buffer_diagnostics_flush(bufnr, state)
   end
 
   state.flush_in_flight = false
-  local reason = state.queued_flush_reason
-  state.queued_flush_reason = nil
-  if not vim.tbl_isempty(state.changed_lines) then
-    schedule_buffer_diagnostics_flush(bufnr, reason or "change")
-  end
 end
 
 local function make_publish_diagnostics_handler(default_handler, debounce_ms)
@@ -579,9 +576,15 @@ local function make_diagnostics_flushed_handler()
   end
 end
 
-local function is_insert_like_mode()
-  local mode = vim.api.nvim_get_mode().mode
+local function is_insert_like_mode(mode)
+  if mode == nil then
+    mode = vim.api.nvim_get_mode().mode
+  end
   return type(mode) == "string" and mode:match("^[iR]") ~= nil
+end
+
+local function is_normal_like_mode(mode)
+  return type(mode) == "string" and mode:match("^n") ~= nil
 end
 
 merge_changed_line_range = function(ranges, start_line, end_line)
@@ -662,12 +665,6 @@ flush_buffer_diagnostics = function(bufnr, reason)
   end
 
   state.flush_scheduled = false
-  if state.flush_in_flight then
-    if not vim.tbl_isempty(state.changed_lines) then
-      queue_next_buffer_diagnostics_flush(state, reason)
-    end
-    return
-  end
   if vim.tbl_isempty(state.changed_lines) then
     return
   end
@@ -693,6 +690,7 @@ flush_buffer_diagnostics = function(bufnr, reason)
   state.next_flush_generation = (state.next_flush_generation or 0) + 1
   state.awaiting_flush_generation = state.next_flush_generation
   state.flush_in_flight = true
+  state.queued_flush_reason = nil
 
   flush_client_changes(client, bufnr)
   client:notify("$/android-neovim/flushDiagnostics", {
@@ -711,19 +709,15 @@ schedule_buffer_diagnostics_flush = function(bufnr, reason)
   if state == nil then
     return
   end
-  if state.flush_in_flight then
-    if not vim.tbl_isempty(state.changed_lines) then
-      queue_next_buffer_diagnostics_flush(state, reason)
-    end
-    return
-  end
+  queue_next_buffer_diagnostics_flush(state, reason)
   if state.flush_scheduled then
     return
   end
 
   state.flush_scheduled = true
   vim.schedule(function()
-    flush_buffer_diagnostics(bufnr, reason)
+    local next_reason = state.queued_flush_reason or reason
+    flush_buffer_diagnostics(bufnr, next_reason)
   end)
 end
 
@@ -748,11 +742,16 @@ local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
   end
 
   vim.api.nvim_clear_autocmds({ group = diagnostics_sync_group, buffer = bufnr })
-  vim.api.nvim_create_autocmd("InsertLeave", {
+  vim.api.nvim_create_autocmd("ModeChanged", {
     group = diagnostics_sync_group,
     buffer = bufnr,
     callback = function(args)
-      schedule_buffer_diagnostics_flush(args.buf, "insert_leave")
+      local event = vim.v.event or {}
+      local old_mode = event.old_mode
+      local new_mode = event.new_mode
+      if is_insert_like_mode(old_mode) and is_normal_like_mode(new_mode) then
+        schedule_buffer_diagnostics_flush(args.buf, "insert_leave")
+      end
     end,
   })
   vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
@@ -775,9 +774,6 @@ local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
       end
 
       queue_changed_line_range(buf, firstline, lastline, new_lastline)
-      if not is_insert_like_mode() then
-        schedule_buffer_diagnostics_flush(buf, "change")
-      end
     end,
     on_detach = function(_, buf)
       diagnostics_tracking.buffers[buf] = nil
@@ -799,7 +795,7 @@ end
 local function render_status()
 end
 
-local function start_format_status()
+start_format_status = function()
   format_spinner.active = format_spinner.active + 1
   if format_spinner.active > 1 then
     return
@@ -812,7 +808,7 @@ local function start_format_status()
   if not ok then return end
 end
 
-local function stop_format_status()
+stop_format_status = function()
   if format_spinner.active == 0 then
     return
   end
@@ -878,6 +874,55 @@ local function count_changed_lines(before_text, after_text)
   return changed_lines
 end
 
+local function flash_format_changes(bufnr, before_text)
+  if before_text == nil then
+    return
+  end
+  if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+    return
+  end
+
+  local after_text = buffer_text(bufnr)
+  if before_text == after_text then
+    return
+  end
+
+  local hunks = vim.diff(before_text, after_text, {
+    result_type = "indices",
+    algorithm = "histogram",
+  })
+  if type(hunks) ~= "table" or vim.tbl_isempty(hunks) then
+    return
+  end
+
+  vim.api.nvim_buf_clear_namespace(bufnr, format_flash_namespace, 0, -1)
+
+  local line_count = math.max(vim.api.nvim_buf_line_count(bufnr), 1)
+  for _, hunk in ipairs(hunks) do
+    local start_line = math.max((hunk[3] or 1) - 1, 0)
+    local changed_count = math.max(hunk[4] or 0, 1)
+    local end_line = math.min(start_line + changed_count, line_count)
+    if start_line >= line_count then
+      start_line = line_count - 1
+      end_line = line_count
+    end
+    if start_line >= 0 and end_line > start_line then
+      vim.api.nvim_buf_set_extmark(bufnr, format_flash_namespace, start_line, 0, {
+        end_row = end_line,
+        hl_group = "IncSearch",
+        hl_eol = true,
+        priority = 250,
+      })
+    end
+  end
+
+  vim.defer_fn(function()
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      vim.api.nvim_buf_clear_namespace(bufnr, format_flash_namespace, 0, -1)
+    end
+  end, 180)
+end
+
 local function show_format_result(bufnr, before_text)
   if before_text == nil then
     return
@@ -931,6 +976,7 @@ end
 
 complete_format = function(bufnr, before_text)
   stop_format_status()
+  flash_format_changes(bufnr, before_text)
   local state = diagnostics_tracking.buffers[bufnr]
   if state ~= nil then
     queue_full_buffer_diagnostics_range(bufnr, state)
