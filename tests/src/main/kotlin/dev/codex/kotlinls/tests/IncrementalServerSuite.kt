@@ -179,6 +179,256 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 }
             }
         },
+        TestCase("debounces bursty change diagnostics down to the latest document state") {
+            val projectRoot = createDiagnosticsDebounceFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "semantic" to mapOf(
+                            "backend" to "disabled",
+                        ),
+                        "progress" to mapOf(
+                            "mode" to "off",
+                        ),
+                        "diagnostics" to mapOf(
+                            "fast_debounce_ms" to 250,
+                        ),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                val texts = listOf(
+                    """
+                    package demo.app
+
+                    import demo.app.l
+
+                    fun app(): String = "ok"
+                    """.trimIndent() + "\n",
+                    """
+                    package demo.app
+
+                    import demo.app.li
+
+                    fun app(): String = "ok"
+                    """.trimIndent() + "\n",
+                    """
+                    package demo.app
+
+                    import demo.app.lis
+
+                    fun app(): String = "ok"
+                    """.trimIndent() + "\n",
+                    """
+                    package demo.app
+
+                    import demo.app.list
+
+                    fun app(): String = "ok"
+                    """.trimIndent() + "\n",
+                    """
+                    package demo.app
+
+                    import demo.app.listO
+
+                    fun app(): String = "ok"
+                    """.trimIndent() + "\n",
+                    """
+                    package demo.app
+
+                    import demo.app.listOf
+
+                    fun app(): String = "ok"
+                    """.trimIndent() + "\n",
+                )
+
+                texts.forEachIndexed { index, text ->
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "method" to "textDocument/didChange",
+                            "params" to mapOf(
+                                "textDocument" to mapOf(
+                                    "uri" to appFile.toUri().toString(),
+                                    "version" to index + 2,
+                                ),
+                                "contentChanges" to listOf(
+                                    mapOf("text" to text),
+                                ),
+                            ),
+                        ),
+                    )
+                }
+
+                Thread.sleep(800)
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 77,
+                        "method" to "workspace/symbol",
+                        "params" to mapOf("query" to "listOf"),
+                    ),
+                )
+
+                var postBurstDiagnostics = 0
+                readUntil(server.reader, maxMessages = 80) { message ->
+                    if (diagnosticUri(message) == appFile.toUri().toString()) {
+                        postBurstDiagnostics += 1
+                    }
+                    message.id?.asInt() == 77
+                }
+
+                assertEquals(0, postBurstDiagnostics) {
+                    "Expected burst changes ending in a clean import state to suppress intermediate diagnostics, got $postBurstDiagnostics publishes"
+                }
+            }
+        },
+        TestCase("defers diagnostics until an explicit flush when insert-leave mode is enabled") {
+            val projectRoot = createDiagnosticsDebounceFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "semantic" to mapOf(
+                            "backend" to "disabled",
+                        ),
+                        "progress" to mapOf(
+                            "mode" to "off",
+                        ),
+                        "diagnostics" to mapOf(
+                            "fast_debounce_ms" to 0,
+                            "flush_on_insert_leave" to true,
+                        ),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "method" to "textDocument/didChange",
+                        "params" to mapOf(
+                            "textDocument" to mapOf(
+                                "uri" to appFile.toUri().toString(),
+                                "version" to 2,
+                            ),
+                            "contentChanges" to listOf(
+                                mapOf(
+                                    "text" to """
+                                        package demo.app
+
+                                        import demo.app.listO
+
+                                        fun app(): String = "ok"
+                                    """.trimIndent() + "\n",
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 88,
+                        "method" to "workspace/symbol",
+                        "params" to mapOf("query" to "listOf"),
+                    ),
+                )
+
+                var diagnosticsBeforeFlush = 0
+                val symbolResponse = readUntil(server.reader, maxMessages = 80) { message ->
+                    if (diagnosticUri(message) == appFile.toUri().toString()) {
+                        diagnosticsBeforeFlush += 1
+                    }
+                    message.id?.asInt() == 88
+                }
+                assertTrue(symbolResponse?.result?.isArray == true) { "Expected workspace/symbol response after didChange" }
+                assertEquals(0, diagnosticsBeforeFlush) {
+                    "Expected didChange diagnostics to stay deferred until flush, got $diagnosticsBeforeFlush publishes"
+                }
+
+                flushDiagnostics(
+                    server,
+                    appFile,
+                    changedLines = listOf(
+                        mapOf(
+                            "start_line" to 2,
+                            "end_line" to 3,
+                        ),
+                    ),
+                )
+
+                val flushedDiagnostics = readUntil(server.reader, maxMessages = 80) {
+                    diagnosticUri(it) == appFile.toUri().toString()
+                }
+                val diagnosticCodes = flushedDiagnostics?.params
+                    ?.get("diagnostics")
+                    ?.mapNotNull { it.get("code")?.asText() }
+                    .orEmpty()
+                assertTrue("unresolved-import-symbol" in diagnosticCodes) {
+                    "Expected explicit diagnostics flush to publish unresolved import diagnostics, got $diagnosticCodes"
+                }
+            }
+        },
+        TestCase("serves named argument completions from the local index when semantic is disabled") {
+            val projectRoot = createNamedArgumentCompletionFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "semantic" to mapOf(
+                            "backend" to "disabled",
+                        ),
+                        "progress" to mapOf(
+                            "mode" to "off",
+                        ),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 140,
+                        "method" to "textDocument/completion",
+                        "params" to mapOf(
+                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                            "position" to mapOf("line" to 10, "character" to 13),
+                        ),
+                    ),
+                )
+
+                val completionResponse = readUntil(server.reader, maxMessages = 120) { message ->
+                    message.id?.asInt() == 140
+                }
+                val subtitle = completionResponse?.result
+                    ?.get("items")
+                    ?.firstOrNull { item -> item.get("label")?.asText() == "subtitle" }
+                assertTrue(subtitle != null) {
+                    "Expected named argument completion for subtitle from indexed fallback, got ${completionResponse?.result}"
+                }
+                assertEquals("subtitle = ", subtitle?.get("insertText")?.asText()) {
+                    "Expected indexed fallback to insert the parameter assignment, got ${subtitle?.get("insertText")?.asText()}"
+                }
+            }
+        },
         TestCase("eventually serves semantic hover and definition for local variables when backend is enabled") {
             val projectRoot = createSemanticRequestFixture()
             val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
@@ -373,6 +623,139 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
 
                 assertTrue("listOf" in labels) {
                     "Expected support-index import completion to include listOf, got ${labels.take(10)}"
+                }
+            }
+        },
+        TestCase("hydrates import completion for new package files added after startup") {
+            val projectRoot = createImportHydrationFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(server, projectRoot)
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                val packageDir = projectRoot.resolve("app/src/main/kotlin/demo/app/sections")
+                packageDir.createDirectories()
+                packageDir.resolve("DockChecklist.kt").writeText(
+                    """
+                    package demo.app.sections
+
+                    class DockChecklist
+                    """.trimIndent() + "\n",
+                )
+
+                var labels = emptyList<String>()
+                repeat(20) { attempt ->
+                    val requestId = 950 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to requestId,
+                            "method" to "textDocument/completion",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 2, "character" to 29),
+                            ),
+                        ),
+                    )
+                    val completionResponse = readUntil(server.reader, maxMessages = 160) { message ->
+                        message.id?.asInt() == requestId
+                    }
+                    labels = completionResponse?.result
+                        ?.get("items")
+                        ?.mapNotNull { item -> item.get("label")?.asText() }
+                        .orEmpty()
+                    if ("DockChecklist" in labels) {
+                        return@repeat
+                    }
+                    Thread.sleep(100)
+                }
+
+                assertTrue("DockChecklist" in labels) {
+                    "Expected import completion to hydrate new package files, got ${labels.take(10)}"
+                }
+            }
+        },
+        TestCase("hydrates import diagnostics and definition when target file appears after startup") {
+            val projectRoot = createImportResolutionFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(server, projectRoot)
+                openDocument(server, appFile)
+
+                val initialDiagnostics = readUntil(server.reader, maxMessages = 80) {
+                    diagnosticUri(it) == appFile.toUri().toString()
+                }
+                val initialCodes = initialDiagnostics?.params
+                    ?.get("diagnostics")
+                    ?.mapNotNull { diagnostic -> diagnostic.get("code")?.asText() }
+                    .orEmpty()
+                assertTrue("unresolved-import-symbol" in initialCodes || "unresolved-import-package" in initialCodes) {
+                    "Expected missing import to fail before target file exists, got $initialCodes"
+                }
+
+                val packageDir = projectRoot.resolve("app/src/main/kotlin/demo/app/sections")
+                packageDir.createDirectories()
+                val targetFile = packageDir.resolve("DockChecklist.kt")
+                targetFile.writeText(
+                    """
+                    package demo.app.sections
+
+                    class DockChecklist
+                    """.trimIndent() + "\n",
+                )
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "method" to "textDocument/didChange",
+                        "params" to mapOf(
+                            "textDocument" to mapOf(
+                                "uri" to appFile.toUri().toString(),
+                                "version" to 2,
+                            ),
+                            "contentChanges" to listOf(
+                                mapOf("text" to appFile.readText()),
+                            ),
+                        ),
+                    ),
+                )
+
+                val recoveredDiagnostics = readUntil(server.reader, maxMessages = 120) {
+                    diagnosticUri(it) == appFile.toUri().toString()
+                }
+                val recoveredCodes = recoveredDiagnostics?.params
+                    ?.get("diagnostics")
+                    ?.mapNotNull { diagnostic -> diagnostic.get("code")?.asText() }
+                    .orEmpty()
+                assertTrue("unresolved-import-symbol" !in recoveredCodes && "unresolved-import-package" !in recoveredCodes) {
+                    "Expected diagnostics to recover once import target exists, got $recoveredCodes"
+                }
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 991,
+                        "method" to "textDocument/definition",
+                        "params" to mapOf(
+                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                            "position" to mapOf("line" to 2, "character" to 31),
+                        ),
+                    ),
+                )
+                val definitionResponse = readUntil(server.reader, maxMessages = 120) { message ->
+                    message.id?.asInt() == 991
+                }
+                val definitionUri = definitionResponse?.result
+                    ?.firstOrNull()
+                    ?.get("uri")
+                    ?.asText()
+                    .orEmpty()
+                assertTrue(definitionUri.endsWith("/DockChecklist.kt")) {
+                    "Expected import definition to resolve to DockChecklist.kt, got $definitionUri"
                 }
             }
         },
@@ -742,6 +1125,26 @@ private fun openDocument(server: RunningServer, path: Path) {
     )
 }
 
+private fun flushDiagnostics(
+    server: RunningServer,
+    path: Path,
+    changedLines: List<Map<String, Int>>,
+) {
+    writePayload(
+        server.clientOut,
+        mapOf(
+            "jsonrpc" to "2.0",
+            "method" to "\$/android-neovim/flushDiagnostics",
+            "params" to mapOf(
+                "textDocument" to mapOf(
+                    "uri" to path.toUri().toString(),
+                ),
+                "changed_lines" to changedLines,
+            ),
+        ),
+    )
+}
+
 private fun createOpenFileDiagnosticsFixture(): Path {
     val root = Files.createTempDirectory("kotlinls-open-file-diags")
     root.resolve("settings.gradle.kts").writeText(
@@ -871,6 +1274,47 @@ private fun createLiveIndexFixture(): Path {
     return root
 }
 
+private fun createDiagnosticsDebounceFixture(): Path {
+    val root = Files.createTempDirectory("kotlinls-diagnostics-debounce")
+    root.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "diagnostics-debounce"
+        include(":app")
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app").createDirectories()
+    root.resolve("app/build.gradle.kts").writeText(
+        """
+        plugins {
+            kotlin("jvm")
+        }
+
+        repositories {
+            mavenCentral()
+        }
+
+        kotlin {
+            jvmToolchain(21)
+        }
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app/App.kt").writeText(
+        """
+        package demo.app
+
+        fun app(): String = "ok"
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app/ImportTargets.kt").writeText(
+        """
+        package demo.app
+
+        fun listOf(): String = "ok"
+        """.trimIndent() + "\n",
+    )
+    return root
+}
+
 private fun createSemanticRequestFixture(): Path {
     val root = Files.createTempDirectory("kotlinls-semantic-request")
     root.resolve("settings.gradle.kts").writeText(
@@ -908,6 +1352,50 @@ private fun createSemanticRequestFixture(): Path {
     return root
 }
 
+private fun createNamedArgumentCompletionFixture(): Path {
+    val root = Files.createTempDirectory("kotlinls-named-arg-completion")
+    root.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "named-arg-completion"
+        include(":app")
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app").createDirectories()
+    root.resolve("app/build.gradle.kts").writeText(
+        """
+        plugins {
+            kotlin("jvm")
+        }
+
+        repositories {
+            mavenCentral()
+        }
+
+        kotlin {
+            jvmToolchain(21)
+        }
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app/App.kt").writeText(
+        """
+        package demo.app
+
+        fun renderCard(
+            title: String,
+            subtitle: String,
+        ) {}
+
+        fun demo() {
+            renderCard(
+                title = "Dockside Notes",
+                subti
+            )
+        }
+        """.trimIndent() + "\n",
+    )
+    return root
+}
+
 private fun createDefaultImportSupportFixture(): Path {
     val root = FixtureSupport.fixtureCopy("simple-jvm-app")
     root.resolve("src/main/kotlin/demo/app").createDirectories()
@@ -916,6 +1404,78 @@ private fun createDefaultImportSupportFixture(): Path {
         package demo.app
 
         fun app(label: String): String = label.trim()
+        """.trimIndent() + "\n",
+    )
+    return root
+}
+
+private fun createImportHydrationFixture(): Path {
+    val root = Files.createTempDirectory("kotlinls-import-hydration")
+    root.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "import-hydration"
+        include(":app")
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app").createDirectories()
+    root.resolve("app/build.gradle.kts").writeText(
+        """
+        plugins {
+            kotlin("jvm")
+        }
+
+        repositories {
+            mavenCentral()
+        }
+
+        kotlin {
+            jvmToolchain(21)
+        }
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app/App.kt").writeText(
+        """
+        package demo.app
+
+        import demo.app.sections.Dock
+
+        fun app(): String = "ok"
+        """.trimIndent() + "\n",
+    )
+    return root
+}
+
+private fun createImportResolutionFixture(): Path {
+    val root = Files.createTempDirectory("kotlinls-import-resolution")
+    root.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "import-resolution"
+        include(":app")
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app").createDirectories()
+    root.resolve("app/build.gradle.kts").writeText(
+        """
+        plugins {
+            kotlin("jvm")
+        }
+
+        repositories {
+            mavenCentral()
+        }
+
+        kotlin {
+            jvmToolchain(21)
+        }
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app/App.kt").writeText(
+        """
+        package demo.app
+
+        import demo.app.sections.DockChecklist
+
+        fun app(): String = "ok"
         """.trimIndent() + "\n",
     )
     return root

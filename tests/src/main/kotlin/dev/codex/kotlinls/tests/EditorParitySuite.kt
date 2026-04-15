@@ -85,7 +85,7 @@ fun editorParitySuite(): TestSuite {
                 val index = lightweightIndexBuilder.build(project, TextDocumentStore())
                 val file = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
                 val content = file.readText()
-                val line = content.lines().indexOfFirst { it.contains("Greeting().say") }
+                val line = content.lines().indexOfFirst { it.contains("fun demo(): Greeting") }
                 val column = content.lines()[line].indexOf("Greeting") + 2
                 val locations = navigationService.definitionFromIndex(
                     index = index,
@@ -106,7 +106,7 @@ fun editorParitySuite(): TestSuite {
                 val index = lightweightIndexBuilder.build(project, TextDocumentStore())
                 val file = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
                 val content = file.readText()
-                val line = content.lines().indexOfFirst { it.contains("Greeting().say") }
+                val line = content.lines().indexOfFirst { it.contains("fun demo(): Greeting") }
                 val column = content.lines()[line].indexOf("Greeting") + 2
                 val hover = hoverService.hoverFromIndex(
                     index = index,

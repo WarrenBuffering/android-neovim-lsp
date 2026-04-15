@@ -5,6 +5,7 @@ import dev.codex.kotlinls.protocol.Diagnostic
 import dev.codex.kotlinls.protocol.DocumentFormattingParams
 import dev.codex.kotlinls.protocol.DocumentRangeFormattingParams
 import dev.codex.kotlinls.protocol.FormattingOptions
+import dev.codex.kotlinls.protocol.IntellijHomeLocator
 import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
 import dev.codex.kotlinls.protocol.TextEdit
@@ -98,7 +99,8 @@ class FormattingService(
             file.ktFile.importDirectives.toList(),
             usedImports(snapshot.bindingContext, file),
         )
-        return diffEdits(file.text, formatted)
+        val withOrganizedImports = organizeImportsForText(snapshot, params.textDocument.uri, formatted) ?: formatted
+        return diffEdits(file.text, withOrganizedImports)
     }
 
     fun formatRange(snapshot: WorkspaceAnalysisSnapshot, params: DocumentRangeFormattingParams): List<TextEdit> {
@@ -126,6 +128,20 @@ class FormattingService(
             file.originalPath,
             file.text,
             file.ktFile.importDirectives.toList(),
+            usedImports(snapshot.bindingContext, file),
+        )
+    }
+
+    fun organizeImportsForText(snapshot: WorkspaceAnalysisSnapshot, uri: String, text: String): String? {
+        val file = snapshot.filesByUri[uri] ?: return null
+        val parsedImports = KtPsiFactory(file.ktFile.project, false)
+            .createFile(file.ktFile.name, text)
+            .importDirectives
+            .toList()
+        return organizeImports(
+            file.originalPath,
+            text,
+            parsedImports,
             usedImports(snapshot.bindingContext, file),
         )
     }
@@ -358,6 +374,9 @@ class FormattingService(
         resolvedIntellijFormatterBridge?.let { return it }
         if (intellijBridgeDisabled()) return null
         if (findIntellijKotlinStyle(path) == null && !hasEditorConfig(path)) return null
+        IntellijHomeLocator.configuredIdeaHome(path.parent)
+            ?.let(JetBrainsFormatterBridge::fromIdeaHome)
+            ?.let { return it }
         return commonIdeaHomes()
             .asSequence()
             .filter(Files::isDirectory)

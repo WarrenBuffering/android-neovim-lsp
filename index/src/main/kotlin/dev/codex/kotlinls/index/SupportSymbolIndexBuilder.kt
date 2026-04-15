@@ -2,6 +2,8 @@ package dev.codex.kotlinls.index
 
 import dev.codex.kotlinls.projectimport.ImportedProject
 import dev.codex.kotlinls.projectimport.StableArtifactFingerprint
+import java.net.URI
+import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import kotlin.io.path.extension
@@ -61,7 +63,7 @@ class SupportSymbolIndexBuilder(
                 buildJavaSourceSymbols(project) +
                     buildExternalLibrarySymbols(project) +
                     buildBinaryLibrarySymbols(project) +
-                    buildJdkSourceSymbols()
+                    buildJdkSourceSymbols().ifEmpty { buildJdkBinarySymbols() }
                 ).distinctBy { it.id },
         )
         synchronized(cacheLock) {
@@ -89,7 +91,9 @@ class SupportSymbolIndexBuilder(
 
     private fun supportLayerFingerprint(project: ImportedProject): String =
         buildString {
-            append("support-index-v2-binary-members")
+            val projectRoot = project.root.normalize()
+            val sourceBackedBinaryNames = sourceBackedBinaryNames(project)
+            append("support-index-v5-runtime-java-stubs")
             append('\n')
             project.modules.sortedBy { it.gradlePath }.forEach { module ->
                 append(module.gradlePath)
@@ -97,7 +101,12 @@ class SupportSymbolIndexBuilder(
                 append(module.externalDependencies.map { it.notation }.sorted())
                 append('|')
                 module.javaSourceRoots.sortedBy(Path::toString).forEach { root ->
-                    appendTreeFingerprint(this, "java", root.normalize())
+                    appendTreeFingerprint(
+                        builder = this,
+                        label = "java",
+                        projectRoot = projectRoot,
+                        root = root.normalize(),
+                    )
                 }
                 append('|')
                 module.classpathSourceJars.sortedBy(Path::toString).forEach { jar ->
@@ -105,7 +114,11 @@ class SupportSymbolIndexBuilder(
                 }
                 append('|')
                 module.classpathJars
-                    .filter { it.isRegularFile() && it.extension == "jar" }
+                    .filter { jar ->
+                        jar.isRegularFile() &&
+                            jar.extension == "jar" &&
+                            jar.fileName.toString().removeSuffix(".jar") !in sourceBackedBinaryNames
+                    }
                     .sortedBy(Path::toString)
                     .forEach { jar ->
                         appendFileFingerprint(this, "binaryJar", jar.normalize())
@@ -114,6 +127,10 @@ class SupportSymbolIndexBuilder(
             }
             defaultJdkSourceArchive()?.let { srcZip ->
                 appendFileFingerprint(this, "jdk", srcZip.normalize())
+            } ?: run {
+                append("jdk-runtime=")
+                append(System.getProperty("java.version"))
+                append('\n')
             }
         }
 
@@ -149,21 +166,10 @@ class SupportSymbolIndexBuilder(
             }
 
     private fun buildBinaryLibrarySymbols(project: ImportedProject): List<IndexedSymbol> {
-        val sourceBackedBinaryNames = project.modules
-            .flatMap { module -> module.classpathSourceJars.asSequence() }
-            .map { sourceJar -> sourceJar.fileName.toString().removeSuffix(".jar").removeSuffix("-sources") }
-            .toSet()
         val classpathEntries = project.modules
             .flatMap { module -> module.classpathJars }
             .distinctBy { it.normalize() }
-        return project.modules
-            .flatMap { module -> module.classpathJars.map { jar -> module.name to jar } }
-            .distinctBy { (_, jar) -> jar.normalize() }
-            .filter { (_, jar) ->
-                jar.isRegularFile() &&
-                    jar.extension == "jar" &&
-                    jar.fileName.toString().removeSuffix(".jar") !in sourceBackedBinaryNames
-            }
+        return indexedBinaryJars(project)
             .flatMap { (moduleName, jar) ->
                 runCatching {
                     binaryClasspathSymbolIndexer.index(jar, moduleName, classpathEntries)
@@ -183,6 +189,33 @@ class SupportSymbolIndexBuilder(
             }
             .flatMap { path -> JavaSourceIndexer.index(path, "jdk") }
             .toList()
+    }
+
+    private fun buildJdkBinarySymbols(): List<IndexedSymbol> {
+        val jrtFs = runCatching { FileSystems.getFileSystem(URI.create("jrt:/")) }
+            .recoverCatching { FileSystems.newFileSystem(URI.create("jrt:/"), emptyMap<String, Any>()) }
+            .getOrNull()
+            ?: return emptyList()
+        val javaBaseRoot = jrtFs.getPath("/modules/java.base")
+        if (!Files.exists(javaBaseRoot)) return emptyList()
+        val classNames = javaBaseRoot.walk()
+            .filter { path ->
+                path.isRegularFile() &&
+                    path.extension == "class" &&
+                    jdkPackageAllowed(path)
+            }
+            .map { path ->
+                javaBaseRoot.relativize(path)
+                    .toString()
+                    .replace('\\', '/')
+                    .removeSuffix(".class")
+                    .replace('/', '.')
+            }
+        return binaryClasspathSymbolIndexer.indexRuntimeClasses(
+            originPath = Path.of("/jdk-runtime/java.base"),
+            moduleName = "jdk",
+            classNames = classNames,
+        )
     }
 
     private fun defaultJdkSourceArchive(): Path? {
@@ -207,18 +240,42 @@ class SupportSymbolIndexBuilder(
         ).any(normalized::contains)
     }
 
-    private fun appendTreeFingerprint(builder: StringBuilder, label: String, root: Path) {
+    private fun sourceBackedBinaryNames(project: ImportedProject): Set<String> =
+        project.modules
+            .flatMap { module -> module.classpathSourceJars }
+            .map { sourceJar -> sourceJar.fileName.toString().removeSuffix(".jar").removeSuffix("-sources") }
+            .toSet()
+
+    private fun indexedBinaryJars(project: ImportedProject): List<Pair<String, Path>> {
+        val sourceBackedBinaryNames = sourceBackedBinaryNames(project)
+        return project.modules
+            .flatMap { module -> module.classpathJars.map { jar -> module.name to jar } }
+            .distinctBy { (_, jar) -> jar.normalize() }
+            .filter { (_, jar) ->
+                jar.isRegularFile() &&
+                    jar.extension == "jar" &&
+                    jar.fileName.toString().removeSuffix(".jar") !in sourceBackedBinaryNames
+            }
+    }
+
+    private fun appendTreeFingerprint(
+        builder: StringBuilder,
+        label: String,
+        projectRoot: Path,
+        root: Path,
+    ) {
         val normalizedRoot = root.normalize()
-        builder.append(label).append('=').append(normalizedRoot).append('|')
+        builder.append(label).append('=').append(projectRelativePath(projectRoot, normalizedRoot)).append('|')
         if (!Files.exists(normalizedRoot)) {
             builder.append("missing").append(';')
             return
         }
         normalizedRoot.walk()
             .filter { it.isRegularFile() && it.extension == "java" }
-            .sortedBy(Path::toString)
+            .map(Path::normalize)
+            .sortedBy { path -> normalizedRoot.relativize(path).toString() }
             .forEach { path ->
-                appendFileFingerprint(builder, label, path.normalize())
+                appendSourceFingerprint(builder, label, normalizedRoot, path)
             }
     }
 
@@ -234,6 +291,28 @@ class SupportSymbolIndexBuilder(
         }
         builder.append(';')
     }
+
+    private fun appendSourceFingerprint(
+        builder: StringBuilder,
+        label: String,
+        root: Path,
+        path: Path,
+    ) {
+        val normalized = path.normalize()
+        builder.append(label)
+            .append(':')
+            .append(root.relativize(normalized).toString().replace('\\', '/'))
+            .append(':')
+            .append(StableArtifactFingerprint.fingerprint(normalized))
+            .append(';')
+    }
+
+    private fun projectRelativePath(projectRoot: Path, path: Path): String =
+        if (path.startsWith(projectRoot)) {
+            projectRoot.relativize(path).toString().replace('\\', '/')
+        } else {
+            path.toString().replace('\\', '/')
+        }
 }
 
 data class SupportSymbolLayer(

@@ -1,5 +1,6 @@
 package dev.codex.kotlinls.server
 
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.databind.JsonNode
 import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.analysis.WorkspaceAnalysisSnapshot
@@ -59,10 +60,12 @@ import dev.codex.kotlinls.protocol.ServerInfo
 import dev.codex.kotlinls.protocol.SignatureHelpOptions
 import dev.codex.kotlinls.protocol.TextDocumentPositionParams
 import dev.codex.kotlinls.protocol.TextDocumentSyncOptions
+import dev.codex.kotlinls.protocol.TextEdit
 import dev.codex.kotlinls.protocol.TypeHierarchyItem
 import dev.codex.kotlinls.protocol.WorkspaceSymbolParams
 import dev.codex.kotlinls.refactor.RenameService
 import dev.codex.kotlinls.symbols.SymbolAndSemanticService
+import dev.codex.kotlinls.workspace.LineIndex
 import dev.codex.kotlinls.workspace.ProjectRootDetector
 import dev.codex.kotlinls.workspace.TextDocumentSnapshot
 import dev.codex.kotlinls.workspace.TextDocumentStore
@@ -97,13 +100,15 @@ class KotlinLanguageServer(
     private val renameService: RenameService = RenameService(),
     private val formattingService: FormattingService = FormattingService(),
     private val codeActionService: CodeActionService = CodeActionService(formattingService),
-    private val refreshDebounceMillis: Long = 150L,
-    private val semanticRefreshDebounceMillis: Long = 500L,
+    private val refreshDebounceMillis: Long = 0L,
+    private val semanticRefreshDebounceMillis: Long = 0L,
     private val warmupStartDelayMillis: Long = 3_000L,
 ) {
     private var config: KotlinLsConfig = KotlinLsConfig()
     private var semanticEngine: SemanticEngine = DisabledSemanticEngine(SemanticBackend.DISABLED)
     private var shutdownRequested = false
+    private val startupSessionId =
+        "${ProcessHandle.current().pid().toString(36)}-${java.lang.Long.toHexString(System.currentTimeMillis()).takeLast(5)}"
     @Volatile
     private var clientInitialized = false
 
@@ -118,6 +123,9 @@ class KotlinLanguageServer(
 
     @Volatile
     private var lightweightIndex: WorkspaceIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+
+    @Volatile
+    private var workspaceIndexReady = false
 
     @Volatile
     private var supportIndex: WorkspaceIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
@@ -165,7 +173,7 @@ class KotlinLanguageServer(
     private val semanticStateLock = Any()
     private val warmupLock = Any()
     private val supportRefreshLock = Any()
-    private val diagnosticLock = Any()
+    private val diagnosticLock = Object()
     private val requestMemoLock = Any()
     private val completionRouteStatsLock = Any()
     private val semanticRequestLock = Any()
@@ -185,19 +193,25 @@ class KotlinLanguageServer(
     private var supportRefreshRunning = false
     private var diagnosticsRefreshRunning = false
     private var pendingSupportRefresh: SupportRefreshRequest? = null
+    private var pendingDiagnosticPublishAtMillis = 0L
+    private var pendingDiagnosticFullRefresh = false
     private val pendingDiagnosticUris = linkedSetOf<String>()
+    private val deferredDiagnosticUris = linkedSetOf<String>()
+    private val pendingDiagnosticForceUris = linkedSetOf<String>()
+    private val pendingDiagnosticFlushAcknowledgements = linkedMapOf<String, Int>()
     private var warmupGeneration = 0
     private val warmupQueuedModules = linkedSetOf<String>()
     private val warmupAllowedOpenModules = linkedSetOf<String>()
     private val refreshGeneration = AtomicInteger(0)
     private val progressGeneration = AtomicInteger(0)
+    private val diagnosticRequestGeneration = AtomicInteger(0)
     private val semanticRequestGeneration = AtomicInteger(0)
     private var publishedDiagnosticUris: Set<String> = emptySet()
+    private val publishedDiagnosticFingerprints = linkedMapOf<String, String>()
     private val maxFocusedSemanticPaths = 32
     private val maxSamePackageForegroundPaths = 8
     private val maxBackgroundWarmupModules = 8
     private val requestMemoMaxEntries = 512
-    private val fastDiagnosticDebounceMillis = 75L
     @Volatile
     private var currentProjectGeneration = 0
     private val latestSemanticRequestIds = linkedMapOf<String, Int>()
@@ -274,6 +288,9 @@ class KotlinLanguageServer(
                 "textDocument/didOpen" -> {
                     val params = read(message.params, DidOpenTextDocumentParams::class.java)
                     documents.open(params.textDocument)
+                    synchronized(diagnosticLock) {
+                        deferredDiagnosticUris.remove(params.textDocument.uri)
+                    }
                     updateLiveSourceIndex(params.textDocument.uri)
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
@@ -299,7 +316,13 @@ class KotlinLanguageServer(
                     val params = read(message.params, DidChangeTextDocumentParams::class.java)
                     documents.applyChanges(params)
                     updateLiveSourceIndex(params.textDocument.uri, publishDiagnostics = false)
-                    scheduleFastDiagnosticsPublish(params.textDocument.uri)
+                    if (config.diagnostics.flushOnInsertLeave) {
+                        synchronized(diagnosticLock) {
+                            deferredDiagnosticUris += params.textDocument.uri
+                        }
+                    } else {
+                        scheduleFastDiagnosticsPublish(params.textDocument.uri)
+                    }
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
                     project?.let { currentProject ->
@@ -324,6 +347,9 @@ class KotlinLanguageServer(
                     val uri = read(message.params, DidCloseTextDocumentParams::class.java).textDocument.uri
                     documents.close(uri)
                     semanticEngine.invalidate(uri)
+                    synchronized(diagnosticLock) {
+                        deferredDiagnosticUris.remove(uri)
+                    }
                     synchronized(supportRefreshLock) {
                         supportPackagesByUri.remove(uri)
                     }
@@ -333,6 +359,9 @@ class KotlinLanguageServer(
                 "textDocument/didSave" -> {
                     val uri = read(message.params, DidSaveTextDocumentParams::class.java).textDocument.uri
                     val path = documentUriToPath(uri)
+                    synchronized(diagnosticLock) {
+                        deferredDiagnosticUris.remove(uri)
+                    }
                     ensureProjectReady(uri)
                     if (isProjectModelPath(path)) {
                         scheduleRefresh(reimportProject = true, rebuildFastIndex = true)
@@ -361,6 +390,10 @@ class KotlinLanguageServer(
                         scheduleSemanticRefresh(uri, interactive = false)
                     }
                 }
+                "$/android-neovim/flushDiagnostics" -> {
+                    val params = read(message.params, FlushDiagnosticsParams::class.java)
+                    flushDeferredDiagnostics(params.textDocument.uri, params.changedLines, params.generation)
+                }
                 "workspace/didChangeConfiguration" -> scheduleRefresh(reimportProject = true, rebuildFastIndex = true)
                 "workspace/didChangeWatchedFiles" -> scheduleRefresh(reimportProject = true, rebuildFastIndex = true)
                 "textDocument/completion" -> respond(message) {
@@ -368,6 +401,14 @@ class KotlinLanguageServer(
                     val source = sourceView(params.textDocument.uri)
                     val currentProject = project
                     if (source != null) {
+                        currentProject?.let { projectForCompletion ->
+                            hydrateFastIndexForCompletion(
+                                project = projectForCompletion,
+                                path = source.first,
+                                text = source.second,
+                                params = params,
+                            )
+                        }
                         val cacheKey = requestMemoKey(params.textDocument.uri, params.position)
                         memoizedCompletion(cacheKey)?.let { return@respond it }
                         val activeIndex = currentIndex()
@@ -388,14 +429,24 @@ class KotlinLanguageServer(
                             )
 
                             CompletionRoute.BRIDGE -> currentProject?.let { current ->
-                                semanticEngine.complete(
-                                    project = current,
-                                    path = source.first,
-                                    text = source.second,
-                                    version = documents.get(params.textDocument.uri)?.version,
-                                    params = params,
-                                    projectGeneration = currentProjectGeneration,
-                                )
+                                semanticStateForRequest(params.textDocument.uri)
+                                    ?.let { semantic ->
+                                        completionService.semanticNamedArgumentCompletions(semantic.first, params)
+                                    }
+                                    ?: completionService.namedArgumentCompletionsFromIndex(
+                                        index = currentIndex(),
+                                        path = source.first,
+                                        text = source.second,
+                                        params = params,
+                                    )
+                                    ?: semanticEngine.complete(
+                                        project = current,
+                                        path = source.first,
+                                        text = source.second,
+                                        version = documents.get(params.textDocument.uri)?.version,
+                                        params = params,
+                                        projectGeneration = currentProjectGeneration,
+                                    )
                             } ?: CompletionList(false, emptyList())
                         }
                         recordCompletionRoute(
@@ -414,9 +465,12 @@ class KotlinLanguageServer(
                 }
                 "textDocument/hover" -> respond(message) {
                     val params = read(message.params, TextDocumentPositionParams::class.java)
+                    val source = sourceView(params.textDocument.uri) ?: return@respond null
+                    project?.let { currentProject ->
+                        hydrateFastIndexForImportedPackages(currentProject, source.first, source.second)
+                    }
                     val cacheKey = requestMemoKey(params.textDocument.uri, params.position)
                     memoizedHover(cacheKey)?.let { return@respond it.value }
-                    val source = sourceView(params.textDocument.uri) ?: return@respond null
                     val indexedSymbol = SourceIndexLookup.resolveSymbol(currentIndex(), source.first, source.second, params.position)
                     if (indexedSymbol != null && shouldPreferIndexForLookup(source.first, source.second, params.position, indexedSymbol)) {
                         val indexedHover = hoverService.hoverFromIndex(currentIndex(), source.first, source.second, params)
@@ -453,9 +507,12 @@ class KotlinLanguageServer(
                 }
                 "textDocument/definition" -> respond(message) {
                     val params = read(message.params, TextDocumentPositionParams::class.java)
+                    val source = sourceView(params.textDocument.uri) ?: return@respond emptyList<dev.codex.kotlinls.protocol.Location>()
+                    project?.let { currentProject ->
+                        hydrateFastIndexForImportedPackages(currentProject, source.first, source.second)
+                    }
                     val cacheKey = requestMemoKey(params.textDocument.uri, params.position)
                     memoizedDefinition(cacheKey)?.let { return@respond it }
-                    val source = sourceView(params.textDocument.uri) ?: return@respond emptyList<dev.codex.kotlinls.protocol.Location>()
                     val indexedSymbol = SourceIndexLookup.resolveSymbol(currentIndex(), source.first, source.second, params.position)
                     if (indexedSymbol != null && shouldPreferIndexForLookup(source.first, source.second, params.position, indexedSymbol)) {
                         val indexedDefinition = navigationService.definitionFromIndex(currentIndex(), source.first, source.second, params)
@@ -487,9 +544,12 @@ class KotlinLanguageServer(
                 }
                 "textDocument/typeDefinition" -> respond(message) {
                     val params = read(message.params, TextDocumentPositionParams::class.java)
+                    val source = sourceView(params.textDocument.uri) ?: return@respond emptyList<dev.codex.kotlinls.protocol.Location>()
+                    project?.let { currentProject ->
+                        hydrateFastIndexForImportedPackages(currentProject, source.first, source.second)
+                    }
                     val cacheKey = requestMemoKey(params.textDocument.uri, params.position)
                     memoizedTypeDefinition(cacheKey)?.let { return@respond it }
-                    val source = sourceView(params.textDocument.uri) ?: return@respond emptyList<dev.codex.kotlinls.protocol.Location>()
                     val indexedSymbol = SourceIndexLookup.resolveSymbol(currentIndex(), source.first, source.second, params.position)
                     if (indexedSymbol != null && shouldPreferIndexForLookup(source.first, source.second, params.position, indexedSymbol)) {
                         val indexedTypeDefinition = navigationService.typeDefinitionFromIndex(currentIndex(), source.first, source.second, params)
@@ -582,7 +642,7 @@ class KotlinLanguageServer(
                 "textDocument/formatting" -> respond(message) {
                     val params = read(message.params, DocumentFormattingParams::class.java)
                     val source = sourceView(params.textDocument.uri) ?: return@respond emptyList<dev.codex.kotlinls.protocol.TextEdit>()
-                    semanticEngine.formatDocument(
+                    val edits = semanticEngine.formatDocument(
                         projectRoot = project?.root,
                         path = source.first,
                         text = source.second,
@@ -591,6 +651,18 @@ class KotlinLanguageServer(
                         projectGeneration = currentProjectGeneration,
                     )
                         ?: emptyList<dev.codex.kotlinls.protocol.TextEdit>()
+                    val semanticState = semanticStateForRequest(params.textDocument.uri)
+                    if (semanticState == null) {
+                        edits
+                    } else {
+                        val formattedText = applyTextEdits(source.second, edits)
+                        val organizedText = formattingService.organizeImportsForText(
+                            snapshot = semanticState.first,
+                            uri = params.textDocument.uri,
+                            text = formattedText,
+                        ) ?: formattedText
+                        formattingService.editsForFormattedText(source.second, organizedText)
+                    }
                 }
                 "textDocument/rangeFormatting" -> respond(message) {
                     val params = read(message.params, DocumentRangeFormattingParams::class.java)
@@ -775,6 +847,7 @@ class KotlinLanguageServer(
         currentProjectGeneration = refreshGeneration.incrementAndGet()
         lightweightIndexBuilder.load(cachedProject)?.let { cachedIndex ->
             lightweightIndex = cachedIndex
+            workspaceIndexReady = true
         }
         supportIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
         supportCacheFullyLoaded = false
@@ -802,7 +875,57 @@ class KotlinLanguageServer(
         )
         rebuildCombinedIndex()
         if (publishDiagnostics) {
-            publishOpenDiagnostics()
+            scheduleDiagnosticsPublish()
+        }
+    }
+
+    private fun hydrateFastIndexForCompletion(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        params: CompletionParams,
+    ) {
+        val packages = linkedSetOf<String>()
+        packages += SourceIndexLookup.importedPackages(text)
+        completionService.fastIndexHydrationPackage(text, params)
+            ?.takeIf { it.isNotBlank() }
+            ?.let(packages::add)
+        hydrateFastIndexForPackages(project, path, packages)
+    }
+
+    private fun hydrateFastIndexForImportedPackages(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+    ) {
+        hydrateFastIndexForPackages(project, path, SourceIndexLookup.importedPackages(text))
+    }
+
+    private fun hydrateFastIndexForPackages(
+        project: ImportedProject,
+        path: Path,
+        packageNames: Collection<String>,
+    ) {
+        if (packageNames.isEmpty()) return
+        var nextIndex = lightweightIndex
+        packageNames
+            .asSequence()
+            .map(String::trim)
+            .filter(String::isNotBlank)
+            .distinct()
+            .sorted()
+            .forEach { packageName ->
+                nextIndex = lightweightIndexBuilder.hydratePackageNeighborhood(
+                    project = project,
+                    packageName = packageName,
+                    currentIndex = nextIndex,
+                    documents = documents,
+                    preferredPath = path,
+                )
+            }
+        if (nextIndex !== lightweightIndex) {
+            lightweightIndex = nextIndex
+            rebuildCombinedIndex()
         }
     }
 
@@ -944,14 +1067,17 @@ class KotlinLanguageServer(
             ?.let { supportSymbolIndexBuilder.loadPackages(request.project, it) }
         if (partialLayer != null) {
             supportCacheManifestAvailable = true
-            synchronized(supportRefreshLock) {
-                loadedSupportPackages.addAll(requestedPackages)
-            }
         }
         if (partialLayer != null && partialLayer.symbols.isNotEmpty()) {
             if (request.projectGeneration != currentProjectGeneration) return
             supportIndex = mergeIndices(listOf(supportIndex, partialLayer.toWorkspaceIndex()))
             rebuildCombinedIndex()
+        }
+        if (partialLayer != null) {
+            synchronized(supportRefreshLock) {
+                loadedSupportPackages.addAll(requestedPackages)
+            }
+            scheduleDiagnosticsPublishForSupportPackages(requestedPackages)
         }
         if (!request.ensureCache) return
 
@@ -982,6 +1108,7 @@ class KotlinLanguageServer(
             }
             supportIndex = mergeIndices(listOf(supportIndex, readyLayer.toWorkspaceIndex()))
             rebuildCombinedIndex()
+            scheduleDiagnosticsPublish()
             supportProgress.report("Cached ${layer.symbols.size} library symbols", 1, 1)
             supportProgress.complete("Dependency index ready")
         } catch (t: Throwable) {
@@ -1017,6 +1144,7 @@ class KotlinLanguageServer(
 
         if (requiresImport) {
             currentProjectGeneration = refreshGeneration.incrementAndGet()
+            workspaceIndexReady = false
             if (usesLocalSemanticRuntime()) {
                 moduleSemanticFingerprints = computeSemanticFingerprints(nextProject)
                 val carriedStates = carryForwardSemanticStates(nextProject)
@@ -1029,6 +1157,7 @@ class KotlinLanguageServer(
         }
 
         if (rebuildFastIndex || lightweightIndex.symbols.isEmpty()) {
+            workspaceIndexReady = false
             val fastIndexProgress = beginProgress(
                 title = "Fast Source Index",
                 subtitle = "Scanning workspace files",
@@ -1046,6 +1175,7 @@ class KotlinLanguageServer(
                 throw t
             }
         }
+        workspaceIndexReady = true
 
         if (requiresImport || previousProject?.root?.normalize() != nextProject.root.normalize()) {
             supportIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
@@ -1063,9 +1193,9 @@ class KotlinLanguageServer(
             project = nextProject,
             projectGeneration = currentProjectGeneration,
             packageNames = supportPackagesForDocuments(documents.openDocuments()),
-            ensureCache = true,
+            ensureCache = requiresImport || previousProject?.root?.normalize() != nextProject.root.normalize(),
         )
-        publishOpenDiagnostics()
+        scheduleDiagnosticsPublish()
         if (usesLocalSemanticRuntime()) {
             val semanticUris = requestedSemanticUris.ifEmpty { documents.openDocuments().map { it.uri }.toSet() }
             if (semanticUris.isNotEmpty()) {
@@ -1091,7 +1221,7 @@ class KotlinLanguageServer(
             )
         }
         rebuildCombinedIndex()
-        publishOpenDiagnostics()
+        scheduleDiagnosticsPublish()
     }
 
     private fun refreshSemanticModules(
@@ -1114,9 +1244,11 @@ class KotlinLanguageServer(
                 currentState?.validated == true &&
                 currentState.projectGeneration == currentProjectGeneration &&
                 currentState.fullyIndexed &&
-                currentState.snapshot != null &&
                 !requestedDocumentsChanged
             ) {
+                if (currentState.snapshot == null) {
+                    scheduleBackgroundWarmup(project, listOf(module.gradlePath), includeOpenModules = true)
+                }
                 return@forEach
             }
             val focusedPaths = focusedSemanticPaths(project, module, moduleRequestedUris)
@@ -1191,6 +1323,7 @@ class KotlinLanguageServer(
             requestId = requestId,
             fullyIndexed = focusedPaths.isEmpty(),
             validated = true,
+            fileContentHashes = semanticFileContentHashes(nextSnapshot),
             openDocumentVersions = openDocumentVersionsForModule(project, module),
         )
     }
@@ -1279,12 +1412,8 @@ class KotlinLanguageServer(
 
     private fun requestedUrisRequireFreshSemantic(requestedUris: Collection<String>): Boolean =
         requestedUris.any { uri ->
-            val document = documents.get(uri) ?: return@any false
             val state = moduleStateForUri(uri) ?: return@any true
-            if (state.projectGeneration != currentProjectGeneration || state.snapshot == null) {
-                return@any true
-            }
-            state.openDocumentVersions[uri] != document.version
+            !semanticStateCurrentForUri(state, uri)
         }
 
     private fun scheduleBackgroundWarmup(
@@ -1302,7 +1431,11 @@ class KotlinLanguageServer(
             }
             modulePaths.forEach { modulePath ->
                 val currentState = semanticStates[modulePath]
-                if (currentState?.projectGeneration == generation && currentState.fullyIndexed) {
+                if (
+                    currentState?.projectGeneration == generation &&
+                    currentState.fullyIndexed &&
+                    currentState.snapshot != null
+                ) {
                     return@forEach
                 }
                 warmupQueuedModules += modulePath
@@ -1353,7 +1486,12 @@ class KotlinLanguageServer(
                     val currentProject = project.takeIf { generation == currentProjectGeneration } ?: break
                     val module = currentProject.modulesByGradlePath[nextModulePath] ?: continue
                     val currentState = semanticStates[nextModulePath]
-                    if (currentState?.validated == true && currentState.projectGeneration == generation && currentState.fullyIndexed) {
+                    if (
+                        currentState?.validated == true &&
+                        currentState.projectGeneration == generation &&
+                        currentState.fullyIndexed &&
+                        currentState.snapshot != null
+                    ) {
                         continue
                     }
                     runCatching {
@@ -1376,11 +1514,31 @@ class KotlinLanguageServer(
         }
     }
 
-    private fun publishOpenDiagnostics() {
+    private fun publishOpenDiagnostics(
+        requestedUris: Set<String> = emptySet(),
+        fullRefresh: Boolean = true,
+        expectedGeneration: Int? = null,
+        forceUris: Set<String> = emptySet(),
+        flushAcknowledgements: Map<String, Int> = emptyMap(),
+    ) {
         if (!clientInitialized) return
         val openUris = documents.openDocuments().map { it.uri }.toSet()
+        val deferredUris = synchronized(diagnosticLock) { deferredDiagnosticUris.toSet() }
+        val targetOpenUris = if (fullRefresh) {
+            openUris - deferredUris
+        } else {
+            openUris.intersect(requestedUris) - deferredUris
+        }
+        if (!fullRefresh && targetOpenUris.isEmpty()) return
         val merged = linkedMapOf<String, MutableList<dev.codex.kotlinls.protocol.Diagnostic>>()
         val currentProject = project
+        currentProject?.let { importedProject ->
+            targetOpenUris.forEach { uri ->
+                val source = sourceView(uri) ?: return@forEach
+                if (!isSourceFile(source.first)) return@forEach
+                hydrateFastIndexForImportedPackages(importedProject, source.first, source.second)
+            }
+        }
         val currentIndex = currentIndex()
         val diagnosticLookup = FastDiagnosticLookup(
             importableFqNames = currentIndex.symbols.asSequence()
@@ -1406,7 +1564,7 @@ class KotlinLanguageServer(
                 .asSequence()
                 .filter { analyzed -> analyzed.module.gradlePath == state.module.gradlePath }
                 .map { it.uri }
-                .filter(openUris::contains)
+                .filter(targetOpenUris::contains)
                 .filter { uri -> semanticStateCurrentForUri(state, uri) }
                 .toSet()
             if (stateUris.isEmpty()) return@forEach
@@ -1415,7 +1573,7 @@ class KotlinLanguageServer(
                 semanticUris += params.uri
             }
         }
-        openUris.forEach { uri ->
+        targetOpenUris.forEach { uri ->
             if (uri in semanticUris) return@forEach
             val diagnostics = mutableListOf<dev.codex.kotlinls.protocol.Diagnostic>()
             val source = sourceView(uri)
@@ -1429,69 +1587,209 @@ class KotlinLanguageServer(
             }
             merged[uri] = diagnostics
         }
-        val urisToSend = publishedDiagnosticUris + openUris
-        urisToSend.forEach { uri ->
-            transport.sendNotification(
-                "textDocument/publishDiagnostics",
-                PublishDiagnosticsParams(
-                    uri = uri,
-                    diagnostics = merged[uri].orEmpty().sortedWith(
-                        compareBy<dev.codex.kotlinls.protocol.Diagnostic> { it.range.start.line }
-                            .thenBy { it.range.start.character },
-                    ),
-                ),
-            )
+        val urisToClear = if (fullRefresh) {
+            publishedDiagnosticUris - openUris
+        } else {
+            emptySet()
         }
-        publishedDiagnosticUris = openUris
+        val urisToSend = urisToClear + targetOpenUris
+        if (expectedGeneration != null && diagnosticRequestGeneration.get() != expectedGeneration) {
+            if (forceUris.isNotEmpty() || flushAcknowledgements.isNotEmpty()) {
+                scheduleDiagnosticsPublish(
+                    delayMillis = 0L,
+                    uris = requestedUris.ifEmpty { forceUris },
+                    fullRefresh = fullRefresh,
+                    forceUris = forceUris,
+                    flushAcknowledgements = flushAcknowledgements,
+                )
+            }
+            return
+        }
+        urisToSend.forEach { uri ->
+            val diagnostics = merged[uri].orEmpty().sortedWith(
+                compareBy<dev.codex.kotlinls.protocol.Diagnostic> { it.range.start.line }
+                    .thenBy { it.range.start.character },
+            )
+            val fingerprint = diagnosticFingerprint(diagnostics)
+            if (uri !in forceUris && publishedDiagnosticFingerprints[uri] == fingerprint && uri in publishedDiagnosticUris) {
+                return@forEach
+            }
+            transport.sendNotification("textDocument/publishDiagnostics", PublishDiagnosticsParams(uri = uri, diagnostics = diagnostics))
+            publishedDiagnosticFingerprints[uri] = fingerprint
+        }
+        publishedDiagnosticUris = if (fullRefresh) {
+            openUris
+        } else {
+            (publishedDiagnosticUris + targetOpenUris) - urisToClear
+        }
+        urisToClear.forEach { uri ->
+            publishedDiagnosticFingerprints.remove(uri)
+        }
+        flushAcknowledgements.forEach { (uri, generation) ->
+            notifyDiagnosticsFlushed(uri, generation)
+        }
     }
 
     private fun clearDiagnostics(uri: String) {
         transport.sendNotification("textDocument/publishDiagnostics", PublishDiagnosticsParams(uri, emptyList()))
         publishedDiagnosticUris = publishedDiagnosticUris - uri
+        publishedDiagnosticFingerprints.remove(uri)
     }
 
     private fun scheduleFastDiagnosticsPublish(uri: String) {
         if (!clientInitialized || !isSourceUri(uri)) return
+        scheduleDiagnosticsPublish(uris = setOf(uri), fullRefresh = false)
+    }
+
+    private fun flushDeferredDiagnostics(
+        uri: String,
+        changedLines: List<ChangedLineRange>,
+        generation: Int?,
+    ) {
+        if (!clientInitialized || !isSourceUri(uri)) return
+        val hadDeferred = synchronized(diagnosticLock) {
+            deferredDiagnosticUris.remove(uri)
+        }
+        if (!hadDeferred && changedLines.isEmpty()) return
+        scheduleDiagnosticsPublish(
+            delayMillis = 0L,
+            uris = setOf(uri),
+            fullRefresh = false,
+            forceUris = setOf(uri),
+            flushAcknowledgements = generation?.let { mapOf(uri to it) }.orEmpty(),
+        )
+    }
+
+    private fun scheduleDiagnosticsPublishForSupportPackages(packageNames: Set<String>) {
+        if (packageNames.isEmpty()) {
+            scheduleDiagnosticsPublish()
+            return
+        }
+        val affectedUris = synchronized(supportRefreshLock) {
+            supportPackagesByUri
+                .asSequence()
+                .filter { (_, requestedPackages) -> requestedPackages.any(packageNames::contains) }
+                .map { (uri, _) -> uri }
+                .toSet()
+        }
+        if (affectedUris.isEmpty()) return
+        scheduleDiagnosticsPublish(uris = affectedUris, fullRefresh = false)
+    }
+
+    private fun scheduleDiagnosticsPublish(
+        delayMillis: Long? = null,
+        uris: Set<String> = emptySet(),
+        fullRefresh: Boolean = true,
+        forceUris: Set<String> = emptySet(),
+        flushAcknowledgements: Map<String, Int> = emptyMap(),
+    ) {
+        if (!clientInitialized) return
+        val effectiveDelayMillis = (delayMillis ?: config.diagnostics.fastDebounceMillis).coerceAtLeast(0L)
+        val targetAt = System.currentTimeMillis() + effectiveDelayMillis
         synchronized(diagnosticLock) {
-            pendingDiagnosticUris += uri
-            if (diagnosticsRefreshRunning) return
+            diagnosticRequestGeneration.incrementAndGet()
+            if (fullRefresh) {
+                pendingDiagnosticFullRefresh = true
+                pendingDiagnosticUris.clear()
+            } else if (!pendingDiagnosticFullRefresh) {
+                pendingDiagnosticUris += uris
+            }
+            pendingDiagnosticForceUris += forceUris
+            pendingDiagnosticFlushAcknowledgements.putAll(flushAcknowledgements)
+            pendingDiagnosticPublishAtMillis = targetAt
+            if (diagnosticsRefreshRunning) {
+                diagnosticLock.notifyAll()
+                return
+            }
             diagnosticsRefreshRunning = true
         }
         try {
             diagnosticExecutor.execute {
                 while (true) {
-                    try {
-                        Thread.sleep(fastDiagnosticDebounceMillis)
-                    } catch (_: InterruptedException) {
-                        Thread.currentThread().interrupt()
-                        synchronized(diagnosticLock) {
-                            diagnosticsRefreshRunning = false
-                            pendingDiagnosticUris.clear()
+                    var fullRefreshNow = false
+                    var urisToPublishNow = emptySet<String>()
+                    var forceUrisNow = emptySet<String>()
+                    var flushAcknowledgementsNow = emptyMap<String, Int>()
+                    var expectedGeneration = 0
+                    synchronized(diagnosticLock) {
+                        while (true) {
+                            val target = pendingDiagnosticPublishAtMillis
+                            if (target <= 0L) {
+                                diagnosticsRefreshRunning = false
+                                return@execute
+                            }
+                            val remaining = target - System.currentTimeMillis()
+                            if (remaining <= 0L) {
+                                fullRefreshNow = pendingDiagnosticFullRefresh
+                                urisToPublishNow = pendingDiagnosticUris.toSet()
+                                forceUrisNow = pendingDiagnosticForceUris.toSet()
+                                flushAcknowledgementsNow = pendingDiagnosticFlushAcknowledgements.toMap()
+                                expectedGeneration = diagnosticRequestGeneration.get()
+                                pendingDiagnosticFullRefresh = false
+                                pendingDiagnosticUris.clear()
+                                pendingDiagnosticForceUris.clear()
+                                pendingDiagnosticFlushAcknowledgements.clear()
+                                pendingDiagnosticPublishAtMillis = 0L
+                                break
+                            }
+                            try {
+                                diagnosticLock.wait(remaining)
+                            } catch (_: InterruptedException) {
+                                Thread.currentThread().interrupt()
+                                diagnosticsRefreshRunning = false
+                                pendingDiagnosticPublishAtMillis = 0L
+                                pendingDiagnosticFullRefresh = false
+                                pendingDiagnosticUris.clear()
+                                pendingDiagnosticForceUris.clear()
+                                pendingDiagnosticFlushAcknowledgements.clear()
+                                return@execute
+                            }
                         }
-                        return@execute
                     }
-                    val shouldPublish = synchronized(diagnosticLock) {
-                        if (pendingDiagnosticUris.isEmpty()) {
-                            diagnosticsRefreshRunning = false
-                            false
-                        } else {
-                            pendingDiagnosticUris.clear()
-                            true
-                        }
-                    }
-                    if (!shouldPublish) {
-                        return@execute
-                    }
-                    publishOpenDiagnostics()
+                    publishOpenDiagnostics(
+                        urisToPublishNow,
+                        fullRefresh = fullRefreshNow,
+                        expectedGeneration = expectedGeneration,
+                        forceUris = forceUrisNow,
+                        flushAcknowledgements = flushAcknowledgementsNow,
+                    )
                 }
             }
         } catch (_: java.util.concurrent.RejectedExecutionException) {
             synchronized(diagnosticLock) {
                 diagnosticsRefreshRunning = false
+                pendingDiagnosticPublishAtMillis = 0L
+                pendingDiagnosticFullRefresh = false
                 pendingDiagnosticUris.clear()
+                pendingDiagnosticForceUris.clear()
+                pendingDiagnosticFlushAcknowledgements.clear()
             }
         }
     }
+
+    private fun notifyDiagnosticsFlushed(uri: String, generation: Int) {
+        transport.sendNotification(
+            "$/android-neovim/diagnosticsFlushed",
+            DiagnosticsFlushedParams(
+                textDocument = dev.codex.kotlinls.protocol.TextDocumentIdentifier(uri),
+                generation = generation,
+            ),
+        )
+    }
+
+    private fun diagnosticFingerprint(diagnostics: List<dev.codex.kotlinls.protocol.Diagnostic>): String =
+        buildString {
+            diagnostics.forEach { diagnostic ->
+                append(diagnostic.range.start.line).append(':')
+                append(diagnostic.range.start.character).append(':')
+                append(diagnostic.range.end.line).append(':')
+                append(diagnostic.range.end.character).append(':')
+                append(diagnostic.severity).append(':')
+                append(diagnostic.code).append(':')
+                append(diagnostic.source).append(':')
+                append(diagnostic.message).append('\n')
+            }
+        }
 
     private fun availableSemanticState(uri: String): Pair<WorkspaceAnalysisSnapshot, WorkspaceIndex>? =
         if (!usesLocalSemanticRuntime()) {
@@ -1566,7 +1864,22 @@ class KotlinLanguageServer(
                 append('@')
                 append(version)
                 append(';')
-            }
+        }
+    }
+
+    private fun applyTextEdits(
+        text: String,
+        edits: List<TextEdit>,
+    ): String {
+        if (edits.isEmpty()) return text
+        val lineIndex = LineIndex.build(text)
+        val builder = StringBuilder(text)
+        edits.sortedByDescending { lineIndex.offset(it.range.start) }.forEach { edit ->
+            val start = lineIndex.offset(edit.range.start)
+            val end = lineIndex.offset(edit.range.end)
+            builder.replace(start, end, edit.newText)
+        }
+        return builder.toString()
     }
 
     private fun currentIndex(): WorkspaceIndex =
@@ -1669,8 +1982,18 @@ class KotlinLanguageServer(
         state: ModuleSemanticState,
         uri: String,
     ): Boolean {
-        val currentVersion = documents.get(uri)?.version ?: return true
-        return state.openDocumentVersions[uri] == currentVersion
+        if (state.projectGeneration != currentProjectGeneration) return false
+        val currentHash = currentSourceContentHash(uri) ?: return true
+        state.fileContentHashes[uri]?.let { recordedHash ->
+            return recordedHash == currentHash
+        }
+        val currentVersion = documents.get(uri)?.version
+        if (currentVersion != null && state.openDocumentVersions[uri] == currentVersion) {
+            return true
+        }
+        if (!state.validated || !state.fullyIndexed) return false
+        val diskHash = diskSourceContentHash(documentUriToPath(uri)) ?: return false
+        return diskHash == currentHash
     }
 
     private fun moduleStateForUri(uri: String): ModuleSemanticState? {
@@ -1702,6 +2025,7 @@ class KotlinLanguageServer(
                     requestId = state.requestId,
                     fullyIndexed = state.fullyIndexed,
                     validated = false,
+                    fileContentHashes = emptyMap(),
                     openDocumentVersions = emptyMap(),
                 )
             }.toMap()
@@ -1763,6 +2087,7 @@ class KotlinLanguageServer(
             supportIndex = mergeIndices(listOf(supportIndex, partialLayer.toWorkspaceIndex()))
             rebuildCombinedIndex()
         }
+        scheduleDiagnosticsPublishForSupportPackages(missingPackages)
     }
 
     private fun collapsePendingSemanticUri(uri: String) {
@@ -1781,10 +2106,12 @@ class KotlinLanguageServer(
     private fun semanticStateEligibleForIndex(state: ModuleSemanticState): Boolean {
         if (state.projectGeneration != currentProjectGeneration) return false
         val currentProject = project ?: return true
-        val currentOpenVersions = openDocumentVersionsForModule(currentProject, state.module)
-        return currentOpenVersions.all { (uri, version) ->
-            state.openDocumentVersions[uri] == version
-        }
+        return documents.openDocuments()
+            .asSequence()
+            .filter { document ->
+                currentProject.moduleForPath(documentUriToPath(document.uri))?.gradlePath == state.module.gradlePath
+            }
+            .all { document -> semanticStateCurrentForUri(state, document.uri) }
     }
 
     private fun nextSemanticRequestId(modulePath: String): Int =
@@ -1822,37 +2149,46 @@ class KotlinLanguageServer(
         }
         rebuildCombinedIndex()
         persistSemanticState(nextState)
-        publishOpenDiagnostics()
+        scheduleDiagnosticsPublish()
+        if (!nextState.fullyIndexed) {
+            project?.let { currentProject ->
+                if (nextState.projectGeneration == currentProjectGeneration) {
+                    scheduleBackgroundWarmup(currentProject, listOf(nextState.module.gradlePath), includeOpenModules = true)
+                }
+            }
+        }
     }
 
     private fun loadPersistedSemanticStates(project: ImportedProject): Map<String, ModuleSemanticState> =
         project.modules.mapNotNull { module ->
             val fingerprint = moduleSemanticFingerprints[module.gradlePath] ?: return@mapNotNull null
-            val index = semanticIndexCache.load(project.root, module.gradlePath, fingerprint) ?: return@mapNotNull null
+            val cached = semanticIndexCache.loadEntry(project.root, module.gradlePath, fingerprint) ?: return@mapNotNull null
             module.gradlePath to ModuleSemanticState(
                 module = module,
                 snapshot = null,
-                index = index,
+                index = cached.index,
                 projectGeneration = currentProjectGeneration,
                 requestId = 0,
                 fullyIndexed = true,
                 validated = true,
+                fileContentHashes = cached.fileContentHashes,
                 openDocumentVersions = emptyMap(),
             )
         }.toMap()
 
     private fun loadOptimisticSemanticStates(project: ImportedProject): Map<String, ModuleSemanticState> {
-        val cachedByModule = semanticIndexCache.loadAll(project.root)
+        val cachedByModule = semanticIndexCache.loadAllEntries(project.root)
         return project.modules.mapNotNull { module ->
-            val index = cachedByModule[module.gradlePath] ?: return@mapNotNull null
+            val cached = cachedByModule[module.gradlePath] ?: return@mapNotNull null
             module.gradlePath to ModuleSemanticState(
                 module = module,
                 snapshot = null,
-                index = index,
+                index = cached.index,
                 projectGeneration = currentProjectGeneration,
                 requestId = 0,
                 fullyIndexed = true,
                 validated = false,
+                fileContentHashes = cached.fileContentHashes,
                 openDocumentVersions = emptyMap(),
             )
         }.toMap()
@@ -1867,8 +2203,18 @@ class KotlinLanguageServer(
             moduleGradlePath = state.module.gradlePath,
             fingerprint = fingerprint,
             index = state.index,
+            fileContentHashes = state.fileContentHashes,
         )
     }
+
+    private fun semanticFileContentHashes(snapshot: WorkspaceAnalysisSnapshot): Map<String, String> =
+        snapshot.files.associate { file -> file.uri to sha256(file.text) }
+
+    private fun currentSourceContentHash(uri: String): String? =
+        documents.get(uri)?.text?.let(::sha256) ?: diskSourceContentHash(documentUriToPath(uri))
+
+    private fun diskSourceContentHash(path: Path): String? =
+        runCatching { Files.readString(path.normalize()) }.getOrNull()?.let(::sha256)
 
     private fun computeSemanticFingerprints(project: ImportedProject): Map<String, String> =
         project.modules.associate { module ->
@@ -2102,16 +2448,6 @@ class KotlinLanguageServer(
         )
     }
 
-    private fun notifyUser(message: String) {
-        transport.sendNotification(
-            "window/showMessage",
-            mapOf(
-                "type" to 3,
-                "message" to "android-neovim-lsp: $message",
-            ),
-        )
-    }
-
     private fun recordCompletionRoute(
         decision: CompletionRoutingDecision,
         itemCount: Int,
@@ -2236,6 +2572,25 @@ class KotlinLanguageServer(
         val value: T,
     )
 
+    private data class FlushDiagnosticsParams(
+        val textDocument: dev.codex.kotlinls.protocol.TextDocumentIdentifier,
+        @param:JsonProperty("changed_lines")
+        val changedLines: List<ChangedLineRange> = emptyList(),
+        val generation: Int? = null,
+    )
+
+    private data class ChangedLineRange(
+        @param:JsonProperty("start_line")
+        val startLine: Int,
+        @param:JsonProperty("end_line")
+        val endLine: Int,
+    )
+
+    private data class DiagnosticsFlushedParams(
+        val textDocument: dev.codex.kotlinls.protocol.TextDocumentIdentifier,
+        val generation: Int,
+    )
+
     private data class ModuleSemanticState(
         val module: ImportedModule,
         val snapshot: WorkspaceAnalysisSnapshot?,
@@ -2244,6 +2599,7 @@ class KotlinLanguageServer(
         val requestId: Int,
         val fullyIndexed: Boolean,
         val validated: Boolean,
+        val fileContentHashes: Map<String, String>,
         val openDocumentVersions: Map<String, Int>,
     )
 }

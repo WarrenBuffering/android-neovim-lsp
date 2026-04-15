@@ -6,6 +6,7 @@ import dev.codex.kotlinls.protocol.Json
 internal data class KotlinLsConfig(
     val semantic: SemanticConfig = SemanticConfig(),
     val progress: ProgressConfig = ProgressConfig(),
+    val diagnostics: DiagnosticsConfig = DiagnosticsConfig(),
 ) {
     companion object {
         fun fromInitializationOptions(initializationOptions: Map<String, Any?>?): KotlinLsConfig {
@@ -24,6 +25,13 @@ internal data class KotlinLsConfig(
                 progress = ProgressConfig(
                     mode = ProgressMode.from(parsed.progress.mode),
                 ),
+                diagnostics = DiagnosticsConfig(
+                    fastDebounceMillis = parsed.diagnostics.fastDebounceMillis
+                        ?.coerceAtLeast(0L)
+                        ?: DiagnosticsConfig().fastDebounceMillis,
+                    flushOnInsertLeave = parsed.diagnostics.flushOnInsertLeave
+                        ?: DiagnosticsConfig().flushOnInsertLeave,
+                ),
             )
         }
     }
@@ -37,6 +45,11 @@ internal data class SemanticConfig(
 
 internal data class ProgressConfig(
     val mode: ProgressMode = ProgressMode.MINIMAL,
+)
+
+internal data class DiagnosticsConfig(
+    val fastDebounceMillis: Long = 100L,
+    val flushOnInsertLeave: Boolean = false,
 )
 
 internal enum class SemanticBackend {
@@ -82,6 +95,7 @@ internal enum class ProgressMode {
 private data class RawKotlinLsConfig(
     val semantic: RawSemanticConfig = RawSemanticConfig(),
     val progress: RawProgressConfig = RawProgressConfig(),
+    val diagnostics: RawDiagnosticsConfig = RawDiagnosticsConfig(),
 )
 
 private data class RawSemanticConfig(
@@ -93,4 +107,11 @@ private data class RawSemanticConfig(
 
 private data class RawProgressConfig(
     val mode: String? = null,
+)
+
+private data class RawDiagnosticsConfig(
+    @param:JsonProperty("fast_debounce_ms")
+    val fastDebounceMillis: Long? = null,
+    @param:JsonProperty("flush_on_insert_leave")
+    val flushOnInsertLeave: Boolean? = null,
 )

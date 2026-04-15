@@ -49,12 +49,19 @@ object SourceIndexLookup {
     ): Set<String> =
         buildSet {
             addAll(defaultImportPackages(path))
-            imports(text)
-                .mapNotNull { sourceImport ->
-                    sourceImport.fqName.substringBeforeLast('.', missingDelimiterValue = "").takeIf { it.isNotBlank() }
-                }
-                .forEach(::add)
+            addAll(importedPackages(text))
         }
+
+    fun importedPackages(text: String): Set<String> =
+        IMPORT_PATH_REGEX.findAll(text)
+            .mapNotNull { match ->
+                val importedPath = match.groupValues[1]
+                when {
+                    importedPath.endsWith(".*") -> importedPath.removeSuffix(".*").takeIf { it.isNotBlank() }
+                    else -> importedPath.substringBeforeLast('.', missingDelimiterValue = "").takeIf { it.isNotBlank() }
+                }
+            }
+            .toSet()
 
     private fun resolveImported(
         index: WorkspaceIndex,
@@ -169,6 +176,7 @@ object SourceIndexLookup {
 
     private val PACKAGE_REGEX = Regex("""(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_$.]*)\s*$""")
     private val IMPORT_REGEX = Regex("""(?m)^\s*import\s+([A-Za-z_][A-Za-z0-9_$.]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*$""")
+    private val IMPORT_PATH_REGEX = Regex("""(?m)^\s*import\s+([A-Za-z_][A-Za-z0-9_$.]*(?:\.\*)?)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*$""")
     private val DEFAULT_KOTLIN_IMPORT_PACKAGES = setOf(
         "java.lang",
         "kotlin",

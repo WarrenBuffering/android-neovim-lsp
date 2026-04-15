@@ -62,8 +62,15 @@ class DiagnosticsService(
         text: String,
         lookup: FastDiagnosticLookup?,
     ): List<Diagnostic> {
-        val availableLookup = lookup ?: return emptyList()
         val diagnostics = mutableListOf<Diagnostic>()
+        malformedImportLines(text).forEach { malformed ->
+            diagnostics += malformed.diagnostic(
+                code = "malformed-import",
+                message = "Malformed import statement.",
+            )
+        }
+        val availableLookup = lookup
+            ?: return diagnostics.sortedWith(compareBy<Diagnostic> { it.range.start.line }.thenBy { it.range.start.character })
         val seenImports = linkedMapOf<ImportIdentity, ImportLine>()
         validImportLines(text).forEach { importLine ->
             val identity = ImportIdentity(importLine.importedPath, importLine.alias)
@@ -107,12 +114,6 @@ class DiagnosticsService(
                     )
                 }
             }
-        }
-        malformedImportLines(text).forEach { malformed ->
-            diagnostics += malformed.diagnostic(
-                code = "malformed-import",
-                message = "Malformed import statement.",
-            )
         }
         return diagnostics.sortedWith(compareBy<Diagnostic> { it.range.start.line }.thenBy { it.range.start.character })
     }

@@ -4,6 +4,7 @@ import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.completion.CompletionRoute
 import dev.codex.kotlinls.completion.CompletionService
 import dev.codex.kotlinls.hover.HoverAndSignatureService
+import dev.codex.kotlinls.index.IndexedParameter
 import dev.codex.kotlinls.index.IndexedSymbol
 import dev.codex.kotlinls.index.WorkspaceIndex
 import dev.codex.kotlinls.index.WorkspaceIndexBuilder
@@ -201,6 +202,13 @@ fun featureSuite(): TestSuite {
                 assertTrue("animateDpAsState" in labels) {
                     "Expected animateDpAsState import completion, got ${labels.take(10)}"
                 }
+                val animate = completions.items.firstOrNull { it.label == "animateDpAsState" }
+                assertEquals(CompletionItemKind.TEXT, animate?.kind) {
+                    "Expected import completion to stay plain-text so confirm does not insert (), got ${animate?.kind}"
+                }
+                assertEquals("animateDpAsState", animate?.insertText) {
+                    "Expected import completion to insert the symbol name only, got ${animate?.insertText}"
+                }
             },
             TestCase("offers package segment completion inside imports") {
                 val root = FixtureSupport.fixture("multi-module")
@@ -278,6 +286,164 @@ fun featureSuite(): TestSuite {
                 assertTrue(shout?.additionalTextEdits?.any { it.newText.contains("import demo.lib.shout") } == true) {
                     "Expected shout completion to add import, got ${shout?.additionalTextEdits}"
                 }
+            },
+            TestCase("routes lexical call-argument completions through the bridge") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    fun renderCard(
+                        title: String,
+                        subtitle: String,
+                    ) {}
+
+                    fun demo() {
+                        renderCard(
+                            title = "Dockside Notes",
+                            sub
+                        )
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 31,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.trim() == "sub" }
+                val column = content.lines()[line].indexOf("sub") + 3
+                val decision = completionService.classifyCompletionRoute(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                    bridgeAvailable = true,
+                )
+                assertEquals(CompletionRoute.BRIDGE, decision.route) {
+                    "Expected lexical call-argument completion to use the bridge, got $decision"
+                }
+                assertEquals("lexical-scope-sensitive-context", decision.reason) {
+                    "Expected lexical bridge routing reason, got $decision"
+                }
+            },
+            TestCase("offers resolved named argument completions from semantic call descriptors") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    fun renderCard(
+                        title: String,
+                        subtitle: String,
+                    ) {}
+
+                    fun demo() {
+                        renderCard(
+                            title = "Dockside Notes",
+                            sub
+                        )
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 32,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.trim() == "sub" }
+                val column = content.lines()[line].indexOf("sub") + 3
+                val completions = completionService.complete(
+                    snapshot,
+                    index,
+                    CompletionParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                    allowBridge = false,
+                )
+                val subtitle = completions.items.firstOrNull { it.label == "subtitle" }
+                assertTrue(subtitle != null) {
+                    "Expected resolved named argument completion for subtitle, got ${completions.items.take(10).map { it.label }}"
+                }
+                assertEquals("subtitle = ", subtitle?.insertText) {
+                    "Expected named argument completion to insert the parameter assignment, got ${subtitle?.insertText}"
+                }
+                assertEquals(CompletionItemKind.PROPERTY, subtitle?.kind) {
+                    "Expected named argument completion to avoid callable insertion behavior, got ${subtitle?.kind}"
+                }
+                assertContains(subtitle?.detail.orEmpty(), "String")
+            },
+            TestCase("offers named argument completions from indexed callable signatures") {
+                val index = WorkspaceIndex(
+                    symbols = listOf(
+                        indexedSymbol(
+                            id = "source::dev.castline.anglerswharf.sections.TackleBoxHeader",
+                            name = "TackleBoxHeader",
+                            fqName = "dev.castline.anglerswharf.sections.TackleBoxHeader",
+                            signature = "TackleBoxHeader(title: String, subtitle: String)",
+                            documentation = "Fishing demo header composable.",
+                            packageName = "dev.castline.anglerswharf.sections",
+                            path = Path.of("/workspace/app/src/main/kotlin/dev/castline/anglerswharf/sections/TackleBoxHeader.kt"),
+                            uri = "file:///workspace/app/src/main/kotlin/dev/castline/anglerswharf/sections/TackleBoxHeader.kt",
+                            parameters = listOf(
+                                IndexedParameter(name = "title", type = "String"),
+                                IndexedParameter(name = "subtitle", type = "String"),
+                            ),
+                        ),
+                    ),
+                    references = emptyList(),
+                    callEdges = emptyList(),
+                )
+                val text = """
+                    package dev.castline.anglerswharf
+
+                    import dev.castline.anglerswharf.sections.TackleBoxHeader
+
+                    fun demo() {
+                        TackleBoxHeader(
+                            title = "Dockside Notes",
+                            subti
+                        )
+                    }
+                """.trimIndent()
+                val line = text.lines().indexOfFirst { it.trim() == "subti" }
+                val column = text.lines()[line].indexOf("subti") + 5
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = Path.of("/workspace/app/src/main/kotlin/dev/castline/anglerswharf/TackleBoxView.kt"),
+                    text = text,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier("file:///workspace/app/src/main/kotlin/dev/castline/anglerswharf/TackleBoxView.kt"),
+                        position = Position(line, column),
+                    ),
+                )
+                val subtitle = completions.items.firstOrNull { it.label == "subtitle" }
+                assertTrue(subtitle != null) {
+                    "Expected indexed named argument completion for subtitle, got ${completions.items.take(10).map { it.label }}"
+                }
+                assertEquals("subtitle = ", subtitle?.insertText) {
+                    "Expected indexed named argument completion to insert the parameter assignment, got ${subtitle?.insertText}"
+                }
+                assertEquals(CompletionItemKind.PROPERTY, subtitle?.kind) {
+                    "Expected indexed named argument completion to stay non-callable, got ${subtitle?.kind}"
+                }
+                assertContains(subtitle?.detail.orEmpty(), "String")
             },
             TestCase("boosts imported extension completions in index-only mode") {
                 val root = FixtureSupport.fixture("multi-module")
@@ -1035,8 +1201,8 @@ fun featureSuite(): TestSuite {
                 val index = indexBuilder.build(snapshot)
                 val appFile = root.resolve("app/src/main/kotlin/demo/app/Main.kt")
                 val content = appFile.readText()
-                val targetLine = content.lines().indexOfFirst { it.contains("Greeting().say") }
-                val targetColumn = content.lines()[targetLine].lastIndexOf("Greeting") + 2
+                val targetLine = content.lines().indexOfFirst { it.contains("fun demo(): Greeting") }
+                val targetColumn = content.lines()[targetLine].indexOf("Greeting") + 2
                 val locations = navigationService.definition(
                     snapshot,
                     index,
@@ -1062,6 +1228,7 @@ private fun indexedSymbol(
     packageName: String,
     path: Path,
     uri: String,
+    parameters: List<IndexedParameter> = emptyList(),
 ): IndexedSymbol = IndexedSymbol(
     id = id,
     name = name,
@@ -1076,4 +1243,6 @@ private fun indexedSymbol(
     packageName = packageName,
     moduleName = "support",
     importable = true,
+    parameterCount = parameters.size,
+    parameters = parameters,
 )

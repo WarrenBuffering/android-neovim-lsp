@@ -77,6 +77,63 @@ fun formattingSuite(): TestSuite {
                 assertContains(formatted, "    \"b\",")
                 assertContains(formatted, "separator = \",\"")
             },
+            TestCase("bridge-backed document formatting also organizes imports") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    import kotlin.collections.setOf
+                    import kotlin.collections.listOf
+
+                    fun greet( name:String)=listOf(
+                    "a",
+                    "b"
+                    ).joinToString(separator =",")
+                """.trimIndent()
+                val bridgeFormattingService = FormattingService(
+                    intellijFormatterBridge = FormatterBridge { _, _, _ ->
+                        """
+                        package demo
+
+                        import kotlin.collections.setOf
+                        import kotlin.collections.listOf
+
+                        fun greet(name: String) = listOf(
+                            "a",
+                            "b",
+                        ).joinToString(separator = ",")
+                        """.trimIndent()
+                    },
+                )
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 8,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val edits = bridgeFormattingService.formatDocument(
+                    snapshot,
+                    DocumentFormattingParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        options = FormattingOptions(tabSize = 4, insertSpaces = true),
+                    ),
+                )
+                val formatted = applyEdits(content, edits)
+                assertContains(formatted, "import kotlin.collections.listOf")
+                assertTrue(
+                    formatted.indexOf("import kotlin.collections.listOf") <
+                        formatted.indexOf("import kotlin.collections.setOf"),
+                ) {
+                    "Expected imports to be reorganized after bridge formatting: $formatted"
+                }
+                assertContains(formatted, "fun greet(name: String) =")
+            },
             TestCase("range formatting only edits overlapping formatted changes") {
                 val root = FixtureSupport.fixture("simple-jvm-app")
                 val project = importer.importProject(root)
@@ -569,37 +626,27 @@ fun formattingSuite(): TestSuite {
             },
             TestCase("detects JetBrains bridge from product bundle metadata") {
                 val root = Files.createTempDirectory("kotlinls-idea-home")
-                val contents = root.resolve("Android Studio.app/Contents")
-                contents.resolve("Resources").createDirectories()
-                contents.resolve("bin").createDirectories()
-                contents.resolve("lib").createDirectories()
-                contents.resolve("plugins/Kotlin/lib").createDirectories()
-                contents.resolve("jbr/Contents/Home/bin").createDirectories()
-                contents.resolve("Resources/product-info.json").writeText(
-                    """
-                    {
-                      "launch": [
-                        {
-                          "os": "macOS",
-                          "arch": "aarch64",
-                          "vmOptionsFilePath": "../bin/studio.vmoptions",
-                          "bootClassPathJarNames": ["app.jar"],
-                          "additionalJvmArguments": [
-                            "-Didea.platform.prefix=AndroidStudio",
-                            "--add-opens=java.base/java.lang=ALL-UNNAMED"
-                          ],
-                          "mainClass": "com.android.tools.idea.MainWrapper"
-                        }
-                      ]
-                    }
-                    """.trimIndent() + "\n",
-                )
-                contents.resolve("bin/studio.vmoptions").writeText("-Xmx512m\n")
-                contents.resolve("lib/app.jar").writeText("")
-                contents.resolve("plugins/Kotlin/lib/kotlin-plugin.jar").writeText("")
-                contents.resolve("jbr/Contents/Home/bin/java").writeText("")
+                val contents = createFakeIdeaHome(root.resolve("Android Studio.app/Contents"))
                 val bridge = JetBrainsFormatterBridge.fromIdeaHome(contents)
                 assertTrue(bridge != null) { "Expected JetBrains bridge to be detected from fake bundle" }
+            },
+            TestCase("detects JetBrains bridge from local.properties project config") {
+                val root = Files.createTempDirectory("kotlinls-local-properties-idea-home")
+                val contents = createFakeIdeaHome(root.resolve("Android Studio.app/Contents"))
+                val projectRoot = Files.createTempDirectory("kotlinls-local-properties-project")
+                projectRoot.resolve("local.properties").writeText(
+                    "kotlinls.intellijHome=${contents}\n",
+                )
+                withSystemProperty("kotlinls.enableIntellijBridge", null) {
+                    withSystemProperty("kotlinls.intellijHome", null) {
+                        withSystemProperty("kotlinls.disableIntellijBridge", null) {
+                            val bridge = JetBrainsFormatterBridge.detect(projectRoot)
+                            assertTrue(bridge != null) {
+                                "Expected JetBrains bridge to be detected from local.properties project config"
+                            }
+                        }
+                    }
+                }
             },
             TestCase("JetBrains bridge only opts into incubator vector when runtime provides it") {
                 val root = Files.createTempDirectory("kotlinls-idea-home-no-vector")
@@ -668,15 +715,50 @@ fun formattingSuite(): TestSuite {
                 assertContains(fileName, "IgnisMapView")
             },
             TestCase("keeps JetBrains formatter bridge off by default") {
+                val projectRoot = Files.createTempDirectory("kotlinls-no-idea-home")
                 withSystemProperty("kotlinls.enableIntellijBridge", null) {
                     withSystemProperty("kotlinls.intellijHome", null) {
-                        val bridge = JetBrainsFormatterBridge.detect()
-                        assertTrue(bridge == null) { "Expected JetBrains bridge to stay off without explicit opt-in" }
+                        withSystemProperty("kotlinls.disableIntellijBridge", null) {
+                            val bridge = JetBrainsFormatterBridge.detect(projectRoot)
+                            assertTrue(bridge == null) { "Expected JetBrains bridge to stay off without explicit opt-in" }
+                        }
                     }
                 }
             },
         ),
     )
+}
+
+private fun createFakeIdeaHome(contents: java.nio.file.Path): java.nio.file.Path {
+    contents.resolve("Resources").createDirectories()
+    contents.resolve("bin").createDirectories()
+    contents.resolve("lib").createDirectories()
+    contents.resolve("plugins/Kotlin/lib").createDirectories()
+    contents.resolve("jbr/Contents/Home/bin").createDirectories()
+    contents.resolve("Resources/product-info.json").writeText(
+        """
+        {
+          "launch": [
+            {
+              "os": "macOS",
+              "arch": "aarch64",
+              "vmOptionsFilePath": "../bin/studio.vmoptions",
+              "bootClassPathJarNames": ["app.jar"],
+              "additionalJvmArguments": [
+                "-Didea.platform.prefix=AndroidStudio",
+                "--add-opens=java.base/java.lang=ALL-UNNAMED"
+              ],
+              "mainClass": "com.android.tools.idea.MainWrapper"
+            }
+          ]
+        }
+        """.trimIndent() + "\n",
+    )
+    contents.resolve("bin/studio.vmoptions").writeText("-Xmx512m\n")
+    contents.resolve("lib/app.jar").writeText("")
+    contents.resolve("plugins/Kotlin/lib/kotlin-plugin.jar").writeText("")
+    contents.resolve("jbr/Contents/Home/bin/java").writeText("")
+    return contents
 }
 
 private fun applyEdits(

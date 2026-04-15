@@ -9,3 +9,5 @@ tmp/
 .DS_Store
 packaging/dist/
 scratch/
+local.properties
+**/local.properties

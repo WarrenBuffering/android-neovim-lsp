@@ -34,6 +34,10 @@ require("lazy").setup({
     dependencies = { "neovim/nvim-lspconfig" },
     config = function()
       require("android_neovim_lsp").setup({
+        diagnostics = {
+          enabled = true,
+          debounce_ms = 100,
+        },
         inlay_hints = false,
         format_on_save = true,
         block_on_save = false,

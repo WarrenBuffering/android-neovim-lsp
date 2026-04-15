@@ -1,0 +1,8 @@
+# Copy this file to local.properties and adjust the paths for your machine.
+
+# Required for Android module import and classpath augmentation.
+sdk.dir=/Users/yourname/Library/Android/sdk
+
+# Optional but recommended if you want bridge-backed semantic and formatting features
+# to use a specific Android Studio or IntelliJ install.
+kotlinls.intellijHome=/Applications/Android Studio.app/Contents

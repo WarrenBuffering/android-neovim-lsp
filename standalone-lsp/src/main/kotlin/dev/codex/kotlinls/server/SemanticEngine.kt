@@ -12,6 +12,7 @@ import dev.codex.kotlinls.protocol.CompletionParams
 import dev.codex.kotlinls.protocol.DocumentFormattingParams
 import dev.codex.kotlinls.protocol.DocumentRangeFormattingParams
 import dev.codex.kotlinls.protocol.Hover
+import dev.codex.kotlinls.protocol.IntellijHomeLocator
 import dev.codex.kotlinls.protocol.Location
 import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
@@ -426,10 +427,10 @@ internal class BridgeK2SemanticEngine private constructor(
         runCatching { currentBridge?.close() }
     }
 
-    private fun acquireBridge(): JetBrainsCompletionBridge? {
+    private fun acquireBridge(preferredProjectRoot: Path? = null): JetBrainsCompletionBridge? {
         bridge?.let { return it }
         return synchronized(this) {
-            bridge ?: JetBrainsCompletionBridge.detect(forceEnable = true)?.also { detected ->
+            bridge ?: JetBrainsCompletionBridge.detect(forceEnable = true, projectRoot = preferredProjectRoot)?.also { detected ->
                 bridge = detected
                 synchronized(pendingSyncLock) {
                     scheduleSyncDrainLocked(0L)
@@ -448,14 +449,16 @@ internal class BridgeK2SemanticEngine private constructor(
     }
 
     private fun scheduleBridgeStartup() {
+        var preferredProjectRoot: Path? = null
         synchronized(pendingSyncLock) {
             if (bridge != null || bridgeStartupScheduled) return
             bridgeStartupScheduled = true
+            preferredProjectRoot = pendingProjectWarmups.firstOrNull() ?: pendingDocumentSyncs.values.firstOrNull()?.projectRoot
         }
         try {
             syncExecutor.execute {
                 try {
-                    acquireBridge()
+                    acquireBridge(preferredProjectRoot)
                 } finally {
                     synchronized(pendingSyncLock) {
                         bridgeStartupScheduled = false
@@ -692,15 +695,9 @@ internal class BridgeK2SemanticEngine private constructor(
         }
 
         private fun detectFormatterBridge() =
-            configuredIdeaHome()
+            IntellijHomeLocator.configuredIdeaHome()
                 ?.let(JetBrainsFormatterBridge::fromIdeaHome)
                 ?: commonIdeaHomes().firstNotNullOfOrNull(JetBrainsFormatterBridge::fromIdeaHome)
-
-        private fun configuredIdeaHome(): Path? {
-            val configured = System.getProperty("kotlinls.intellijHome")
-                ?: System.getenv("KOTLINLS_INTELLIJ_HOME")
-            return configured?.takeIf { it.isNotBlank() }?.let(Path::of)?.normalize()
-        }
 
         private fun commonIdeaHomes(): List<Path> =
             listOf(
