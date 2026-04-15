@@ -493,6 +493,7 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
         },
         TestCase("warms semantic caches for the full project in background on first startup") {
             val projectRoot = createSemanticPersistenceMultiModuleFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/AppEntry.kt")
             val cacheRoot = Files.createTempDirectory("kotlinls-semantic-full-project-cache")
             val cache = PersistentSemanticIndexCache(cacheRoot)
 
@@ -515,18 +516,20 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
                         ),
                     ),
                 )
+                openDocument(server, appFile)
 
                 val appCached = waitForSemanticCacheEntry(cache, projectRoot, ":app")
                 val libCached = waitForSemanticCacheEntry(cache, projectRoot, ":lib")
                 val toolsCached = waitForSemanticCacheEntry(cache, projectRoot, ":tools")
 
-                assertTrue(appCached != null) { "Expected startup warmup to cache the app module" }
-                assertTrue(libCached != null) { "Expected startup warmup to cache the library module" }
-                assertTrue(toolsCached != null) { "Expected startup warmup to cache unrelated modules across the whole project" }
+                assertTrue(appCached != null) { "Expected first-open warmup to cache the app module" }
+                assertTrue(libCached != null) { "Expected first-open warmup to cache the library module" }
+                assertTrue(toolsCached != null) { "Expected first-open warmup to cache unrelated modules across the whole project" }
             }
         },
         TestCase("skips full-project background warmup when semantic cache fingerprints still match") {
             val projectRoot = createSemanticPersistenceMultiModuleFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/AppEntry.kt")
             val cacheRoot = Files.createTempDirectory("kotlinls-semantic-skip-rewarm-cache")
             val cache = PersistentSemanticIndexCache(cacheRoot)
 
@@ -549,14 +552,15 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
                         ),
                     ),
                 )
+                openDocument(server, appFile)
                 assertTrue(waitForSemanticCacheEntry(cache, projectRoot, ":app") != null) {
-                    "Expected initial startup warmup to populate the app cache"
+                    "Expected initial first-open warmup to populate the app cache"
                 }
                 assertTrue(waitForSemanticCacheEntry(cache, projectRoot, ":lib") != null) {
-                    "Expected initial startup warmup to populate the library cache"
+                    "Expected initial first-open warmup to populate the library cache"
                 }
                 assertTrue(waitForSemanticCacheEntry(cache, projectRoot, ":tools") != null) {
-                    "Expected initial startup warmup to populate the tools cache"
+                    "Expected initial first-open warmup to populate the tools cache"
                 }
             }
 
@@ -584,6 +588,7 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
                         ),
                     ),
                 )
+                openDocument(server, appFile)
                 Thread.sleep(1_500)
             }
 
@@ -592,7 +597,45 @@ fun semanticPersistenceSuite(): TestSuite = TestSuite(
                 "Expected validated semantic caches to skip whole-project background rewrites on the next launch"
             }
         },
+        TestCase("corrects an initialize parent root to the first opened Gradle project") {
+            val fixture = createNestedSemanticPersistenceFixture()
+            val cacheRoot = Files.createTempDirectory("kotlinls-semantic-parent-root-cache")
+            val cache = PersistentSemanticIndexCache(cacheRoot)
+
+            withRunningServer(
+                serverFactory = { transport ->
+                    KotlinLanguageServer(
+                        transport = transport,
+                        semanticIndexCache = cache,
+                        refreshDebounceMillis = 0L,
+                        warmupStartDelayMillis = 0L,
+                    )
+                },
+            ) { server ->
+                initializeServer(
+                    server,
+                    fixture.workspaceRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf(
+                            "mode" to "off",
+                        ),
+                    ),
+                )
+                openDocument(server, fixture.appFile)
+
+                val appCached = waitForSemanticCacheEntry(cache, fixture.projectRoot, ":app")
+                assertTrue(appCached != null) {
+                    "Expected first file open to correct the parent initialize root and warm the nested project cache"
+                }
+            }
+        },
     ),
+)
+
+private data class NestedSemanticPersistenceFixture(
+    val workspaceRoot: Path,
+    val projectRoot: Path,
+    val appFile: Path,
 )
 
 private data class PersistenceRunningServer(
@@ -841,6 +884,50 @@ private fun createSemanticPersistenceMultiModuleFixture(): Path {
     }
 
     return root
+}
+
+private fun createNestedSemanticPersistenceFixture(): NestedSemanticPersistenceFixture {
+    val workspaceRoot = Files.createTempDirectory("kotlinls-nested-workspace")
+    val projectRoot = workspaceRoot.resolve("nested-project").also { it.createDirectories() }
+    projectRoot.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "nested-semantic-persist"
+        include(":app")
+        """.trimIndent() + "\n",
+    )
+    projectRoot.resolve("app/build.gradle.kts").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            plugins {
+                kotlin("jvm")
+            }
+
+            repositories {
+                mavenCentral()
+            }
+
+            kotlin {
+                jvmToolchain(21)
+            }
+            """.trimIndent() + "\n",
+        )
+    }
+    val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt").apply {
+        parent.createDirectories()
+        writeText(
+            """
+            package demo.app
+
+            fun app(): String = "ok"
+            """.trimIndent() + "\n",
+        )
+    }
+    return NestedSemanticPersistenceFixture(
+        workspaceRoot = workspaceRoot,
+        projectRoot = projectRoot,
+        appFile = appFile,
+    )
 }
 
 private fun writePayload(output: PipedOutputStream, payload: Any) {

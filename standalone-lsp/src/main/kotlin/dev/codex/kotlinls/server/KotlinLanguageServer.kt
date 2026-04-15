@@ -13,6 +13,7 @@ import dev.codex.kotlinls.diagnostics.DiagnosticsService.FastDiagnosticLookup
 import dev.codex.kotlinls.formatting.FormattingService
 import dev.codex.kotlinls.hover.HoverAndSignatureService
 import dev.codex.kotlinls.index.IndexedSymbol
+import dev.codex.kotlinls.index.DocumentCacheStatus
 import dev.codex.kotlinls.index.LightweightWorkspaceIndexBuilder
 import dev.codex.kotlinls.index.PersistentSemanticIndexCache
 import dev.codex.kotlinls.index.SourceIndexLookup
@@ -116,6 +117,9 @@ class KotlinLanguageServer(
     private var root: Path? = null
 
     @Volatile
+    private var relevantFileRootResolved = false
+
+    @Volatile
     private var project: ImportedProject? = null
 
     @Volatile
@@ -190,6 +194,7 @@ class KotlinLanguageServer(
     private var refreshInteractiveSemanticRequested = false
     private val pendingSemanticUris = linkedSetOf<String>()
     private var warmupRunning = false
+    private var projectWarmupStartedGeneration = 0
     private var supportRefreshRunning = false
     private var diagnosticsRefreshRunning = false
     private var pendingSupportRefresh: SupportRefreshRequest? = null
@@ -262,21 +267,13 @@ class KotlinLanguageServer(
                                     ensureCache = true,
                                 )
                             }
-                            semanticEngine.prefetch(
-                                project = currentProject,
-                                activeDocument = documents.openDocuments().firstOrNull(),
-                                openDocuments = documents.openDocuments(),
-                                projectGeneration = currentProjectGeneration,
-                            )
-                            if (usesLocalSemanticRuntime()) {
-                                val openDocuments = documents.openDocuments()
-                                val backgroundModules = backgroundWarmupModules(currentProject)
-                                if (backgroundModules.isNotEmpty()) {
-                                    scheduleBackgroundWarmup(currentProject, backgroundModules, includeOpenModules = true)
-                                }
-                                openDocuments.forEach { document ->
-                                    scheduleSemanticRefresh(document.uri)
-                                }
+                            if (documents.openDocuments().isNotEmpty()) {
+                                semanticEngine.prefetch(
+                                    project = currentProject,
+                                    activeDocument = documents.openDocuments().firstOrNull(),
+                                    openDocuments = documents.openDocuments(),
+                                    projectGeneration = currentProjectGeneration,
+                                )
                             }
                         }
                     }
@@ -301,16 +298,15 @@ class KotlinLanguageServer(
                             text = params.textDocument.text,
                             force = true,
                         )
-                        semanticEngine.prefetch(
-                            project = currentProject,
-                            activeDocument = documents.get(params.textDocument.uri),
-                            openDocuments = documents.openDocuments(),
-                            projectGeneration = currentProjectGeneration,
-                            syncDocuments = false,
-                            startBridge = true,
-                        )
+                        ensureProjectWarmupStarted(currentProject)
                     }
+                    announceDiagnosticsKickoff(params.textDocument.uri, "open")
                     scheduleSemanticRefresh(params.textDocument.uri)
+                    schedulePersistentDocumentCacheSync(
+                        project = project,
+                        uri = params.textDocument.uri,
+                        reason = "open",
+                    )
                 }
                 "textDocument/didChange" -> {
                     val params = read(message.params, DidChangeTextDocumentParams::class.java)
@@ -355,27 +351,6 @@ class KotlinLanguageServer(
                         scheduleRefresh(reimportProject = true, rebuildFastIndex = true)
                     } else if (isSourceFile(path)) {
                         updateLiveSourceIndex(uri)
-                        val currentProject = project
-                        val source = sourceView(uri)
-                        if (currentProject != null && source != null) {
-                            persistExecutor.execute {
-                                runCatching {
-                                    lightweightIndexBuilder.persistDocument(currentProject, source.first, source.second)
-                                }.onFailure { error ->
-                                    System.err.println("[android-neovim-lsp] lightweight cache persist failed: ${error.message}")
-                                }
-                            }
-                            semanticEngine.invalidate(uri, documents.get(uri)?.version)
-                            semanticEngine.prefetch(
-                                project = currentProject,
-                                activeDocument = documents.get(uri),
-                                openDocuments = documents.openDocuments(),
-                                projectGeneration = currentProjectGeneration,
-                                syncDocuments = false,
-                                startBridge = true,
-                            )
-                        }
-                        scheduleSemanticRefresh(uri, interactive = false)
                     }
                 }
                 "$/android-neovim/flushDiagnostics" -> {
@@ -723,7 +698,8 @@ class KotlinLanguageServer(
             rootUri != null -> documentUriToPath(rootUri)
             rootPath != null -> Path.of(rootPath)
             else -> null
-        }
+        }?.let(rootDetector::detect)?.normalize()
+        relevantFileRootResolved = false
         preloadPersistedState()
         val semanticCapabilities = semanticEngine.capabilities
         val localSemanticCapabilities = usesLocalSemanticRuntime()
@@ -768,7 +744,7 @@ class KotlinLanguageServer(
                 foldingRangeProvider = localSemanticCapabilities || semanticCapabilities.foldingRange,
                 selectionRangeProvider = localSemanticCapabilities,
                 documentHighlightProvider = localSemanticCapabilities || semanticCapabilities.documentHighlight,
-                inlayHintProvider = localSemanticCapabilities || semanticCapabilities.inlayHints,
+                inlayHintProvider = false,
                 callHierarchyProvider = localSemanticCapabilities || semanticCapabilities.callHierarchy,
                 typeHierarchyProvider = localSemanticCapabilities || semanticCapabilities.typeHierarchy,
                 executeCommandProvider = ExecuteCommandOptions(
@@ -803,8 +779,8 @@ class KotlinLanguageServer(
         rebuildFastIndex: Boolean,
         scheduleSemantic: Boolean,
     ) {
-        if (root == null) {
-            root = rootDetector.detect(documentUriToPath(uri))
+        if (root == null || !relevantFileRootResolved) {
+            maybeCorrectRootFromUri(uri)
         }
         scheduleRefresh(
             reimportProject = reimportProject,
@@ -814,10 +790,8 @@ class KotlinLanguageServer(
     }
 
     private fun ensureProjectReady(uri: String) {
-        if (root == null) {
-            root = rootDetector.detect(documentUriToPath(uri))
-        }
-        if (project == null) {
+        val rootChanged = maybeCorrectRootFromUri(uri)
+        if (project == null || rootChanged) {
             scheduleRefresh(reimportProject = true, rebuildFastIndex = true)
         }
     }
@@ -843,6 +817,56 @@ class KotlinLanguageServer(
         }
         semanticEngine.onProjectChanged(cachedProject)
         rebuildCombinedIndex()
+    }
+
+    private fun maybeCorrectRootFromUri(uri: String): Boolean {
+        if (!isSourceUri(uri)) return false
+        val detectedRoot = rootDetector.detect(documentUriToPath(uri)).normalize()
+        val currentRoot = root?.normalize()
+        if (currentRoot == null) {
+            root = detectedRoot
+            relevantFileRootResolved = true
+            return false
+        }
+        if (relevantFileRootResolved) {
+            return false
+        }
+        relevantFileRootResolved = true
+        if (currentRoot == detectedRoot) {
+            return false
+        }
+        root = detectedRoot
+        resetStateForRootChange()
+        showInfoMessage("Project Root: switched to ${detectedRoot.fileName ?: detectedRoot}")
+        return true
+    }
+
+    private fun resetStateForRootChange() {
+        currentProjectGeneration = refreshGeneration.incrementAndGet()
+        project = null
+        workspaceIndexReady = false
+        lightweightIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        supportIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        combinedIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        importCompletionCombinedIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        moduleSemanticFingerprints = emptyMap()
+        supportCacheFullyLoaded = false
+        supportCacheManifestAvailable = null
+        publishedDiagnosticUris = emptySet()
+        publishedDiagnosticFingerprints.clear()
+        synchronized(supportRefreshLock) {
+            loadedSupportPackages.clear()
+            supportPackagesByUri.clear()
+            pendingSupportRefresh = null
+        }
+        synchronized(refreshLock) {
+            pendingSemanticUris.clear()
+        }
+        replaceSemanticStates(emptyMap())
+        clearRequestMemoCaches()
+        documents.openDocuments().forEach { document ->
+            clearDiagnostics(document.uri)
+        }
     }
 
     private fun updateLiveSourceIndex(uri: String, publishDiagnostics: Boolean = true) {
@@ -1180,11 +1204,8 @@ class KotlinLanguageServer(
         scheduleDiagnosticsPublish()
         if (usesLocalSemanticRuntime()) {
             val semanticUris = requestedSemanticUris.ifEmpty { documents.openDocuments().map { it.uri }.toSet() }
-            val backgroundModules = backgroundWarmupModules(nextProject)
-            if (backgroundModules.isNotEmpty()) {
-                scheduleBackgroundWarmup(nextProject, backgroundModules, includeOpenModules = true)
-            }
             if (semanticUris.isNotEmpty()) {
+                ensureProjectWarmupStarted(nextProject)
                 refreshSemanticModules(nextProject, semanticUris, interactiveSemanticRefresh)
             }
         }
@@ -1461,6 +1482,70 @@ class KotlinLanguageServer(
             val state = moduleStateForUri(uri) ?: return@any true
             !semanticStateCurrentForUri(state, uri)
         }
+
+    private fun ensureProjectWarmupStarted(project: ImportedProject) {
+        if (!usesLocalSemanticRuntime()) return
+        if (documents.openDocuments().none { document -> isSourceUri(document.uri) }) return
+        val generation = currentProjectGeneration
+        val warmupModules = synchronized(warmupLock) {
+            if (projectWarmupStartedGeneration == generation) {
+                return
+            }
+            projectWarmupStartedGeneration = generation
+            backgroundWarmupModules(project)
+        }
+        if (warmupModules.isEmpty()) {
+            showInfoMessage("Semantic Warmup: project cache already current")
+            return
+        }
+        showInfoMessage("Semantic Warmup: starting background project index")
+        scheduleBackgroundWarmup(project, warmupModules, includeOpenModules = true)
+    }
+
+    private fun announceDiagnosticsKickoff(uri: String, reason: String) {
+        if (!clientInitialized || !isSourceUri(uri)) return
+        showInfoMessage("Diagnostics: queued ${documentLabel(uri)} ${reasonLabel(reason)}")
+    }
+
+    private fun schedulePersistentDocumentCacheSync(
+        project: ImportedProject?,
+        uri: String,
+        reason: String,
+    ) {
+        if (!clientInitialized || !isSourceUri(uri)) return
+        val snapshot = documents.get(uri) ?: return
+        val path = documentUriToPath(uri).normalize()
+        val reasonLabel = reasonLabel(reason)
+        val fileLabel = documentLabel(uri)
+        try {
+            persistExecutor.execute {
+                val activeProject = awaitProjectForCacheSync(project) ?: run {
+                    showInfoMessage("Lightweight Index: skipped $fileLabel $reasonLabel because the project is still loading")
+                    return@execute
+                }
+                if (activeProject.moduleForPath(path) == null) {
+                    showInfoMessage("Lightweight Index: skipped $fileLabel $reasonLabel because it is outside the imported project")
+                    return@execute
+                }
+                val status = lightweightIndexBuilder.persistDocumentIfChanged(
+                    project = activeProject,
+                    path = path,
+                    text = snapshot.text,
+                )
+                val message = when (status) {
+                    DocumentCacheStatus.CURRENT ->
+                        "Lightweight Index: $fileLabel fingerprint matched $reasonLabel"
+
+                    DocumentCacheStatus.MISSING ->
+                        "Lightweight Index: indexed $fileLabel $reasonLabel (missing cache entry)"
+
+                    DocumentCacheStatus.STALE ->
+                        "Lightweight Index: refreshed $fileLabel $reasonLabel (fingerprint changed)"
+                }
+                showInfoMessage(message)
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
+    }
 
     private fun scheduleBackgroundWarmup(
         project: ImportedProject,
@@ -1783,6 +1868,7 @@ class KotlinLanguageServer(
             forceUris = setOf(uri),
             flushAcknowledgements = generation?.let { mapOf(uri to it) }.orEmpty(),
         )
+        announceDiagnosticsKickoff(uri, "insert-leave")
         val currentProject = project
         if (currentProject != null) {
             semanticEngine.prefetch(
@@ -1795,6 +1881,11 @@ class KotlinLanguageServer(
             )
         }
         scheduleSemanticRefresh(uri, interactive = false)
+        schedulePersistentDocumentCacheSync(
+            project = currentProject,
+            uri = uri,
+            reason = "insert-leave",
+        )
     }
 
     private fun scheduleDiagnosticsPublishForSupportPackages(packageNames: Set<String>) {
@@ -1987,8 +2078,16 @@ class KotlinLanguageServer(
             }
         }
         return try {
-            future.get(config.semantic.requestTimeoutMillis, TimeUnit.MILLISECONDS)
-            availableSemanticState(uri)
+            val resolvedState = future.get(config.semantic.requestTimeoutMillis, TimeUnit.MILLISECONDS)
+            resolvedState
+                ?.takeIf { state ->
+                    state.projectGeneration == requestGeneration &&
+                        state.snapshot != null &&
+                        semanticStateCurrentForUri(state, uri)
+                }
+                ?.snapshot
+                ?.let { snapshot -> snapshot to currentIndex() }
+                ?: availableSemanticState(uri)
         } catch (_: TimeoutException) {
             null
         } catch (_: java.util.concurrent.ExecutionException) {
@@ -2092,6 +2191,15 @@ class KotlinLanguageServer(
         value: List<dev.codex.kotlinls.protocol.Location>,
     ) {
         rememberMemoizedValue(typeDefinitionMemo, key, value)
+    }
+
+    private fun clearRequestMemoCaches() {
+        synchronized(requestMemoLock) {
+            completionMemo.clear()
+            hoverMemo.clear()
+            definitionMemo.clear()
+            typeDefinitionMemo.clear()
+        }
     }
 
     private fun <T> rememberMemoizedValue(
@@ -2392,6 +2500,20 @@ class KotlinLanguageServer(
     private fun diskSourceContentHash(path: Path): String? =
         runCatching { Files.readString(path.normalize()) }.getOrNull()?.let(::sha256)
 
+    private fun awaitProjectForCacheSync(preferredProject: ImportedProject?): ImportedProject? {
+        preferredProject?.let { return it }
+        repeat(20) {
+            project?.let { return it }
+            try {
+                Thread.sleep(25L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+        }
+        return project
+    }
+
     private fun computeSemanticFingerprints(project: ImportedProject): Map<String, String> =
         project.modules.associate { module ->
             module.gradlePath to fingerprintModule(module)
@@ -2511,10 +2633,31 @@ class KotlinLanguageServer(
     private fun moduleLabel(module: ImportedModule): String =
         module.gradlePath.removePrefix(":").ifBlank { module.name }
 
+    private fun documentLabel(uri: String): String =
+        documentUriToPath(uri).fileName?.toString().orEmpty().ifBlank { uri }
+
+    private fun reasonLabel(reason: String): String =
+        when (reason) {
+            "open" -> "on open"
+            "insert-leave" -> "after insert leave"
+            else -> "after $reason"
+        }
+
     private fun isSourceUri(uri: String): Boolean = isSourceFile(documentUriToPath(uri))
 
     private fun isSourceFile(path: Path): Boolean =
         path.fileName?.toString()?.substringAfterLast('.', "").orEmpty() in setOf("kt", "kts", "java")
+
+    private fun showInfoMessage(message: String) {
+        if (!clientInitialized) return
+        sendNotificationSafely(
+            "window/showMessage",
+            mapOf(
+                "type" to 3,
+                "message" to message,
+            ),
+        )
+    }
 
     private fun isProjectModelPath(path: Path): Boolean {
         val normalized = path.normalize()
@@ -2610,7 +2753,7 @@ class KotlinLanguageServer(
         } else {
             null
         }
-        transport.sendNotification(
+        sendNotificationSafely(
             "\$/android-neovim/progress",
             mapOf(
                 "token" to token,
@@ -2622,6 +2765,12 @@ class KotlinLanguageServer(
                 ),
             ),
         )
+    }
+
+    private fun sendNotificationSafely(method: String, params: Any?) {
+        runCatching {
+            transport.sendNotification(method, params)
+        }
     }
 
     private fun recordCompletionRoute(

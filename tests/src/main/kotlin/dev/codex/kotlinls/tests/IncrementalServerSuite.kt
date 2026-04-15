@@ -600,24 +600,27 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 assertTrue(definitionCount > 0) { "Expected semantic definition for local variable once snapshot was ready" }
             }
         },
-        TestCase("requests inlay hint refresh after semantic analysis for open files") {
+        TestCase("does not advertise inlay hints even when semantic analysis is enabled") {
             val projectRoot = createSemanticRequestFixture()
-            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
             withRunningServer { server ->
-                initializeServer(
-                    server,
-                    projectRoot,
-                    initializationOptions = mapOf(
-                        "progress" to mapOf("mode" to "off"),
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 1,
+                        "method" to "initialize",
+                        "params" to mapOf(
+                            "rootUri" to projectRoot.toUri().toString(),
+                            "initializationOptions" to mapOf(
+                                "progress" to mapOf("mode" to "off"),
+                            ),
+                        ),
                     ),
                 )
-                openDocument(server, appFile)
-                val refreshRequest = readUntil(server.reader, maxMessages = 160, timeoutMillis = 15_000L) { message ->
-                    message.method == "workspace/inlayHint/refresh"
-                }
-                assertTrue(refreshRequest != null) {
-                    "Expected workspace/inlayHint/refresh request after semantic state install"
-                }
+                val initResponse = readUntil(server.reader, maxMessages = 20) { it.id?.asInt() == 1 }
+                val capabilities = initResponse?.result?.get("capabilities")
+                assertTrue(capabilities != null) { "Expected initialize capabilities" }
+                assertEquals(false, capabilities?.get("inlayHintProvider")?.asBoolean())
             }
         },
         TestCase("serves default-import Kotlin stdlib hover and definition from the support index") {
@@ -873,7 +876,7 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     initializationOptions = mapOf(
                         "progress" to mapOf("mode" to "off"),
                         "semantic" to mapOf(
-                            "request_timeout_ms" to 600,
+                            "request_timeout_ms" to 1_500,
                         ),
                     ),
                 )

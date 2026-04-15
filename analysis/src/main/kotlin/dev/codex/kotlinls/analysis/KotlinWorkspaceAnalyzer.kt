@@ -32,6 +32,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.Comparator
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.createDirectories
 import kotlin.io.path.extension
 import kotlin.io.path.name
@@ -44,6 +45,7 @@ class KotlinWorkspaceAnalyzer(
 ) {
     private val mirrorCacheLock = Any()
     private val mirrorCaches = linkedMapOf<Path, MirrorWorkspaceCache>()
+    private val focusedSnapshotGeneration = AtomicInteger(0)
 
     fun analyze(
         project: ImportedProject,
@@ -413,8 +415,10 @@ class KotlinWorkspaceAnalyzer(
             .hashCode()
             .toUInt()
             .toString(16)
-        val focusedRoot = workspaceSnapshotRoot.resolve("focused-$focusedKey")
-        recreateDirectory(focusedRoot)
+        val focusedRoot = workspaceSnapshotRoot.resolve(
+            "focused-$focusedKey-${focusedSnapshotGeneration.incrementAndGet()}",
+        )
+        focusedRoot.createDirectories()
         return focusedRoot
     }
 
