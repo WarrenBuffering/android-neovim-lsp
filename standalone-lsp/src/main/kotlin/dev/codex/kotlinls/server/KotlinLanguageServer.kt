@@ -13,6 +13,7 @@ import dev.codex.kotlinls.diagnostics.DiagnosticsService.FastDiagnosticLookup
 import dev.codex.kotlinls.formatting.FormattingService
 import dev.codex.kotlinls.hover.HoverAndSignatureService
 import dev.codex.kotlinls.index.IndexedSymbol
+import dev.codex.kotlinls.index.DocumentCacheStatus
 import dev.codex.kotlinls.index.LightweightWorkspaceIndexBuilder
 import dev.codex.kotlinls.index.PersistentSemanticIndexCache
 import dev.codex.kotlinls.index.SourceIndexLookup
@@ -116,6 +117,9 @@ class KotlinLanguageServer(
     private var root: Path? = null
 
     @Volatile
+    private var relevantFileRootResolved = false
+
+    @Volatile
     private var project: ImportedProject? = null
 
     @Volatile
@@ -189,7 +193,9 @@ class KotlinLanguageServer(
     private var refreshFastIndexRequested = false
     private var refreshInteractiveSemanticRequested = false
     private val pendingSemanticUris = linkedSetOf<String>()
+    private val pendingSemanticFlushGenerations = linkedMapOf<String, Int>()
     private var warmupRunning = false
+    private var projectWarmupStartedGeneration = 0
     private var supportRefreshRunning = false
     private var diagnosticsRefreshRunning = false
     private var pendingSupportRefresh: SupportRefreshRequest? = null
@@ -199,6 +205,8 @@ class KotlinLanguageServer(
     private val deferredDiagnosticUris = linkedSetOf<String>()
     private val pendingDiagnosticForceUris = linkedSetOf<String>()
     private val pendingDiagnosticFlushAcknowledgements = linkedMapOf<String, Int>()
+    private val pendingPostDiagnosticsWork = linkedMapOf<String, PendingPostDiagnosticsWork>()
+    private val latestFlushGenerationByUri = linkedMapOf<String, Int>()
     private var warmupGeneration = 0
     private val warmupQueuedModules = linkedSetOf<String>()
     private val warmupAllowedOpenModules = linkedSetOf<String>()
@@ -262,21 +270,13 @@ class KotlinLanguageServer(
                                     ensureCache = true,
                                 )
                             }
-                            semanticEngine.prefetch(
-                                project = currentProject,
-                                activeDocument = documents.openDocuments().firstOrNull(),
-                                openDocuments = documents.openDocuments(),
-                                projectGeneration = currentProjectGeneration,
-                            )
-                            if (usesLocalSemanticRuntime()) {
-                                val openDocuments = documents.openDocuments()
-                                val backgroundModules = backgroundWarmupModules(currentProject)
-                                if (backgroundModules.isNotEmpty()) {
-                                    scheduleBackgroundWarmup(currentProject, backgroundModules, includeOpenModules = true)
-                                }
-                                openDocuments.forEach { document ->
-                                    scheduleSemanticRefresh(document.uri)
-                                }
+                            if (documents.openDocuments().isNotEmpty()) {
+                                semanticEngine.prefetch(
+                                    project = currentProject,
+                                    activeDocument = documents.openDocuments().firstOrNull(),
+                                    openDocuments = documents.openDocuments(),
+                                    projectGeneration = currentProjectGeneration,
+                                )
                             }
                         }
                     }
@@ -301,27 +301,22 @@ class KotlinLanguageServer(
                             text = params.textDocument.text,
                             force = true,
                         )
-                        semanticEngine.prefetch(
-                            project = currentProject,
-                            activeDocument = documents.get(params.textDocument.uri),
-                            openDocuments = documents.openDocuments(),
-                            projectGeneration = currentProjectGeneration,
-                            syncDocuments = false,
-                            startBridge = true,
-                        )
+                        ensureProjectWarmupStarted(currentProject)
                     }
+                    announceDiagnosticsKickoff(params.textDocument.uri, "open")
                     scheduleSemanticRefresh(params.textDocument.uri)
+                    schedulePersistentDocumentCacheSync(
+                        project = project,
+                        uri = params.textDocument.uri,
+                        reason = "open",
+                    )
                 }
                 "textDocument/didChange" -> {
                     val params = read(message.params, DidChangeTextDocumentParams::class.java)
                     documents.applyChanges(params)
                     updateLiveSourceIndex(params.textDocument.uri, publishDiagnostics = false)
-                    if (config.diagnostics.flushOnInsertLeave) {
-                        synchronized(diagnosticLock) {
-                            deferredDiagnosticUris += params.textDocument.uri
-                        }
-                    } else {
-                        scheduleFastDiagnosticsPublish(params.textDocument.uri)
+                    synchronized(diagnosticLock) {
+                        deferredDiagnosticUris += params.textDocument.uri
                     }
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
@@ -333,17 +328,6 @@ class KotlinLanguageServer(
                                 text = currentText,
                             )
                         }
-                        semanticEngine.prefetch(
-                            project = currentProject,
-                            activeDocument = documents.get(params.textDocument.uri),
-                            openDocuments = documents.openDocuments(),
-                            projectGeneration = currentProjectGeneration,
-                            syncDocuments = false,
-                            startBridge = true,
-                        )
-                    }
-                    if (!config.diagnostics.flushOnInsertLeave) {
-                        scheduleSemanticRefresh(params.textDocument.uri, interactive = false)
                     }
                 }
                 "textDocument/didClose" -> {
@@ -352,6 +336,8 @@ class KotlinLanguageServer(
                     semanticEngine.invalidate(uri)
                     synchronized(diagnosticLock) {
                         deferredDiagnosticUris.remove(uri)
+                        pendingPostDiagnosticsWork.remove(uri)
+                        latestFlushGenerationByUri.remove(uri)
                     }
                     synchronized(supportRefreshLock) {
                         supportPackagesByUri.remove(uri)
@@ -370,27 +356,6 @@ class KotlinLanguageServer(
                         scheduleRefresh(reimportProject = true, rebuildFastIndex = true)
                     } else if (isSourceFile(path)) {
                         updateLiveSourceIndex(uri)
-                        val currentProject = project
-                        val source = sourceView(uri)
-                        if (currentProject != null && source != null) {
-                            persistExecutor.execute {
-                                runCatching {
-                                    lightweightIndexBuilder.persistDocument(currentProject, source.first, source.second)
-                                }.onFailure { error ->
-                                    System.err.println("[android-neovim-lsp] lightweight cache persist failed: ${error.message}")
-                                }
-                            }
-                            semanticEngine.invalidate(uri, documents.get(uri)?.version)
-                            semanticEngine.prefetch(
-                                project = currentProject,
-                                activeDocument = documents.get(uri),
-                                openDocuments = documents.openDocuments(),
-                                projectGeneration = currentProjectGeneration,
-                                syncDocuments = false,
-                                startBridge = true,
-                            )
-                        }
-                        scheduleSemanticRefresh(uri, interactive = false)
                     }
                 }
                 "$/android-neovim/flushDiagnostics" -> {
@@ -422,22 +387,23 @@ class KotlinLanguageServer(
                             params = params,
                             bridgeAvailable = currentProject != null,
                         )
+                        val indexForCompletion = completionIndexForRoute(routeDecision, activeIndex)
                         val startedAt = System.nanoTime()
                         val response = when (routeDecision.route) {
                             CompletionRoute.INDEX -> completionService.completeFromIndex(
-                                index = completionIndexForRoute(routeDecision),
+                                index = indexForCompletion,
                                 path = source.first,
                                 text = source.second,
                                 params = params,
                             )
 
-                            CompletionRoute.BRIDGE -> currentProject?.let { current ->
+                            CompletionRoute.BRIDGE -> (currentProject?.let { current ->
                                 availableSemanticState(params.textDocument.uri)
                                     ?.let { semantic ->
                                         completionService.semanticNamedArgumentCompletions(semantic.first, params)
                                     }
                                     ?: completionService.namedArgumentCompletionsFromIndex(
-                                        index = currentIndex(),
+                                        index = indexForCompletion,
                                         path = source.first,
                                         text = source.second,
                                         params = params,
@@ -450,7 +416,13 @@ class KotlinLanguageServer(
                                         params = params,
                                         projectGeneration = currentProjectGeneration,
                                     )
-                            } ?: CompletionList(false, emptyList())
+                            } ?: CompletionList(false, emptyList())).takeUnless { it.items.isEmpty() }
+                                ?: completionService.completeFromIndex(
+                                    index = indexForCompletion,
+                                    path = source.first,
+                                    text = source.second,
+                                    params = params,
+                                )
                         }
                         recordCompletionRoute(
                             decision = routeDecision,
@@ -738,7 +710,8 @@ class KotlinLanguageServer(
             rootUri != null -> documentUriToPath(rootUri)
             rootPath != null -> Path.of(rootPath)
             else -> null
-        }
+        }?.let(rootDetector::detect)?.normalize()
+        relevantFileRootResolved = false
         preloadPersistedState()
         val semanticCapabilities = semanticEngine.capabilities
         val localSemanticCapabilities = usesLocalSemanticRuntime()
@@ -783,7 +756,7 @@ class KotlinLanguageServer(
                 foldingRangeProvider = localSemanticCapabilities || semanticCapabilities.foldingRange,
                 selectionRangeProvider = localSemanticCapabilities,
                 documentHighlightProvider = localSemanticCapabilities || semanticCapabilities.documentHighlight,
-                inlayHintProvider = localSemanticCapabilities || semanticCapabilities.inlayHints,
+                inlayHintProvider = false,
                 callHierarchyProvider = localSemanticCapabilities || semanticCapabilities.callHierarchy,
                 typeHierarchyProvider = localSemanticCapabilities || semanticCapabilities.typeHierarchy,
                 executeCommandProvider = ExecuteCommandOptions(
@@ -818,8 +791,8 @@ class KotlinLanguageServer(
         rebuildFastIndex: Boolean,
         scheduleSemantic: Boolean,
     ) {
-        if (root == null) {
-            root = rootDetector.detect(documentUriToPath(uri))
+        if (root == null || !relevantFileRootResolved) {
+            maybeCorrectRootFromUri(uri)
         }
         scheduleRefresh(
             reimportProject = reimportProject,
@@ -829,10 +802,8 @@ class KotlinLanguageServer(
     }
 
     private fun ensureProjectReady(uri: String) {
-        if (root == null) {
-            root = rootDetector.detect(documentUriToPath(uri))
-        }
-        if (project == null) {
+        val rootChanged = maybeCorrectRootFromUri(uri)
+        if (project == null || rootChanged) {
             scheduleRefresh(reimportProject = true, rebuildFastIndex = true)
         }
     }
@@ -858,6 +829,60 @@ class KotlinLanguageServer(
         }
         semanticEngine.onProjectChanged(cachedProject)
         rebuildCombinedIndex()
+    }
+
+    private fun maybeCorrectRootFromUri(uri: String): Boolean {
+        if (!isSourceUri(uri)) return false
+        val detectedRoot = rootDetector.detect(documentUriToPath(uri)).normalize()
+        val currentRoot = root?.normalize()
+        if (currentRoot == null) {
+            root = detectedRoot
+            relevantFileRootResolved = true
+            return false
+        }
+        if (relevantFileRootResolved) {
+            return false
+        }
+        relevantFileRootResolved = true
+        if (currentRoot == detectedRoot) {
+            return false
+        }
+        root = detectedRoot
+        resetStateForRootChange()
+        showInfoMessage("Project Root: switched to ${detectedRoot.fileName ?: detectedRoot}")
+        return true
+    }
+
+    private fun resetStateForRootChange() {
+        currentProjectGeneration = refreshGeneration.incrementAndGet()
+        project = null
+        workspaceIndexReady = false
+        lightweightIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        supportIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        combinedIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        importCompletionCombinedIndex = WorkspaceIndex(emptyList(), emptyList(), emptyList())
+        moduleSemanticFingerprints = emptyMap()
+        supportCacheFullyLoaded = false
+        supportCacheManifestAvailable = null
+        publishedDiagnosticUris = emptySet()
+        publishedDiagnosticFingerprints.clear()
+        synchronized(supportRefreshLock) {
+            loadedSupportPackages.clear()
+            supportPackagesByUri.clear()
+            pendingSupportRefresh = null
+        }
+        synchronized(refreshLock) {
+            pendingSemanticUris.clear()
+            pendingSemanticFlushGenerations.clear()
+        }
+        synchronized(diagnosticLock) {
+            pendingPostDiagnosticsWork.clear()
+        }
+        replaceSemanticStates(emptyMap())
+        clearRequestMemoCaches()
+        documents.openDocuments().forEach { document ->
+            clearDiagnostics(document.uri)
+        }
     }
 
     private fun updateLiveSourceIndex(uri: String, publishDiagnostics: Boolean = true) {
@@ -931,6 +956,7 @@ class KotlinLanguageServer(
         rebuildFastIndex: Boolean = reimportProject || lightweightIndex.symbols.isEmpty(),
         semanticUri: String? = null,
         interactiveSemanticRefresh: Boolean = true,
+        semanticFlushGeneration: Int? = null,
     ) {
         synchronized(refreshLock) {
             refreshRequested = true
@@ -938,6 +964,9 @@ class KotlinLanguageServer(
             refreshFastIndexRequested = refreshFastIndexRequested || rebuildFastIndex || reimportProject
             semanticUri?.let {
                 collapsePendingSemanticUri(it)
+                semanticFlushGeneration?.let { generation ->
+                    pendingSemanticFlushGenerations[it] = generation
+                }
                 refreshInteractiveSemanticRequested = refreshInteractiveSemanticRequested || interactiveSemanticRefresh
             }
             if (refreshRunning) {
@@ -977,7 +1006,9 @@ class KotlinLanguageServer(
                         val fastIndexFlag = refreshFastIndexRequested
                         refreshFastIndexRequested = false
                         val semanticUris = pendingSemanticUris.toSet()
+                        val semanticFlushGenerations = pendingSemanticFlushGenerations.toMap()
                         pendingSemanticUris.clear()
+                        pendingSemanticFlushGenerations.clear()
                         val interactiveSemanticFlag = refreshInteractiveSemanticRequested
                         refreshInteractiveSemanticRequested = false
                         RefreshRequest(
@@ -985,6 +1016,7 @@ class KotlinLanguageServer(
                             rebuildFastIndex = fastIndexFlag || flag || lightweightIndex.symbols.isEmpty(),
                             semanticUris = semanticUris,
                             interactiveSemanticRefresh = interactiveSemanticFlag || flag || fastIndexFlag,
+                            semanticFlushGenerations = semanticFlushGenerations,
                         )
                     }
                     runCatching {
@@ -993,6 +1025,7 @@ class KotlinLanguageServer(
                             rebuildFastIndex = doReimport.rebuildFastIndex,
                             requestedSemanticUris = doReimport.semanticUris,
                             interactiveSemanticRefresh = doReimport.interactiveSemanticRefresh,
+                            requestedSemanticFlushGenerations = doReimport.semanticFlushGenerations,
                         )
                     }
                         .onFailure { error ->
@@ -1119,6 +1152,7 @@ class KotlinLanguageServer(
         rebuildFastIndex: Boolean = true,
         requestedSemanticUris: Set<String> = emptySet(),
         interactiveSemanticRefresh: Boolean = true,
+        requestedSemanticFlushGenerations: Map<String, Int> = emptyMap(),
     ) {
         val rootPath = root ?: return
         val previousProject = project
@@ -1195,11 +1229,12 @@ class KotlinLanguageServer(
         scheduleDiagnosticsPublish()
         if (usesLocalSemanticRuntime()) {
             val semanticUris = requestedSemanticUris.ifEmpty { documents.openDocuments().map { it.uri }.toSet() }
-            val backgroundModules = backgroundWarmupModules(nextProject)
-            if (backgroundModules.isNotEmpty()) {
-                scheduleBackgroundWarmup(nextProject, backgroundModules, includeOpenModules = true)
-            }
+                .filterTo(linkedSetOf()) { uri ->
+                    val generation = requestedSemanticFlushGenerations[uri]
+                    generation == null || isCurrentFlushGeneration(uri, generation)
+                }
             if (semanticUris.isNotEmpty()) {
+                ensureProjectWarmupStarted(nextProject)
                 refreshSemanticModules(nextProject, semanticUris, interactiveSemanticRefresh)
             }
         }
@@ -1477,6 +1512,74 @@ class KotlinLanguageServer(
             !semanticStateCurrentForUri(state, uri)
         }
 
+    private fun ensureProjectWarmupStarted(project: ImportedProject) {
+        if (!usesLocalSemanticRuntime()) return
+        if (documents.openDocuments().none { document -> isSourceUri(document.uri) }) return
+        val generation = currentProjectGeneration
+        val warmupModules = synchronized(warmupLock) {
+            if (projectWarmupStartedGeneration == generation) {
+                return
+            }
+            projectWarmupStartedGeneration = generation
+            backgroundWarmupModules(project)
+        }
+        if (warmupModules.isEmpty()) {
+            showInfoMessage("Semantic Warmup: project cache already current")
+            return
+        }
+        showInfoMessage("Semantic Warmup: starting background project index")
+        scheduleBackgroundWarmup(project, warmupModules, includeOpenModules = true)
+    }
+
+    private fun announceDiagnosticsKickoff(uri: String, reason: String) {
+        if (!clientInitialized || !isSourceUri(uri)) return
+        showInfoMessage("Diagnostics: starting ${documentLabel(uri)} ${reasonLabel(reason)}")
+    }
+
+    private fun schedulePersistentDocumentCacheSync(
+        project: ImportedProject?,
+        uri: String,
+        reason: String,
+        flushGeneration: Int? = null,
+    ) {
+        if (!clientInitialized || !isSourceUri(uri)) return
+        val snapshot = documents.get(uri) ?: return
+        val path = documentUriToPath(uri).normalize()
+        val reasonLabel = reasonLabel(reason)
+        val fileLabel = documentLabel(uri)
+        try {
+            persistExecutor.execute {
+                if (flushGeneration != null && !isCurrentFlushGeneration(uri, flushGeneration)) {
+                    return@execute
+                }
+                val activeProject = awaitProjectForCacheSync(project) ?: run {
+                    showInfoMessage("Lightweight Index: skipped $fileLabel $reasonLabel because the project is still loading")
+                    return@execute
+                }
+                if (activeProject.moduleForPath(path) == null) {
+                    showInfoMessage("Lightweight Index: skipped $fileLabel $reasonLabel because it is outside the imported project")
+                    return@execute
+                }
+                val status = lightweightIndexBuilder.persistDocumentIfChanged(
+                    project = activeProject,
+                    path = path,
+                    text = snapshot.text,
+                )
+                val message = when (status) {
+                    DocumentCacheStatus.CURRENT ->
+                        "Lightweight Index: $fileLabel fingerprint matched $reasonLabel"
+
+                    DocumentCacheStatus.MISSING ->
+                        "Lightweight Index: indexed $fileLabel $reasonLabel (missing cache entry)"
+
+                    DocumentCacheStatus.STALE ->
+                        "Lightweight Index: refreshed $fileLabel $reasonLabel (fingerprint changed)"
+                }
+                showInfoMessage(message)
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
+    }
+
     private fun scheduleBackgroundWarmup(
         project: ImportedProject,
         modulePaths: Collection<String> = project.modules.map { it.gradlePath },
@@ -1602,18 +1705,27 @@ class KotlinLanguageServer(
         flushAcknowledgements: Map<String, Int> = emptyMap(),
     ) {
         if (!clientInitialized) return
+        if (expectedGeneration != null && diagnosticRequestGeneration.get() != expectedGeneration) {
+            return
+        }
         val openUris = documents.openDocuments().map { it.uri }.toSet()
         val deferredUris = synchronized(diagnosticLock) { deferredDiagnosticUris.toSet() }
         val targetOpenUris = if (fullRefresh) {
             openUris - deferredUris
         } else {
             openUris.intersect(requestedUris) - deferredUris
+        }.filterTo(linkedSetOf()) { uri ->
+            val generation = flushAcknowledgements[uri]
+            generation == null || isCurrentFlushGeneration(uri, generation)
         }
         if (!fullRefresh && targetOpenUris.isEmpty()) return
         val merged = linkedMapOf<String, MutableList<dev.codex.kotlinls.protocol.Diagnostic>>()
         val currentProject = project
         currentProject?.let { importedProject ->
             targetOpenUris.forEach { uri ->
+                if (expectedGeneration != null && diagnosticRequestGeneration.get() != expectedGeneration) {
+                    return
+                }
                 val source = sourceView(uri) ?: return@forEach
                 if (!isSourceFile(source.first)) return@forEach
                 hydrateFastIndexForImportedPackages(importedProject, source.first, source.second)
@@ -1638,6 +1750,9 @@ class KotlinLanguageServer(
         )
         val semanticUris = linkedSetOf<String>()
         semanticStates.values.forEach { state ->
+            if (expectedGeneration != null && diagnosticRequestGeneration.get() != expectedGeneration) {
+                return
+            }
             if (state.projectGeneration != currentProjectGeneration) return@forEach
             val snapshot = state.snapshot ?: return@forEach
             val stateUris = snapshot.files
@@ -1654,6 +1769,9 @@ class KotlinLanguageServer(
             }
         }
         targetOpenUris.forEach { uri ->
+            if (expectedGeneration != null && diagnosticRequestGeneration.get() != expectedGeneration) {
+                return
+            }
             if (uri in semanticUris) return@forEach
             val diagnostics = mutableListOf<dev.codex.kotlinls.protocol.Diagnostic>()
             val source = sourceView(uri)
@@ -1668,13 +1786,16 @@ class KotlinLanguageServer(
             merged[uri] = diagnostics
         }
         if (expectedGeneration != null && diagnosticRequestGeneration.get() != expectedGeneration) {
-            if (forceUris.isNotEmpty() || flushAcknowledgements.isNotEmpty()) {
+            val currentFlushAcknowledgements = flushAcknowledgements.filter { (uri, generation) ->
+                isCurrentFlushGeneration(uri, generation)
+            }
+            if (forceUris.isNotEmpty() || currentFlushAcknowledgements.isNotEmpty()) {
                 scheduleDiagnosticsPublish(
                     delayMillis = 0L,
                     uris = requestedUris.ifEmpty { forceUris },
                     fullRefresh = fullRefresh,
                     forceUris = forceUris,
-                    flushAcknowledgements = flushAcknowledgements,
+                    flushAcknowledgements = currentFlushAcknowledgements,
                 )
             }
             return
@@ -1781,12 +1902,29 @@ class KotlinLanguageServer(
         scheduleDiagnosticsPublish(uris = setOf(uri), fullRefresh = false)
     }
 
+    private fun isCurrentFlushGeneration(uri: String, generation: Int): Boolean =
+        synchronized(diagnosticLock) {
+            latestFlushGenerationByUri[uri]?.let { latest -> generation >= latest } ?: true
+        }
+
     private fun flushDeferredDiagnostics(
         uri: String,
         changedLines: List<ChangedLineRange>,
         generation: Int?,
     ) {
         if (!clientInitialized || !isSourceUri(uri)) return
+        if (generation != null) {
+            val isLatest = synchronized(diagnosticLock) {
+                val latest = latestFlushGenerationByUri[uri]
+                if (latest == null || generation >= latest) {
+                    latestFlushGenerationByUri[uri] = generation
+                    true
+                } else {
+                    false
+                }
+            }
+            if (!isLatest) return
+        }
         val hadDeferred = synchronized(diagnosticLock) {
             deferredDiagnosticUris.remove(uri)
         }
@@ -1798,7 +1936,14 @@ class KotlinLanguageServer(
             forceUris = setOf(uri),
             flushAcknowledgements = generation?.let { mapOf(uri to it) }.orEmpty(),
         )
-        scheduleSemanticRefresh(uri, interactive = false)
+        announceDiagnosticsKickoff(uri, "insert-leave")
+        if (generation == null) {
+            runPostDiagnosticsWork(uri, generation = null)
+            return
+        }
+        synchronized(diagnosticLock) {
+            pendingPostDiagnosticsWork[uri] = PendingPostDiagnosticsWork(flushGeneration = generation)
+        }
     }
 
     private fun scheduleDiagnosticsPublishForSupportPackages(packageNames: Set<String>) {
@@ -1916,6 +2061,37 @@ class KotlinLanguageServer(
                 generation = generation,
             ),
         )
+        val postDiagnosticsWork = synchronized(diagnosticLock) {
+            pendingPostDiagnosticsWork[uri]
+                ?.takeIf { it.flushGeneration == generation }
+                ?.also { pendingPostDiagnosticsWork.remove(uri) }
+        }
+        if (postDiagnosticsWork != null) {
+            runPostDiagnosticsWork(uri, generation)
+        }
+    }
+
+    private fun runPostDiagnosticsWork(uri: String, generation: Int?) {
+        if (!clientInitialized || !isSourceUri(uri)) return
+        if (generation != null && !isCurrentFlushGeneration(uri, generation)) return
+        val currentProject = project
+        if (currentProject != null) {
+            semanticEngine.prefetch(
+                project = currentProject,
+                activeDocument = documents.get(uri),
+                openDocuments = documents.openDocuments(),
+                projectGeneration = currentProjectGeneration,
+                syncDocuments = false,
+                startBridge = true,
+            )
+        }
+        scheduleSemanticRefresh(uri, interactive = false, flushGeneration = generation, immediate = true)
+        schedulePersistentDocumentCacheSync(
+            project = currentProject,
+            uri = uri,
+            reason = "insert-leave",
+            flushGeneration = generation,
+        )
     }
 
     private fun diagnosticFingerprint(diagnostics: List<dev.codex.kotlinls.protocol.Diagnostic>): String =
@@ -1991,8 +2167,16 @@ class KotlinLanguageServer(
             }
         }
         return try {
-            future.get(config.semantic.requestTimeoutMillis, TimeUnit.MILLISECONDS)
-            availableSemanticState(uri)
+            val resolvedState = future.get(config.semantic.requestTimeoutMillis, TimeUnit.MILLISECONDS)
+            resolvedState
+                ?.takeIf { state ->
+                    state.projectGeneration == requestGeneration &&
+                        state.snapshot != null &&
+                        semanticStateCurrentForUri(state, uri)
+                }
+                ?.snapshot
+                ?.let { snapshot -> snapshot to currentIndex() }
+                ?: availableSemanticState(uri)
         } catch (_: TimeoutException) {
             null
         } catch (_: java.util.concurrent.ExecutionException) {
@@ -2045,11 +2229,14 @@ class KotlinLanguageServer(
             }
             ?: mergeIndices(listOf(lightweightIndex, supportIndex))
 
-    private fun completionIndexForRoute(decision: CompletionRoutingDecision): WorkspaceIndex =
+    private fun completionIndexForRoute(
+        decision: CompletionRoutingDecision,
+        fallbackIndex: WorkspaceIndex = currentIndex(),
+    ): WorkspaceIndex =
         when (decision.reason) {
             "package-context" -> lightweightIndex
             "import-context" -> importCompletionCombinedIndex
-            else -> combinedIndex
+            else -> fallbackIndex
         }
 
     private fun requestMemoKey(
@@ -2098,6 +2285,15 @@ class KotlinLanguageServer(
         rememberMemoizedValue(typeDefinitionMemo, key, value)
     }
 
+    private fun clearRequestMemoCaches() {
+        synchronized(requestMemoLock) {
+            completionMemo.clear()
+            hoverMemo.clear()
+            definitionMemo.clear()
+            typeDefinitionMemo.clear()
+        }
+    }
+
     private fun <T> rememberMemoizedValue(
         target: LinkedHashMap<RequestMemoKey, MemoizedValue<T>>,
         key: RequestMemoKey,
@@ -2114,14 +2310,52 @@ class KotlinLanguageServer(
 
     private fun usesLocalSemanticRuntime(): Boolean = config.semantic.backend != SemanticBackend.DISABLED
 
-    private fun scheduleSemanticRefresh(uri: String, interactive: Boolean = true) {
+    private fun scheduleSemanticRefresh(
+        uri: String,
+        interactive: Boolean = true,
+        flushGeneration: Int? = null,
+        immediate: Boolean = false,
+    ) {
         if (!usesLocalSemanticRuntime() || !isSourceUri(uri)) return
+        if (immediate && project != null) {
+            scheduleImmediateSemanticRefresh(
+                uri = uri,
+                interactive = interactive,
+                flushGeneration = flushGeneration,
+            )
+            return
+        }
         scheduleRefresh(
             reimportProject = project == null,
             rebuildFastIndex = false,
             semanticUri = uri,
             interactiveSemanticRefresh = interactive,
+            semanticFlushGeneration = flushGeneration,
         )
+    }
+
+    private fun scheduleImmediateSemanticRefresh(
+        uri: String,
+        interactive: Boolean,
+        flushGeneration: Int?,
+    ) {
+        val scheduledProject = project ?: return
+        try {
+            semanticRequestExecutor.execute {
+                if (flushGeneration != null && !isCurrentFlushGeneration(uri, flushGeneration)) {
+                    return@execute
+                }
+                val activeProject = project ?: return@execute
+                if (activeProject.root.normalize() != scheduledProject.root.normalize()) {
+                    return@execute
+                }
+                refreshSemanticModules(
+                    project = activeProject,
+                    requestedSemanticUris = setOf(uri),
+                    interactiveSemanticRefresh = interactive,
+                )
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {}
     }
 
     private fun openDocumentVersionsForModule(
@@ -2251,8 +2485,16 @@ class KotlinLanguageServer(
         if (currentProject != null) {
             val modulePath = currentProject.moduleForPath(documentUriToPath(uri))?.gradlePath
             if (modulePath != null) {
+                val removedUris = mutableListOf<String>()
                 pendingSemanticUris.removeIf { pendingUri ->
-                    currentProject.moduleForPath(documentUriToPath(pendingUri))?.gradlePath == modulePath
+                    val shouldRemove = currentProject.moduleForPath(documentUriToPath(pendingUri))?.gradlePath == modulePath
+                    if (shouldRemove) {
+                        removedUris += pendingUri
+                    }
+                    shouldRemove
+                }
+                removedUris.forEach { removedUri ->
+                    pendingSemanticFlushGenerations.remove(removedUri)
                 }
             }
         }
@@ -2396,6 +2638,20 @@ class KotlinLanguageServer(
     private fun diskSourceContentHash(path: Path): String? =
         runCatching { Files.readString(path.normalize()) }.getOrNull()?.let(::sha256)
 
+    private fun awaitProjectForCacheSync(preferredProject: ImportedProject?): ImportedProject? {
+        preferredProject?.let { return it }
+        repeat(20) {
+            project?.let { return it }
+            try {
+                Thread.sleep(25L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+        }
+        return project
+    }
+
     private fun computeSemanticFingerprints(project: ImportedProject): Map<String, String> =
         project.modules.associate { module ->
             module.gradlePath to fingerprintModule(module)
@@ -2515,10 +2771,31 @@ class KotlinLanguageServer(
     private fun moduleLabel(module: ImportedModule): String =
         module.gradlePath.removePrefix(":").ifBlank { module.name }
 
+    private fun documentLabel(uri: String): String =
+        documentUriToPath(uri).fileName?.toString().orEmpty().ifBlank { uri }
+
+    private fun reasonLabel(reason: String): String =
+        when (reason) {
+            "open" -> "on open"
+            "insert-leave" -> "after insert leave"
+            else -> "after $reason"
+        }
+
     private fun isSourceUri(uri: String): Boolean = isSourceFile(documentUriToPath(uri))
 
     private fun isSourceFile(path: Path): Boolean =
         path.fileName?.toString()?.substringAfterLast('.', "").orEmpty() in setOf("kt", "kts", "java")
+
+    private fun showInfoMessage(message: String) {
+        if (!clientInitialized) return
+        sendNotificationSafely(
+            "window/showMessage",
+            mapOf(
+                "type" to 3,
+                "message" to message,
+            ),
+        )
+    }
 
     private fun isProjectModelPath(path: Path): Boolean {
         val normalized = path.normalize()
@@ -2614,7 +2891,7 @@ class KotlinLanguageServer(
         } else {
             null
         }
-        transport.sendNotification(
+        sendNotificationSafely(
             "\$/android-neovim/progress",
             mapOf(
                 "token" to token,
@@ -2626,6 +2903,12 @@ class KotlinLanguageServer(
                 ),
             ),
         )
+    }
+
+    private fun sendNotificationSafely(method: String, params: Any?) {
+        runCatching {
+            transport.sendNotification(method, params)
+        }
     }
 
     private fun recordCompletionRoute(
@@ -2704,6 +2987,11 @@ class KotlinLanguageServer(
         val rebuildFastIndex: Boolean,
         val semanticUris: Set<String>,
         val interactiveSemanticRefresh: Boolean,
+        val semanticFlushGenerations: Map<String, Int>,
+    )
+
+    private data class PendingPostDiagnosticsWork(
+        val flushGeneration: Int,
     )
 
     private data class SupportRefreshRequest(

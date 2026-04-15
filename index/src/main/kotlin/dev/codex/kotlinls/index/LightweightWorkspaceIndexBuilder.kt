@@ -235,6 +235,30 @@ class LightweightWorkspaceIndexBuilder(
         saveProjectCache(projectRoot, projectCache)
     }
 
+    fun persistDocumentIfChanged(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+    ): DocumentCacheStatus {
+        val normalized = path.normalize()
+        val module = project.moduleForPath(normalized) ?: return DocumentCacheStatus.CURRENT
+        val projectRoot = project.root.normalize()
+        val contentHash = sha256(text)
+        val existing = synchronized(cacheLock) {
+            projectCaches.getOrPut(projectRoot) { loadProjectCache(projectRoot) }.files[normalized]
+        }
+        val status = when {
+            existing == null || existing.contentHash.isNullOrBlank() -> DocumentCacheStatus.MISSING
+            existing.moduleName != module.name -> DocumentCacheStatus.STALE
+            existing.contentHash != contentHash -> DocumentCacheStatus.STALE
+            else -> DocumentCacheStatus.CURRENT
+        }
+        if (status != DocumentCacheStatus.CURRENT) {
+            persistDocument(project, normalized, text)
+        }
+        return status
+    }
+
     private fun indexSymbols(
         projectCache: CachedProjectIndex,
         workItem: IndexedWorkItem,
@@ -636,6 +660,12 @@ class LightweightWorkspaceIndexBuilder(
             }.resolve("lightweight-index")
         }
     }
+}
+
+enum class DocumentCacheStatus {
+    CURRENT,
+    MISSING,
+    STALE,
 }
 
 private data class RootEntry(

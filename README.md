@@ -79,19 +79,8 @@ require("android_neovim_lsp").setup({
 require("android_neovim_lsp").setup({
   inlay_hints = false,
   format_on_save = true,
-})
-```
-
-`format_on_save` can also be configured as a table:
-
-```lua
-require("android_neovim_lsp").setup({
-  format_on_save = {
-    enabled = true,
-    quiet = true,
-    lsp_format = "fallback",
-    timeout_ms = 5000,
-  },
+  install = true,
+  version = nil,
 })
 ```
 
@@ -99,14 +88,12 @@ You can control bootstrap behavior too:
 
 ```lua
 require("android_neovim_lsp").setup({
-  install = {
-    enabled = true,
-    method = "auto",
-  },
+  install = true,
+  version = nil,
 })
 ```
 
-Supported `install.method` values are `auto`, `build`, `release`, `build_or_release`, and `release_or_build`.
+When `install = true`, the runtime prefers building from the local checkout when available and otherwise falls back to the release installer. Set `version` to pin a specific GitHub release tag such as `"v-0.1.3"`. When `version` is set, the runtime installs that release bundle and skips re-downloading it if the managed install root already matches.
 
 ## Manual Install
 

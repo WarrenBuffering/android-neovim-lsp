@@ -670,6 +670,15 @@ fun formattingSuite(): TestSuite {
                     }
                 }
             },
+            TestCase("detects Linux-style JetBrains runtime layout") {
+                val ideaHome = createFakeLinuxIdeaHome(Files.createTempDirectory("kotlinls-linux-idea-home"))
+                withSystemProperty("os.name", "Linux") {
+                    withSystemProperty("os.arch", "x86_64") {
+                        val bridge = JetBrainsFormatterBridge.fromIdeaHome(ideaHome)
+                        assertTrue(bridge != null) { "Expected Linux-style JetBrains home to be recognized" }
+                    }
+                }
+            },
         ),
     )
 }
@@ -704,6 +713,37 @@ private fun createFakeIdeaHome(contents: java.nio.file.Path): java.nio.file.Path
     contents.resolve("plugins/Kotlin/lib/kotlin-plugin.jar").writeText("")
     contents.resolve("jbr/Contents/Home/bin/java").writeText("")
     return contents
+}
+
+private fun createFakeLinuxIdeaHome(root: java.nio.file.Path): java.nio.file.Path {
+    root.resolve("bin").createDirectories()
+    root.resolve("lib").createDirectories()
+    root.resolve("plugins/Kotlin/lib").createDirectories()
+    root.resolve("jbr/bin").createDirectories()
+    root.resolve("product-info.json").writeText(
+        """
+        {
+          "launch": [
+            {
+              "os": "linux",
+              "arch": "x86_64",
+              "vmOptionsFilePath": "bin/studio64.vmoptions",
+              "bootClassPathJarNames": ["app.jar"],
+              "additionalJvmArguments": [
+                "-Didea.platform.prefix=AndroidStudio",
+                "--add-opens=java.base/java.lang=ALL-UNNAMED"
+              ],
+              "mainClass": "com.android.tools.idea.MainWrapper"
+            }
+          ]
+        }
+        """.trimIndent() + "\n",
+    )
+    root.resolve("bin/studio64.vmoptions").writeText("-Xmx512m\n")
+    root.resolve("lib/app.jar").writeText("")
+    root.resolve("plugins/Kotlin/lib/kotlin-plugin.jar").writeText("")
+    root.resolve("jbr/bin/java").writeText("")
+    return root
 }
 
 private fun applyEdits(

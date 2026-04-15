@@ -330,7 +330,7 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 }
             }
         },
-        TestCase("defers diagnostics until an explicit flush when insert-leave mode is enabled") {
+        TestCase("defers diagnostics until the insert-leave flush arrives") {
             val projectRoot = createDiagnosticsDebounceFixture()
             val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
             withRunningServer { server ->
@@ -346,7 +346,6 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                         ),
                         "diagnostics" to mapOf(
                             "fast_debounce_ms" to 0,
-                            "flush_on_insert_leave" to true,
                         ),
                     ),
                 )
@@ -420,6 +419,71 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     .orEmpty()
                 assertTrue("unresolved-import-symbol" in diagnosticCodes) {
                     "Expected explicit diagnostics flush to publish unresolved import diagnostics, got $diagnosticCodes"
+                }
+            }
+        },
+        TestCase("suppresses semantic progress notifications until the insert-leave flush arrives") {
+            val projectRoot = createSemanticRequestFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "semantic" to mapOf(
+                            "backend" to "k2_bridge",
+                        ),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "method" to "textDocument/didChange",
+                        "params" to mapOf(
+                            "textDocument" to mapOf(
+                                "uri" to appFile.toUri().toString(),
+                                "version" to 2,
+                            ),
+                            "contentChanges" to listOf(
+                                mapOf(
+                                    "text" to """
+                                        package demo.app
+
+                                        fun app(): Int {
+                                            val total = 41
+                                            return total + 2
+                                        }
+                                    """.trimIndent() + "\n",
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 189,
+                        "method" to "workspace/symbol",
+                        "params" to mapOf("query" to "app"),
+                    ),
+                )
+
+                var sawSemanticProgressBeforeFlush = false
+                val symbolResponse = readUntil(server.reader, maxMessages = 120) { message ->
+                    if (progressTitle(message) == "Semantic Analysis" || progressTitle(message) == "Semantic Index") {
+                        sawSemanticProgressBeforeFlush = true
+                    }
+                    message.id?.asInt() == 189
+                }
+                assertTrue(symbolResponse?.result?.isArray == true) { "Expected workspace/symbol response after didChange" }
+                assertTrue(!sawSemanticProgressBeforeFlush) {
+                    "Expected semantic progress to stay deferred until flush"
                 }
             }
         },
@@ -536,24 +600,27 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 assertTrue(definitionCount > 0) { "Expected semantic definition for local variable once snapshot was ready" }
             }
         },
-        TestCase("requests inlay hint refresh after semantic analysis for open files") {
+        TestCase("does not advertise inlay hints even when semantic analysis is enabled") {
             val projectRoot = createSemanticRequestFixture()
-            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
             withRunningServer { server ->
-                initializeServer(
-                    server,
-                    projectRoot,
-                    initializationOptions = mapOf(
-                        "progress" to mapOf("mode" to "off"),
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 1,
+                        "method" to "initialize",
+                        "params" to mapOf(
+                            "rootUri" to projectRoot.toUri().toString(),
+                            "initializationOptions" to mapOf(
+                                "progress" to mapOf("mode" to "off"),
+                            ),
+                        ),
                     ),
                 )
-                openDocument(server, appFile)
-                val refreshRequest = readUntil(server.reader, maxMessages = 160, timeoutMillis = 15_000L) { message ->
-                    message.method == "workspace/inlayHint/refresh"
-                }
-                assertTrue(refreshRequest != null) {
-                    "Expected workspace/inlayHint/refresh request after semantic state install"
-                }
+                val initResponse = readUntil(server.reader, maxMessages = 20) { it.id?.asInt() == 1 }
+                val capabilities = initResponse?.result?.get("capabilities")
+                assertTrue(capabilities != null) { "Expected initialize capabilities" }
+                assertEquals(false, capabilities?.get("inlayHintProvider")?.asBoolean())
             }
         },
         TestCase("serves default-import Kotlin stdlib hover and definition from the support index") {
@@ -796,60 +863,6 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     .orEmpty()
                 assertTrue(definitionUri.endsWith("/DockChecklist.kt")) {
                     "Expected import definition to resolve to DockChecklist.kt, got $definitionUri"
-                }
-            }
-        },
-        TestCase("serves first semantic hover and definition on cold request when focused analysis fits timeout") {
-            val projectRoot = createSemanticRequestFixture()
-            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
-            withRunningServer { server ->
-                initializeServer(
-                    server,
-                    projectRoot,
-                    initializationOptions = mapOf(
-                        "progress" to mapOf("mode" to "off"),
-                        "semantic" to mapOf(
-                            "request_timeout_ms" to 600,
-                        ),
-                    ),
-                )
-                openDocument(server, appFile)
-                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
-
-                writePayload(
-                    server.clientOut,
-                    mapOf(
-                        "jsonrpc" to "2.0",
-                        "id" to 600,
-                        "method" to "textDocument/hover",
-                        "params" to mapOf(
-                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
-                            "position" to mapOf("line" to 4, "character" to 11),
-                        ),
-                    ),
-                )
-                val hoverResponse = readUntil(server.reader, maxMessages = 160) { message ->
-                    message.id?.asInt() == 600
-                }
-                assertContains(hoverResponse?.result?.toString().orEmpty(), "Int")
-
-                writePayload(
-                    server.clientOut,
-                    mapOf(
-                        "jsonrpc" to "2.0",
-                        "id" to 601,
-                        "method" to "textDocument/definition",
-                        "params" to mapOf(
-                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
-                            "position" to mapOf("line" to 4, "character" to 11),
-                        ),
-                    ),
-                )
-                val definitionResponse = readUntil(server.reader, maxMessages = 160) { message ->
-                    message.id?.asInt() == 601
-                }
-                assertTrue((definitionResponse?.result?.size() ?: 0) > 0) {
-                    "Expected first cold definition request to succeed once focused analysis completed inside timeout"
                 }
             }
         },

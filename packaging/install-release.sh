@@ -6,6 +6,7 @@ VERSION="${ANDROID_NEOVIM_LSP_VERSION:-latest}"
 INSTALL_ROOT="${ANDROID_NEOVIM_LSP_INSTALL_ROOT:-$HOME/.local/share/android-neovim-lsp}"
 BIN_DIR="${ANDROID_NEOVIM_LSP_BIN_DIR:-$HOME/.local/bin}"
 LINK_BIN="${ANDROID_NEOVIM_LSP_LINK_BIN:-1}"
+VERSION_MARKER=".installed-release-version"
 ASSET_NAME="android-neovim-lsp.tar.gz"
 CHECKSUM_NAME="${ASSET_NAME}.sha256"
 
@@ -87,6 +88,7 @@ fi
 rm -rf "$INSTALL_ROOT"
 mkdir -p "$INSTALL_ROOT"
 tar -xzf "$ARCHIVE_PATH" -C "$INSTALL_ROOT" --strip-components=1
+printf '%s\n' "$TAG_NAME" > "$INSTALL_ROOT/$VERSION_MARKER"
 
 BIN_PATH="$INSTALL_ROOT/android-neovim-lsp/bin/android-neovim-lsp"
 if [[ ! -x "$BIN_PATH" ]]; then
@@ -110,4 +112,3 @@ Launcher:
 Neovim runtime:
   $INSTALL_ROOT/nvim
 EOF
-

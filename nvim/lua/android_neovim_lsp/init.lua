@@ -7,6 +7,7 @@ local bootstrap_state = {
 }
 
 local format_on_save_group = vim.api.nvim_create_augroup("AndroidNeovimLspFormatOnSave", { clear = false })
+local format_flash_namespace = vim.api.nvim_create_namespace("AndroidNeovimLspFormatFlash")
 local format_spinner = {
   active = 0,
 }
@@ -15,6 +16,10 @@ local progress_spinner = {
   active = {},
   order = {},
 }
+local format_request_timeout_ms = 30000
+local format_request_quiet = true
+local format_lsp_mode = "fallback"
+local diagnostics_debounce_ms = 0
 local diagnostics_debounce = {
   pending = {},
   timers = {},
@@ -26,6 +31,8 @@ local flush_buffer_diagnostics
 local schedule_buffer_diagnostics_flush
 local complete_format
 local merge_changed_line_range
+local start_format_status
+local stop_format_status
 local function empty_map(value)
   if value == nil then
     return vim.empty_dict()
@@ -159,8 +166,30 @@ local function detect_cmd()
   return { "android-neovim-lsp" }
 end
 
+local function managed_install_cmd_path(install_root)
+  return vim.fs.normalize(vim.fs.joinpath(install_root, "android-neovim-lsp", "bin", "android-neovim-lsp"))
+end
+
+local function should_bootstrap_existing(existing, install_root)
+  if existing == nil then
+    return true
+  end
+  local command = existing[1]
+  if type(command) ~= "string" or command == "" then
+    return false
+  end
+  if command == "android-neovim-lsp" then
+    return false
+  end
+  return vim.fs.normalize(command) == managed_install_cmd_path(install_root)
+end
+
 local function repo_revision_marker_path(install_root)
   return vim.fs.joinpath(install_root, ".plugin-source-revision")
+end
+
+local function release_version_marker_path(install_root)
+  return vim.fs.joinpath(install_root, ".installed-release-version")
 end
 
 local function current_repo_revision(root)
@@ -197,19 +226,14 @@ local function installer_scripts(root)
   return build_script, release_script
 end
 
-local function bootstrap_methods(install_opts, build_script, release_script)
-  local method = install_opts and install_opts.method or "auto"
+local function bootstrap_methods(requested_version, build_script, release_script)
   local methods
-  if method == "build" then
-    methods = { "build" }
-  elseif method == "release" then
+  if type(requested_version) == "string" and requested_version ~= "" then
     methods = { "release" }
-  elseif method == "release_or_build" then
-    methods = { "release", "build" }
-  elseif method == "build_or_release" then
+  elseif build_script ~= nil then
     methods = { "build", "release" }
   else
-    methods = build_script ~= nil and { "build", "release" } or { "release", "build" }
+    methods = { "release" }
   end
 
   return vim.tbl_filter(function(candidate)
@@ -226,6 +250,14 @@ local function should_refresh_repo_build(root, install_root)
   return vim.trim(installed or "") ~= revision, revision
 end
 
+local function should_refresh_release_install(install_root, requested_version)
+  if type(requested_version) ~= "string" or requested_version == "" or requested_version == "latest" then
+    return false
+  end
+  local installed = read_file(release_version_marker_path(install_root))
+  return vim.trim(installed or "") ~= requested_version
+end
+
 local function maybe_notify_install(message, level, install_opts)
   if install_opts and install_opts.quiet then
     return
@@ -240,9 +272,14 @@ local function bootstrap_cmd(install_opts)
   local existing = detect_existing_cmd(install_root)
   local needs_refresh = false
   local revision = nil
+  local requested_version = install_opts and install_opts.version or nil
 
-  if build_script ~= nil then
+  if build_script ~= nil and should_bootstrap_existing(existing, install_root) then
     needs_refresh, revision = should_refresh_repo_build(repo, install_root)
+  end
+
+  if not needs_refresh and should_bootstrap_existing(existing, install_root) then
+    needs_refresh = should_refresh_release_install(install_root, requested_version)
   end
 
   if existing ~= nil and not needs_refresh then
@@ -253,7 +290,7 @@ local function bootstrap_cmd(install_opts)
     return existing or detect_cmd()
   end
 
-  local methods = bootstrap_methods(install_opts, build_script, release_script)
+  local methods = bootstrap_methods(requested_version, build_script, release_script)
   if vim.tbl_isempty(methods) then
     return existing or detect_cmd()
   end
@@ -270,6 +307,9 @@ local function bootstrap_cmd(install_opts)
   local env = vim.tbl_extend("force", vim.fn.environ(), {
     ANDROID_NEOVIM_LSP_INSTALL_ROOT = install_root,
   })
+  if type(requested_version) == "string" and requested_version ~= "" then
+    env.ANDROID_NEOVIM_LSP_VERSION = requested_version
+  end
 
   for _, method in ipairs(methods) do
     local ok
@@ -312,49 +352,24 @@ local function bootstrap_cmd(install_opts)
   return detect_existing_cmd(install_root) or existing or detect_cmd()
 end
 
-local function normalize_feature_opts(value, defaults)
-  if value == nil then
-    return nil
-  end
-  if type(value) == "boolean" then
-    return vim.tbl_deep_extend("force", defaults, { enabled = value })
-  end
-  if type(value) == "table" then
-    return vim.tbl_deep_extend("force", defaults, value)
-  end
-  return vim.deepcopy(defaults)
-end
-
 local function split_setup_opts(opts)
   local lsp_opts = vim.deepcopy(opts or {})
-  local diagnostics_opts = opts and opts.diagnostics
-  if diagnostics_opts == nil then
-    diagnostics_opts = {}
-  end
   local plugin_opts = {
-    diagnostics = normalize_feature_opts(diagnostics_opts, {
-      enabled = true,
-      debounce_ms = 0,
-      flush_on_insert_leave = true,
-    }),
-    inlay_hints = normalize_feature_opts(opts and opts.inlay_hints, { enabled = true }),
-    format_on_save = normalize_feature_opts(opts and opts.format_on_save, {
-      enabled = true,
-      quiet = true,
-      lsp_format = "fallback",
-      timeout_ms = 5000,
-    }),
-    install = normalize_feature_opts(opts and opts.install, {
-      enabled = true,
-      method = "auto",
+    inlay_hints_enabled = opts and opts.inlay_hints,
+    format_on_save_enabled = opts and opts.format_on_save == true,
+    install = {
+      enabled = opts and opts.install == true,
+      version = nil,
       quiet = false,
-      install_root = default_install_root(),
-    }),
+      install_root = (opts and opts.install_root) or default_install_root(),
+    },
   }
-  lsp_opts.diagnostics = nil
+  plugin_opts.install.version = opts and opts.version or nil
   lsp_opts.inlay_hints = nil
   lsp_opts.format_on_save = nil
   lsp_opts.install = nil
+  lsp_opts.install_root = nil
+  lsp_opts.version = nil
   return lsp_opts, plugin_opts
 end
 
@@ -440,10 +455,10 @@ local function queue_next_buffer_diagnostics_flush(state, reason)
     return
   end
 
-  state.queued_flush_reason = reason or state.queued_flush_reason or "change"
+  state.queued_flush_reason = reason or "change"
 end
 
-local function perform_format_buffer(bufnr, format_opts, before_text)
+local function perform_format_buffer(bufnr, before_text)
   local function on_complete()
     complete_format(bufnr, before_text)
   end
@@ -451,16 +466,15 @@ local function perform_format_buffer(bufnr, format_opts, before_text)
   local ok, conform = pcall(require, "conform")
   if ok then
     start_format_status()
-    local attempted = conform.format({
+    local ok_format, attempted = pcall(conform.format, {
       bufnr = bufnr,
       async = false,
-      quiet = format_opts.quiet,
-      lsp_format = format_opts.lsp_format,
-      timeout_ms = format_opts.timeout_ms,
-    }, function()
-      on_complete()
-    end)
-    if attempted == false then
+      quiet = format_request_quiet,
+      lsp_format = format_lsp_mode,
+      timeout_ms = format_request_timeout_ms,
+    })
+    on_complete()
+    if not ok_format or attempted == false then
       stop_format_status()
     end
     return
@@ -470,7 +484,7 @@ local function perform_format_buffer(bufnr, format_opts, before_text)
   local ok_format = pcall(vim.lsp.buf.format, {
     bufnr = bufnr,
     async = false,
-    timeout_ms = format_opts.timeout_ms,
+    timeout_ms = format_request_timeout_ms,
   })
   on_complete()
   if not ok_format then
@@ -484,11 +498,6 @@ local function finish_buffer_diagnostics_flush(bufnr, state)
   end
 
   state.flush_in_flight = false
-  local reason = state.queued_flush_reason
-  state.queued_flush_reason = nil
-  if not vim.tbl_isempty(state.changed_lines) then
-    schedule_buffer_diagnostics_flush(bufnr, reason or "change")
-  end
 end
 
 local function make_publish_diagnostics_handler(default_handler, debounce_ms)
@@ -567,9 +576,15 @@ local function make_diagnostics_flushed_handler()
   end
 end
 
-local function is_insert_like_mode()
-  local mode = vim.api.nvim_get_mode().mode
+local function is_insert_like_mode(mode)
+  if mode == nil then
+    mode = vim.api.nvim_get_mode().mode
+  end
   return type(mode) == "string" and mode:match("^[iR]") ~= nil
+end
+
+local function is_normal_like_mode(mode)
+  return type(mode) == "string" and mode:match("^n") ~= nil
 end
 
 merge_changed_line_range = function(ranges, start_line, end_line)
@@ -650,12 +665,6 @@ flush_buffer_diagnostics = function(bufnr, reason)
   end
 
   state.flush_scheduled = false
-  if state.flush_in_flight then
-    if not vim.tbl_isempty(state.changed_lines) then
-      queue_next_buffer_diagnostics_flush(state, reason)
-    end
-    return
-  end
   if vim.tbl_isempty(state.changed_lines) then
     return
   end
@@ -681,6 +690,7 @@ flush_buffer_diagnostics = function(bufnr, reason)
   state.next_flush_generation = (state.next_flush_generation or 0) + 1
   state.awaiting_flush_generation = state.next_flush_generation
   state.flush_in_flight = true
+  state.queued_flush_reason = nil
 
   flush_client_changes(client, bufnr)
   client:notify("$/android-neovim/flushDiagnostics", {
@@ -699,32 +709,19 @@ schedule_buffer_diagnostics_flush = function(bufnr, reason)
   if state == nil then
     return
   end
-  if state.flush_in_flight then
-    if not vim.tbl_isempty(state.changed_lines) then
-      queue_next_buffer_diagnostics_flush(state, reason)
-    end
-    return
-  end
+  queue_next_buffer_diagnostics_flush(state, reason)
   if state.flush_scheduled then
     return
   end
 
   state.flush_scheduled = true
   vim.schedule(function()
-    flush_buffer_diagnostics(bufnr, reason)
+    local next_reason = state.queued_flush_reason or reason
+    flush_buffer_diagnostics(bufnr, next_reason)
   end)
 end
 
 local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
-  if plugin_opts.diagnostics == nil or plugin_opts.diagnostics.enabled == false then
-    return
-  end
-  if plugin_opts.diagnostics.flush_on_insert_leave ~= true then
-    vim.api.nvim_clear_autocmds({ group = diagnostics_sync_group, buffer = bufnr })
-    diagnostics_tracking.buffers[bufnr] = nil
-    return
-  end
-
   local state = diagnostics_tracking.buffers[bufnr]
   if state == nil then
     state = {
@@ -745,11 +742,16 @@ local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
   end
 
   vim.api.nvim_clear_autocmds({ group = diagnostics_sync_group, buffer = bufnr })
-  vim.api.nvim_create_autocmd("InsertLeave", {
+  vim.api.nvim_create_autocmd("ModeChanged", {
     group = diagnostics_sync_group,
     buffer = bufnr,
     callback = function(args)
-      schedule_buffer_diagnostics_flush(args.buf, "insert_leave")
+      local event = vim.v.event or {}
+      local old_mode = event.old_mode
+      local new_mode = event.new_mode
+      if is_insert_like_mode(old_mode) and is_normal_like_mode(new_mode) then
+        schedule_buffer_diagnostics_flush(args.buf, "insert_leave")
+      end
     end,
   })
   vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
@@ -772,9 +774,6 @@ local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
       end
 
       queue_changed_line_range(buf, firstline, lastline, new_lastline)
-      if not is_insert_like_mode() then
-        schedule_buffer_diagnostics_flush(buf, "change")
-      end
     end,
     on_detach = function(_, buf)
       diagnostics_tracking.buffers[buf] = nil
@@ -796,7 +795,7 @@ end
 local function render_status()
 end
 
-local function start_format_status()
+start_format_status = function()
   format_spinner.active = format_spinner.active + 1
   if format_spinner.active > 1 then
     return
@@ -809,7 +808,7 @@ local function start_format_status()
   if not ok then return end
 end
 
-local function stop_format_status()
+stop_format_status = function()
   if format_spinner.active == 0 then
     return
   end
@@ -875,6 +874,55 @@ local function count_changed_lines(before_text, after_text)
   return changed_lines
 end
 
+local function flash_format_changes(bufnr, before_text)
+  if before_text == nil then
+    return
+  end
+  if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+    return
+  end
+
+  local after_text = buffer_text(bufnr)
+  if before_text == after_text then
+    return
+  end
+
+  local hunks = vim.diff(before_text, after_text, {
+    result_type = "indices",
+    algorithm = "histogram",
+  })
+  if type(hunks) ~= "table" or vim.tbl_isempty(hunks) then
+    return
+  end
+
+  vim.api.nvim_buf_clear_namespace(bufnr, format_flash_namespace, 0, -1)
+
+  local line_count = math.max(vim.api.nvim_buf_line_count(bufnr), 1)
+  for _, hunk in ipairs(hunks) do
+    local start_line = math.max((hunk[3] or 1) - 1, 0)
+    local changed_count = math.max(hunk[4] or 0, 1)
+    local end_line = math.min(start_line + changed_count, line_count)
+    if start_line >= line_count then
+      start_line = line_count - 1
+      end_line = line_count
+    end
+    if start_line >= 0 and end_line > start_line then
+      vim.api.nvim_buf_set_extmark(bufnr, format_flash_namespace, start_line, 0, {
+        end_row = end_line,
+        hl_group = "IncSearch",
+        hl_eol = true,
+        priority = 250,
+      })
+    end
+  end
+
+  vim.defer_fn(function()
+    if vim.api.nvim_buf_is_valid(bufnr) then
+      vim.api.nvim_buf_clear_namespace(bufnr, format_flash_namespace, 0, -1)
+    end
+  end, 180)
+end
+
 local function show_format_result(bufnr, before_text)
   if before_text == nil then
     return
@@ -928,6 +976,7 @@ end
 
 complete_format = function(bufnr, before_text)
   stop_format_status()
+  flash_format_changes(bufnr, before_text)
   local state = diagnostics_tracking.buffers[bufnr]
   if state ~= nil then
     queue_full_buffer_diagnostics_range(bufnr, state)
@@ -936,7 +985,7 @@ complete_format = function(bufnr, before_text)
   show_format_result(bufnr, before_text)
 end
 
-local function format_buffer(bufnr, format_opts)
+local function format_buffer(bufnr)
   if vim.g.autoformat == false then
     return
   end
@@ -947,15 +996,15 @@ local function format_buffer(bufnr, format_opts)
     return
   end
   local before_text = buffer_text(bufnr)
-  perform_format_buffer(bufnr, format_opts, before_text)
+  perform_format_buffer(bufnr, before_text)
 end
 
 local function configure_buffer(client, bufnr, plugin_opts)
   ensure_diagnostics_tracking(client, bufnr, plugin_opts)
 
-  if plugin_opts.inlay_hints ~= nil then
+  if plugin_opts.inlay_hints_enabled ~= nil then
     local supports_inlay_hints = client.supports_method and client:supports_method("textDocument/inlayHint")
-    local inlay_hints_enabled = plugin_opts.inlay_hints.enabled and supports_inlay_hints
+    local inlay_hints_enabled = plugin_opts.inlay_hints_enabled and supports_inlay_hints
     set_inlay_hints_enabled(bufnr, inlay_hints_enabled)
     if not inlay_hints_enabled then
       vim.schedule(function()
@@ -967,14 +1016,13 @@ local function configure_buffer(client, bufnr, plugin_opts)
   end
 
   vim.api.nvim_clear_autocmds({ group = format_on_save_group, buffer = bufnr })
-  if plugin_opts.format_on_save and plugin_opts.format_on_save.enabled then
-    local format_opts = vim.tbl_deep_extend("force", {}, plugin_opts.format_on_save)
+  if plugin_opts.format_on_save_enabled then
     vim.b[bufnr].autoformat = false
     vim.api.nvim_create_autocmd("BufWritePre", {
       group = format_on_save_group,
       buffer = bufnr,
       callback = function(args)
-        format_buffer(args.buf, format_opts)
+        format_buffer(args.buf)
       end,
     })
   end
@@ -992,19 +1040,16 @@ function M.default_config(opts)
   local default_publish_diagnostics_handler = user_handlers["textDocument/publishDiagnostics"]
     or vim.lsp.handlers["textDocument/publishDiagnostics"]
   local init_options = vim.deepcopy(lsp_opts.init_options or {})
-  if plugin_opts.diagnostics and plugin_opts.diagnostics.enabled ~= false then
-    init_options.diagnostics = vim.tbl_deep_extend(
-      "force",
-      init_options.diagnostics or {},
-      {
-        fast_debounce_ms = tonumber(plugin_opts.diagnostics.debounce_ms) or 0,
-        flush_on_insert_leave = plugin_opts.diagnostics.flush_on_insert_leave == true,
-      }
-    )
-  end
+  init_options.diagnostics = vim.tbl_deep_extend(
+    "force",
+    init_options.diagnostics or {},
+    {
+      fast_debounce_ms = diagnostics_debounce_ms,
+    }
+  )
   user_handlers["textDocument/publishDiagnostics"] = make_publish_diagnostics_handler(
     default_publish_diagnostics_handler,
-    plugin_opts.diagnostics and plugin_opts.diagnostics.enabled ~= false and plugin_opts.diagnostics.debounce_ms or 0
+    diagnostics_debounce_ms
   )
   user_handlers["$/android-neovim/diagnosticsFlushed"] = make_diagnostics_flushed_handler()
   user_handlers["$/android-neovim/progress"] = function(_, result, ctx)
