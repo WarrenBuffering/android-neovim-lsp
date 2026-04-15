@@ -25,7 +25,29 @@ sdk.dir=/Users/yourname/Library/Android/sdk
 kotlinls.intellijHome=/Applications/Android Studio.app/Contents
 ```
 
-## Install
+## Quick Start
+
+With `lazy.nvim` or LazyVim, this is enough:
+
+```lua
+return {
+  {
+    "WarrenBuffering/android-neovim-lsp",
+    main = "android_neovim_lsp",
+    dependencies = { "neovim/nvim-lspconfig" },
+    opts = {},
+  },
+}
+```
+
+On first setup, the plugin looks for an existing `android-neovim-lsp` binary. If it cannot find one, it will:
+
+- build and install the server from the checkout when the full repo is available
+- otherwise fall back to the release installer path
+
+If you do not want that behavior, set `install = false` in `opts` and provide `cmd` yourself.
+
+## Manual Install
 
 This project is currently installed from a checkout.
 
@@ -49,7 +71,7 @@ ENABLE_JETBRAINS_BRIDGE=1 ./packaging/install-local-dev.sh
 
 ## Neovim Setup
 
-Minimal setup:
+If you are loading the installed runtime directly:
 
 ```lua
 vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
@@ -59,8 +81,9 @@ require("android_neovim_lsp").setup()
 `android_neovim_lsp.setup()` looks for the server in this order:
 
 - `android-neovim-lsp` on `PATH`
-- `~/.local/share/android-neovim-lsp/android-neovim-lsp/bin/android-neovim-lsp` when loaded from the installed runtime
 - a repo-local build at `server/build/install/server/bin/android-neovim-lsp`
+- `~/.local/share/android-neovim-lsp/android-neovim-lsp/bin/android-neovim-lsp`
+- an installed sibling binary when loaded from the bundled runtime
 
 If you want to set the command explicitly:
 
@@ -77,8 +100,7 @@ require("android_neovim_lsp").setup({
 ```lua
 return {
   {
-    dir = vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"),
-    name = "android-neovim-lsp",
+    "WarrenBuffering/android-neovim-lsp",
     main = "android_neovim_lsp",
     dependencies = { "neovim/nvim-lspconfig" },
     opts = {},
@@ -109,6 +131,19 @@ require("android_neovim_lsp").setup({
   },
 })
 ```
+
+You can control bootstrap behavior too:
+
+```lua
+require("android_neovim_lsp").setup({
+  install = {
+    enabled = true,
+    method = "auto",
+  },
+})
+```
+
+Supported `install.method` values are `auto`, `build`, `release`, `build_or_release`, and `release_or_build`.
 
 ## Local Testing
 

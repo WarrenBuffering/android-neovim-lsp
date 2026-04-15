@@ -1,7 +1,6 @@
 return {
   {
-    dir = vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"),
-    name = "android-neovim-lsp",
+    "WarrenBuffering/android-neovim-lsp",
     main = "android_neovim_lsp",
     dependencies = { "neovim/nvim-lspconfig" },
     opts = {

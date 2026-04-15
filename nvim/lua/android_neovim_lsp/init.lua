@@ -1,5 +1,10 @@
 local M = {}
 M._runtime_config = nil
+local bootstrap_state = {
+  attempted = false,
+  success = false,
+  last_error = nil,
+}
 
 local format_on_save_group = vim.api.nvim_create_augroup("AndroidNeovimLspFormatOnSave", { clear = false })
 local format_spinner = {
@@ -51,29 +56,260 @@ local function plugin_root()
   return vim.fs.normalize(vim.fs.joinpath(init_path, "..", "..", ".."))
 end
 
-local function detect_cmd()
+local function repo_root()
+  local root = plugin_root()
+  if not root then
+    return nil
+  end
+  return vim.fs.normalize(vim.fs.joinpath(root, ".."))
+end
+
+local function default_install_root()
+  local configured = vim.env.ANDROID_NEOVIM_LSP_INSTALL_ROOT
+  if type(configured) == "string" and configured ~= "" then
+    return vim.fs.normalize(configured)
+  end
+  return vim.fs.normalize(vim.fs.joinpath(vim.fn.expand("~"), ".local", "share", "android-neovim-lsp"))
+end
+
+local function read_file(path)
+  if path == nil or vim.fn.filereadable(path) ~= 1 then
+    return nil
+  end
+  local lines = vim.fn.readfile(path)
+  if type(lines) ~= "table" or vim.tbl_isempty(lines) then
+    return nil
+  end
+  return table.concat(lines, "\n")
+end
+
+local function write_file(path, contents)
+  local parent = vim.fs.dirname(path)
+  if parent ~= nil and parent ~= "" then
+    vim.fn.mkdir(parent, "p")
+  end
+  vim.fn.writefile(vim.split(contents, "\n", { plain = true }), path)
+end
+
+local function run_command(args, opts)
+  opts = opts or {}
+  if type(vim.system) ~= "function" then
+    return false, "Neovim auto-install requires vim.system support", -1
+  end
+
+  local result = vim.system(args, {
+    cwd = opts.cwd,
+    env = opts.env,
+    text = true,
+  }):wait()
+  local output = table.concat(vim.tbl_filter(function(part)
+    return type(part) == "string" and part ~= ""
+  end, {
+    result.stdout,
+    result.stderr,
+  }), "\n")
+  return result.code == 0, output, result.code
+end
+
+local function detect_existing_cmd(install_root)
   if vim.fn.executable("android-neovim-lsp") == 1 then
     return { "android-neovim-lsp" }
   end
 
-  local root = plugin_root()
-  if not root then
-    return { "android-neovim-lsp" }
+  install_root = install_root or default_install_root()
+  local candidates = {}
+  local seen = {}
+  local runtime_root = plugin_root()
+  local repo = repo_root()
+
+  local function add_candidate(path)
+    if type(path) ~= "string" or path == "" then
+      return
+    end
+    local normalized = vim.fs.normalize(path)
+    if seen[normalized] then
+      return
+    end
+    seen[normalized] = true
+    table.insert(candidates, normalized)
   end
 
-  local candidates = {
-    vim.fs.joinpath(root, "..", "android-neovim-lsp", "bin", "android-neovim-lsp"),
-    vim.fs.joinpath(root, "..", "server", "build", "install", "server", "bin", "android-neovim-lsp"),
-  }
+  if repo ~= nil then
+    add_candidate(vim.fs.joinpath(repo, "server", "build", "install", "server", "bin", "android-neovim-lsp"))
+  end
+  add_candidate(vim.fs.joinpath(install_root, "android-neovim-lsp", "bin", "android-neovim-lsp"))
+  if runtime_root ~= nil then
+    add_candidate(vim.fs.joinpath(runtime_root, "..", "android-neovim-lsp", "bin", "android-neovim-lsp"))
+  end
 
   for _, candidate in ipairs(candidates) do
-    local normalized = vim.fs.normalize(candidate)
-    if vim.fn.executable(normalized) == 1 then
-      return { normalized }
+    if vim.fn.executable(candidate) == 1 then
+      return { candidate }
     end
   end
 
+  return nil
+end
+
+local function detect_cmd()
+  local existing = detect_existing_cmd()
+  if existing ~= nil then
+    return existing
+  end
   return { "android-neovim-lsp" }
+end
+
+local function repo_revision_marker_path(install_root)
+  return vim.fs.joinpath(install_root, ".plugin-source-revision")
+end
+
+local function current_repo_revision(root)
+  if root == nil then
+    return nil
+  end
+  local git_dir = vim.fs.joinpath(root, ".git")
+  if vim.fn.isdirectory(git_dir) ~= 1 and vim.fn.filereadable(git_dir) ~= 1 then
+    return nil
+  end
+  local ok, output = run_command({ "git", "rev-parse", "HEAD" }, { cwd = root })
+  if not ok then
+    return nil
+  end
+  local revision = vim.trim(output or "")
+  if revision == "" then
+    return nil
+  end
+  return revision
+end
+
+local function installer_scripts(root)
+  if root == nil then
+    return nil, nil
+  end
+  local build_script = vim.fs.joinpath(root, "packaging", "install-local-dev.sh")
+  local release_script = vim.fs.joinpath(root, "packaging", "install-release.sh")
+  if vim.fn.filereadable(build_script) ~= 1 then
+    build_script = nil
+  end
+  if vim.fn.filereadable(release_script) ~= 1 then
+    release_script = nil
+  end
+  return build_script, release_script
+end
+
+local function bootstrap_methods(install_opts, build_script, release_script)
+  local method = install_opts and install_opts.method or "auto"
+  local methods
+  if method == "build" then
+    methods = { "build" }
+  elseif method == "release" then
+    methods = { "release" }
+  elseif method == "release_or_build" then
+    methods = { "release", "build" }
+  elseif method == "build_or_release" then
+    methods = { "build", "release" }
+  else
+    methods = build_script ~= nil and { "build", "release" } or { "release", "build" }
+  end
+
+  return vim.tbl_filter(function(candidate)
+    return (candidate == "build" and build_script ~= nil) or (candidate == "release" and release_script ~= nil)
+  end, methods)
+end
+
+local function should_refresh_repo_build(root, install_root)
+  local revision = current_repo_revision(root)
+  if revision == nil then
+    return false, nil
+  end
+  local installed = read_file(repo_revision_marker_path(install_root))
+  return vim.trim(installed or "") ~= revision, revision
+end
+
+local function maybe_notify_install(message, level, install_opts)
+  if install_opts and install_opts.quiet then
+    return
+  end
+  vim.notify(message, level or vim.log.levels.INFO, { title = "android-neovim-lsp" })
+end
+
+local function bootstrap_cmd(install_opts)
+  local install_root = (install_opts and install_opts.install_root) or default_install_root()
+  local repo = repo_root()
+  local build_script, release_script = installer_scripts(repo)
+  local existing = detect_existing_cmd(install_root)
+  local needs_refresh = false
+  local revision = nil
+
+  if build_script ~= nil then
+    needs_refresh, revision = should_refresh_repo_build(repo, install_root)
+  end
+
+  if existing ~= nil and not needs_refresh then
+    return existing
+  end
+
+  if install_opts == nil or install_opts.enabled == false then
+    return existing or detect_cmd()
+  end
+
+  local methods = bootstrap_methods(install_opts, build_script, release_script)
+  if vim.tbl_isempty(methods) then
+    return existing or detect_cmd()
+  end
+
+  if bootstrap_state.attempted and not needs_refresh and bootstrap_state.success then
+    return detect_existing_cmd(install_root) or existing or detect_cmd()
+  end
+
+  bootstrap_state.attempted = true
+  bootstrap_state.success = false
+  bootstrap_state.last_error = nil
+
+  local failures = {}
+  local env = vim.tbl_extend("force", vim.fn.environ(), {
+    ANDROID_NEOVIM_LSP_INSTALL_ROOT = install_root,
+  })
+
+  for _, method in ipairs(methods) do
+    local ok
+    local output
+    local script
+
+    if method == "build" then
+      script = build_script
+      maybe_notify_install("android-neovim-lsp: building local server bundle...", vim.log.levels.INFO, install_opts)
+      ok, output = run_command({ script }, { cwd = repo, env = env })
+    elseif method == "release" then
+      script = release_script
+      maybe_notify_install("android-neovim-lsp: downloading server bundle...", vim.log.levels.INFO, install_opts)
+      ok, output = run_command({ script }, { cwd = repo, env = env })
+    end
+
+    if ok then
+      local refreshed = detect_existing_cmd(install_root)
+      if refreshed ~= nil then
+        if method == "build" and revision ~= nil then
+          write_file(repo_revision_marker_path(install_root), revision)
+        end
+        bootstrap_state.success = true
+        bootstrap_state.last_error = nil
+        maybe_notify_install("android-neovim-lsp: server ready", vim.log.levels.INFO, install_opts)
+        return refreshed
+      end
+      table.insert(failures, string.format("%s installer completed but no launcher was found", method))
+    else
+      local trimmed = vim.trim(output or "")
+      if trimmed == "" then
+        trimmed = "unknown failure"
+      end
+      table.insert(failures, string.format("%s failed: %s", method, trimmed))
+    end
+  end
+
+  bootstrap_state.last_error = table.concat(failures, "\n")
+  maybe_notify_install(bootstrap_state.last_error, vim.log.levels.ERROR, install_opts)
+  return detect_existing_cmd(install_root) or existing or detect_cmd()
 end
 
 local function normalize_feature_opts(value, defaults)
@@ -108,10 +344,17 @@ local function split_setup_opts(opts)
       lsp_format = "fallback",
       timeout_ms = 5000,
     }),
+    install = normalize_feature_opts(opts and opts.install, {
+      enabled = true,
+      method = "auto",
+      quiet = false,
+      install_root = default_install_root(),
+    }),
   }
   lsp_opts.diagnostics = nil
   lsp_opts.inlay_hints = nil
   lsp_opts.format_on_save = nil
+  lsp_opts.install = nil
   return lsp_opts, plugin_opts
 end
 
@@ -740,6 +983,7 @@ end
 function M.default_config(opts)
   opts = opts or {}
   local lsp_opts, plugin_opts = split_setup_opts(opts)
+  local cmd = lsp_opts.cmd or bootstrap_cmd(plugin_opts.install)
   local user_on_attach = lsp_opts.on_attach
   local user_on_exit = lsp_opts.on_exit
   local user_handlers = vim.deepcopy(lsp_opts.handlers or {})
@@ -787,7 +1031,7 @@ function M.default_config(opts)
     end
   end
   return vim.tbl_deep_extend("force", lsp_opts, {
-    cmd = lsp_opts.cmd or detect_cmd(),
+    cmd = cmd,
     filetypes = { "kotlin" },
     root_dir = lsp_opts.root_dir or root_dir,
     single_file_support = true,

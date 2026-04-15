@@ -2,6 +2,8 @@
 
 ## Minimal `init.lua`
 
+If you are loading the installed runtime directly:
+
 ```lua
 vim.opt.runtimepath:prepend(vim.fn.expand("~/.local/share/android-neovim-lsp/nvim"))
 require("android_neovim_lsp").setup({
@@ -10,9 +12,7 @@ require("android_neovim_lsp").setup({
 })
 ```
 
-If you used the release installer, this is the default runtime path it creates.
-
-The repo's [`nvim/init.lua`](init.lua) intentionally uses this installed runtime too, so local testing follows the same loading path as a consumer install.
+If no server binary is available yet, the plugin will bootstrap one automatically on first setup.
 
 ## LazyVim / lazy.nvim
 
@@ -35,8 +35,11 @@ That is the intended consumer setup. `main = "android_neovim_lsp"` lets `lazy.nv
 The plugin looks for the server in this order:
 
 - `android-neovim-lsp` on `PATH`
-- a sibling bundled binary at `../android-neovim-lsp/bin/android-neovim-lsp`
 - a local source build at `../server/build/install/server/bin/android-neovim-lsp`
+- `~/.local/share/android-neovim-lsp/android-neovim-lsp/bin/android-neovim-lsp`
+- a sibling bundled binary at `../android-neovim-lsp/bin/android-neovim-lsp`
+
+If it still cannot find one, it will try to build from the checkout and then fall back to the release installer path.
 
 ## Release Installer
 
@@ -59,7 +62,7 @@ The repo's `nvim/init.lua` also bootstraps `lazy.nvim` and `nvim-lspconfig`, so 
 
 ## Plugin Options
 
-`android_neovim_lsp.setup()` accepts normal `lspconfig` options plus two plugin-specific toggles:
+`android_neovim_lsp.setup()` accepts normal `lspconfig` options plus plugin-specific toggles:
 
 ```lua
 require("android_neovim_lsp").setup({
@@ -80,6 +83,10 @@ require("android_neovim_lsp").setup({
     quiet = true,
     lsp_format = "fallback",
     timeout_ms = 5000,
+  },
+  install = {
+    enabled = true,
+    method = "auto",
   },
 })
 ```
