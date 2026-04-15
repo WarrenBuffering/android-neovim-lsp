@@ -79,19 +79,8 @@ require("android_neovim_lsp").setup({
 require("android_neovim_lsp").setup({
   inlay_hints = false,
   format_on_save = true,
-})
-```
-
-`format_on_save` can also be configured as a table:
-
-```lua
-require("android_neovim_lsp").setup({
-  format_on_save = {
-    enabled = true,
-    quiet = true,
-    lsp_format = "fallback",
-    timeout_ms = 5000,
-  },
+  install = true,
+  version = nil,
 })
 ```
 

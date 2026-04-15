@@ -68,22 +68,6 @@ The repo's `nvim/init.lua` also bootstraps `lazy.nvim` and `nvim-lspconfig`, so 
 require("android_neovim_lsp").setup({
   inlay_hints = false,
   format_on_save = true,
-})
-```
-
-You can also pass tables:
-
-```lua
-require("android_neovim_lsp").setup({
-  inlay_hints = {
-    enabled = false,
-  },
-  format_on_save = {
-    enabled = true,
-    quiet = true,
-    lsp_format = "fallback",
-    timeout_ms = 5000,
-  },
   install = true,
   version = nil,
 })

@@ -15,6 +15,10 @@ local progress_spinner = {
   active = {},
   order = {},
 }
+local format_request_timeout_ms = 30000
+local format_request_quiet = true
+local format_lsp_mode = "fallback"
+local diagnostics_debounce_ms = 0
 local diagnostics_debounce = {
   pending = {},
   timers = {},
@@ -345,52 +349,23 @@ local function bootstrap_cmd(install_opts)
   return detect_existing_cmd(install_root) or existing or detect_cmd()
 end
 
-local function normalize_feature_opts(value, defaults)
-  if value == nil then
-    return nil
-  end
-  if type(value) == "boolean" then
-    return vim.tbl_deep_extend("force", defaults, { enabled = value })
-  end
-  if type(value) == "table" then
-    return vim.tbl_deep_extend("force", defaults, value)
-  end
-  return vim.deepcopy(defaults)
-end
-
 local function split_setup_opts(opts)
   local lsp_opts = vim.deepcopy(opts or {})
-  local diagnostics_opts = opts and opts.diagnostics
-  local requested_version = opts and opts.version
-  if diagnostics_opts == nil then
-    diagnostics_opts = {}
-  end
   local plugin_opts = {
-    diagnostics = normalize_feature_opts(diagnostics_opts, {
-      enabled = true,
-      debounce_ms = 0,
-    }),
-    inlay_hints = normalize_feature_opts(opts and opts.inlay_hints, { enabled = true }),
-    format_on_save = normalize_feature_opts(opts and opts.format_on_save, {
-      enabled = true,
-      quiet = true,
-      lsp_format = "fallback",
-      timeout_ms = 5000,
-    }),
-    install = normalize_feature_opts(opts and opts.install, {
-      enabled = true,
+    inlay_hints_enabled = opts and opts.inlay_hints,
+    format_on_save_enabled = opts and opts.format_on_save == true,
+    install = {
+      enabled = opts and opts.install == true,
       version = nil,
       quiet = false,
-      install_root = default_install_root(),
-    }),
+      install_root = (opts and opts.install_root) or default_install_root(),
+    },
   }
-  if plugin_opts.install ~= nil then
-    plugin_opts.install.version = requested_version
-  end
-  lsp_opts.diagnostics = nil
+  plugin_opts.install.version = opts and opts.version or nil
   lsp_opts.inlay_hints = nil
   lsp_opts.format_on_save = nil
   lsp_opts.install = nil
+  lsp_opts.install_root = nil
   lsp_opts.version = nil
   return lsp_opts, plugin_opts
 end
@@ -480,7 +455,7 @@ local function queue_next_buffer_diagnostics_flush(state, reason)
   state.queued_flush_reason = reason or state.queued_flush_reason or "change"
 end
 
-local function perform_format_buffer(bufnr, format_opts, before_text)
+local function perform_format_buffer(bufnr, before_text)
   local function on_complete()
     complete_format(bufnr, before_text)
   end
@@ -491,9 +466,9 @@ local function perform_format_buffer(bufnr, format_opts, before_text)
     local attempted = conform.format({
       bufnr = bufnr,
       async = false,
-      quiet = format_opts.quiet,
-      lsp_format = format_opts.lsp_format,
-      timeout_ms = format_opts.timeout_ms,
+      quiet = format_request_quiet,
+      lsp_format = format_lsp_mode,
+      timeout_ms = format_request_timeout_ms,
     }, function()
       on_complete()
     end)
@@ -507,7 +482,7 @@ local function perform_format_buffer(bufnr, format_opts, before_text)
   local ok_format = pcall(vim.lsp.buf.format, {
     bufnr = bufnr,
     async = false,
-    timeout_ms = format_opts.timeout_ms,
+    timeout_ms = format_request_timeout_ms,
   })
   on_complete()
   if not ok_format then
@@ -753,10 +728,6 @@ schedule_buffer_diagnostics_flush = function(bufnr, reason)
 end
 
 local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
-  if plugin_opts.diagnostics == nil or plugin_opts.diagnostics.enabled == false then
-    return
-  end
-
   local state = diagnostics_tracking.buffers[bufnr]
   if state == nil then
     state = {
@@ -968,7 +939,7 @@ complete_format = function(bufnr, before_text)
   show_format_result(bufnr, before_text)
 end
 
-local function format_buffer(bufnr, format_opts)
+local function format_buffer(bufnr)
   if vim.g.autoformat == false then
     return
   end
@@ -979,15 +950,15 @@ local function format_buffer(bufnr, format_opts)
     return
   end
   local before_text = buffer_text(bufnr)
-  perform_format_buffer(bufnr, format_opts, before_text)
+  perform_format_buffer(bufnr, before_text)
 end
 
 local function configure_buffer(client, bufnr, plugin_opts)
   ensure_diagnostics_tracking(client, bufnr, plugin_opts)
 
-  if plugin_opts.inlay_hints ~= nil then
+  if plugin_opts.inlay_hints_enabled ~= nil then
     local supports_inlay_hints = client.supports_method and client:supports_method("textDocument/inlayHint")
-    local inlay_hints_enabled = plugin_opts.inlay_hints.enabled and supports_inlay_hints
+    local inlay_hints_enabled = plugin_opts.inlay_hints_enabled and supports_inlay_hints
     set_inlay_hints_enabled(bufnr, inlay_hints_enabled)
     if not inlay_hints_enabled then
       vim.schedule(function()
@@ -999,14 +970,13 @@ local function configure_buffer(client, bufnr, plugin_opts)
   end
 
   vim.api.nvim_clear_autocmds({ group = format_on_save_group, buffer = bufnr })
-  if plugin_opts.format_on_save and plugin_opts.format_on_save.enabled then
-    local format_opts = vim.tbl_deep_extend("force", {}, plugin_opts.format_on_save)
+  if plugin_opts.format_on_save_enabled then
     vim.b[bufnr].autoformat = false
     vim.api.nvim_create_autocmd("BufWritePre", {
       group = format_on_save_group,
       buffer = bufnr,
       callback = function(args)
-        format_buffer(args.buf, format_opts)
+        format_buffer(args.buf)
       end,
     })
   end
@@ -1024,18 +994,16 @@ function M.default_config(opts)
   local default_publish_diagnostics_handler = user_handlers["textDocument/publishDiagnostics"]
     or vim.lsp.handlers["textDocument/publishDiagnostics"]
   local init_options = vim.deepcopy(lsp_opts.init_options or {})
-  if plugin_opts.diagnostics and plugin_opts.diagnostics.enabled ~= false then
-    init_options.diagnostics = vim.tbl_deep_extend(
-      "force",
-      init_options.diagnostics or {},
-      {
-        fast_debounce_ms = tonumber(plugin_opts.diagnostics.debounce_ms) or 0,
-      }
-    )
-  end
+  init_options.diagnostics = vim.tbl_deep_extend(
+    "force",
+    init_options.diagnostics or {},
+    {
+      fast_debounce_ms = diagnostics_debounce_ms,
+    }
+  )
   user_handlers["textDocument/publishDiagnostics"] = make_publish_diagnostics_handler(
     default_publish_diagnostics_handler,
-    plugin_opts.diagnostics and plugin_opts.diagnostics.enabled ~= false and plugin_opts.diagnostics.debounce_ms or 0
+    diagnostics_debounce_ms
   )
   user_handlers["$/android-neovim/diagnosticsFlushed"] = make_diagnostics_flushed_handler()
   user_handlers["$/android-neovim/progress"] = function(_, result, ctx)
