@@ -159,8 +159,30 @@ local function detect_cmd()
   return { "android-neovim-lsp" }
 end
 
+local function managed_install_cmd_path(install_root)
+  return vim.fs.normalize(vim.fs.joinpath(install_root, "android-neovim-lsp", "bin", "android-neovim-lsp"))
+end
+
+local function should_bootstrap_existing(existing, install_root)
+  if existing == nil then
+    return true
+  end
+  local command = existing[1]
+  if type(command) ~= "string" or command == "" then
+    return false
+  end
+  if command == "android-neovim-lsp" then
+    return false
+  end
+  return vim.fs.normalize(command) == managed_install_cmd_path(install_root)
+end
+
 local function repo_revision_marker_path(install_root)
   return vim.fs.joinpath(install_root, ".plugin-source-revision")
+end
+
+local function release_version_marker_path(install_root)
+  return vim.fs.joinpath(install_root, ".installed-release-version")
 end
 
 local function current_repo_revision(root)
@@ -197,19 +219,14 @@ local function installer_scripts(root)
   return build_script, release_script
 end
 
-local function bootstrap_methods(install_opts, build_script, release_script)
-  local method = install_opts and install_opts.method or "auto"
+local function bootstrap_methods(requested_version, build_script, release_script)
   local methods
-  if method == "build" then
-    methods = { "build" }
-  elseif method == "release" then
+  if type(requested_version) == "string" and requested_version ~= "" then
     methods = { "release" }
-  elseif method == "release_or_build" then
-    methods = { "release", "build" }
-  elseif method == "build_or_release" then
+  elseif build_script ~= nil then
     methods = { "build", "release" }
   else
-    methods = build_script ~= nil and { "build", "release" } or { "release", "build" }
+    methods = { "release" }
   end
 
   return vim.tbl_filter(function(candidate)
@@ -226,6 +243,14 @@ local function should_refresh_repo_build(root, install_root)
   return vim.trim(installed or "") ~= revision, revision
 end
 
+local function should_refresh_release_install(install_root, requested_version)
+  if type(requested_version) ~= "string" or requested_version == "" or requested_version == "latest" then
+    return false
+  end
+  local installed = read_file(release_version_marker_path(install_root))
+  return vim.trim(installed or "") ~= requested_version
+end
+
 local function maybe_notify_install(message, level, install_opts)
   if install_opts and install_opts.quiet then
     return
@@ -240,9 +265,14 @@ local function bootstrap_cmd(install_opts)
   local existing = detect_existing_cmd(install_root)
   local needs_refresh = false
   local revision = nil
+  local requested_version = install_opts and install_opts.version or nil
 
-  if build_script ~= nil then
+  if build_script ~= nil and should_bootstrap_existing(existing, install_root) then
     needs_refresh, revision = should_refresh_repo_build(repo, install_root)
+  end
+
+  if not needs_refresh and should_bootstrap_existing(existing, install_root) then
+    needs_refresh = should_refresh_release_install(install_root, requested_version)
   end
 
   if existing ~= nil and not needs_refresh then
@@ -253,7 +283,7 @@ local function bootstrap_cmd(install_opts)
     return existing or detect_cmd()
   end
 
-  local methods = bootstrap_methods(install_opts, build_script, release_script)
+  local methods = bootstrap_methods(requested_version, build_script, release_script)
   if vim.tbl_isempty(methods) then
     return existing or detect_cmd()
   end
@@ -270,6 +300,9 @@ local function bootstrap_cmd(install_opts)
   local env = vim.tbl_extend("force", vim.fn.environ(), {
     ANDROID_NEOVIM_LSP_INSTALL_ROOT = install_root,
   })
+  if type(requested_version) == "string" and requested_version ~= "" then
+    env.ANDROID_NEOVIM_LSP_VERSION = requested_version
+  end
 
   for _, method in ipairs(methods) do
     local ok
@@ -328,6 +361,7 @@ end
 local function split_setup_opts(opts)
   local lsp_opts = vim.deepcopy(opts or {})
   local diagnostics_opts = opts and opts.diagnostics
+  local requested_version = opts and opts.version
   if diagnostics_opts == nil then
     diagnostics_opts = {}
   end
@@ -335,7 +369,6 @@ local function split_setup_opts(opts)
     diagnostics = normalize_feature_opts(diagnostics_opts, {
       enabled = true,
       debounce_ms = 0,
-      flush_on_insert_leave = true,
     }),
     inlay_hints = normalize_feature_opts(opts and opts.inlay_hints, { enabled = true }),
     format_on_save = normalize_feature_opts(opts and opts.format_on_save, {
@@ -346,15 +379,19 @@ local function split_setup_opts(opts)
     }),
     install = normalize_feature_opts(opts and opts.install, {
       enabled = true,
-      method = "auto",
+      version = nil,
       quiet = false,
       install_root = default_install_root(),
     }),
   }
+  if plugin_opts.install ~= nil then
+    plugin_opts.install.version = requested_version
+  end
   lsp_opts.diagnostics = nil
   lsp_opts.inlay_hints = nil
   lsp_opts.format_on_save = nil
   lsp_opts.install = nil
+  lsp_opts.version = nil
   return lsp_opts, plugin_opts
 end
 
@@ -719,11 +756,6 @@ local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
   if plugin_opts.diagnostics == nil or plugin_opts.diagnostics.enabled == false then
     return
   end
-  if plugin_opts.diagnostics.flush_on_insert_leave ~= true then
-    vim.api.nvim_clear_autocmds({ group = diagnostics_sync_group, buffer = bufnr })
-    diagnostics_tracking.buffers[bufnr] = nil
-    return
-  end
 
   local state = diagnostics_tracking.buffers[bufnr]
   if state == nil then
@@ -998,7 +1030,6 @@ function M.default_config(opts)
       init_options.diagnostics or {},
       {
         fast_debounce_ms = tonumber(plugin_opts.diagnostics.debounce_ms) or 0,
-        flush_on_insert_leave = plugin_opts.diagnostics.flush_on_insert_leave == true,
       }
     )
   end

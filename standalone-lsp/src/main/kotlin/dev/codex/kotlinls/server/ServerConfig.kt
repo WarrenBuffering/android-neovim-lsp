@@ -29,8 +29,6 @@ internal data class KotlinLsConfig(
                     fastDebounceMillis = parsed.diagnostics.fastDebounceMillis
                         ?.coerceAtLeast(0L)
                         ?: DiagnosticsConfig().fastDebounceMillis,
-                    flushOnInsertLeave = parsed.diagnostics.flushOnInsertLeave
-                        ?: DiagnosticsConfig().flushOnInsertLeave,
                 ),
             )
         }
@@ -49,7 +47,6 @@ internal data class ProgressConfig(
 
 internal data class DiagnosticsConfig(
     val fastDebounceMillis: Long = 0L,
-    val flushOnInsertLeave: Boolean = false,
 )
 
 internal enum class SemanticBackend {
@@ -112,6 +109,4 @@ private data class RawProgressConfig(
 private data class RawDiagnosticsConfig(
     @param:JsonProperty("fast_debounce_ms")
     val fastDebounceMillis: Long? = null,
-    @param:JsonProperty("flush_on_insert_leave")
-    val flushOnInsertLeave: Boolean? = null,
 )

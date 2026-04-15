@@ -316,12 +316,8 @@ class KotlinLanguageServer(
                     val params = read(message.params, DidChangeTextDocumentParams::class.java)
                     documents.applyChanges(params)
                     updateLiveSourceIndex(params.textDocument.uri, publishDiagnostics = false)
-                    if (config.diagnostics.flushOnInsertLeave) {
-                        synchronized(diagnosticLock) {
-                            deferredDiagnosticUris += params.textDocument.uri
-                        }
-                    } else {
-                        scheduleFastDiagnosticsPublish(params.textDocument.uri)
+                    synchronized(diagnosticLock) {
+                        deferredDiagnosticUris += params.textDocument.uri
                     }
                     semanticEngine.invalidate(params.textDocument.uri, params.textDocument.version)
                     ensureProjectReady(params.textDocument.uri)
@@ -333,17 +329,6 @@ class KotlinLanguageServer(
                                 text = currentText,
                             )
                         }
-                        semanticEngine.prefetch(
-                            project = currentProject,
-                            activeDocument = documents.get(params.textDocument.uri),
-                            openDocuments = documents.openDocuments(),
-                            projectGeneration = currentProjectGeneration,
-                            syncDocuments = false,
-                            startBridge = true,
-                        )
-                    }
-                    if (!config.diagnostics.flushOnInsertLeave) {
-                        scheduleSemanticRefresh(params.textDocument.uri, interactive = false)
                     }
                 }
                 "textDocument/didClose" -> {
@@ -1798,6 +1783,17 @@ class KotlinLanguageServer(
             forceUris = setOf(uri),
             flushAcknowledgements = generation?.let { mapOf(uri to it) }.orEmpty(),
         )
+        val currentProject = project
+        if (currentProject != null) {
+            semanticEngine.prefetch(
+                project = currentProject,
+                activeDocument = documents.get(uri),
+                openDocuments = documents.openDocuments(),
+                projectGeneration = currentProjectGeneration,
+                syncDocuments = false,
+                startBridge = true,
+            )
+        }
         scheduleSemanticRefresh(uri, interactive = false)
     }
 

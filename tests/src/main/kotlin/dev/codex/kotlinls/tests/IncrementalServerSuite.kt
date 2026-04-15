@@ -330,7 +330,7 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 }
             }
         },
-        TestCase("defers diagnostics until an explicit flush when insert-leave mode is enabled") {
+        TestCase("defers diagnostics until the insert-leave flush arrives") {
             val projectRoot = createDiagnosticsDebounceFixture()
             val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
             withRunningServer { server ->
@@ -346,7 +346,6 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                         ),
                         "diagnostics" to mapOf(
                             "fast_debounce_ms" to 0,
-                            "flush_on_insert_leave" to true,
                         ),
                     ),
                 )
@@ -420,6 +419,71 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     .orEmpty()
                 assertTrue("unresolved-import-symbol" in diagnosticCodes) {
                     "Expected explicit diagnostics flush to publish unresolved import diagnostics, got $diagnosticCodes"
+                }
+            }
+        },
+        TestCase("suppresses semantic progress notifications until the insert-leave flush arrives") {
+            val projectRoot = createSemanticRequestFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "semantic" to mapOf(
+                            "backend" to "k2_bridge",
+                        ),
+                    ),
+                )
+                openDocument(server, appFile)
+                readUntil(server.reader, maxMessages = 80) { diagnosticUri(it) == appFile.toUri().toString() }
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "method" to "textDocument/didChange",
+                        "params" to mapOf(
+                            "textDocument" to mapOf(
+                                "uri" to appFile.toUri().toString(),
+                                "version" to 2,
+                            ),
+                            "contentChanges" to listOf(
+                                mapOf(
+                                    "text" to """
+                                        package demo.app
+
+                                        fun app(): Int {
+                                            val total = 41
+                                            return total + 2
+                                        }
+                                    """.trimIndent() + "\n",
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+
+                writePayload(
+                    server.clientOut,
+                    mapOf(
+                        "jsonrpc" to "2.0",
+                        "id" to 189,
+                        "method" to "workspace/symbol",
+                        "params" to mapOf("query" to "app"),
+                    ),
+                )
+
+                var sawSemanticProgressBeforeFlush = false
+                val symbolResponse = readUntil(server.reader, maxMessages = 120) { message ->
+                    if (progressTitle(message) == "Semantic Analysis" || progressTitle(message) == "Semantic Index") {
+                        sawSemanticProgressBeforeFlush = true
+                    }
+                    message.id?.asInt() == 189
+                }
+                assertTrue(symbolResponse?.result?.isArray == true) { "Expected workspace/symbol response after didChange" }
+                assertTrue(!sawSemanticProgressBeforeFlush) {
+                    "Expected semantic progress to stay deferred until flush"
                 }
             }
         },
