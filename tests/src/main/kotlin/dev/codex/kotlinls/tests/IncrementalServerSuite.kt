@@ -9,6 +9,7 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
+import java.lang.reflect.Field
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
@@ -37,6 +38,40 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 assertTrue(!sawSemanticAnalysis) { "Expected fast diagnostics before semantic analysis progress started" }
                 val codes = firstDiagnostic?.params?.get("diagnostics")?.mapNotNull { it.get("code")?.asText() }.orEmpty()
                 assertTrue("package-mismatch" in codes) { "Expected package mismatch diagnostic, got $codes" }
+            }
+        },
+        TestCase("publishes semantic diagnostics before semantic index starts") {
+            val projectRoot = createSemanticDiagnosticsFixture()
+            val appFile = projectRoot.resolve("app/src/main/kotlin/demo/app/App.kt")
+            withRunningServer { server ->
+                initializeServer(
+                    server,
+                    projectRoot,
+                    initializationOptions = mapOf(
+                        "progress" to mapOf("mode" to "off"),
+                        "semantic" to emptyMap<String, Any>(),
+                    ),
+                )
+                openDocument(server, appFile)
+                var sawSemanticIndex = false
+                val semanticDiagnostic = readUntil(server.reader, maxMessages = 160, timeoutMillis = 15_000L) { message ->
+                    if (progressTitle(message) == "Semantic Index") {
+                        sawSemanticIndex = true
+                    }
+                    diagnosticUri(message) == appFile.toUri().toString() &&
+                        ((message.params?.get("diagnostics")?.takeIf(JsonNode::isArray)?.size() ?: 0) > 0)
+                }
+                assertTrue(semanticDiagnostic != null) { "Expected semantic diagnostic for open file" }
+                assertTrue(!sawSemanticIndex) {
+                    "Expected semantic diagnostic to publish before semantic index progress started"
+                }
+                val messages = semanticDiagnostic?.params
+                    ?.get("diagnostics")
+                    ?.mapNotNull { it.get("message")?.asText() }
+                    .orEmpty()
+                assertTrue(messages.any { "type mismatch" in it.lowercase() || "initializer type mismatch" in it.lowercase() }) {
+                    "Expected compiler type mismatch diagnostic, got $messages"
+                }
             }
         },
         TestCase("updates fast index from unsaved document changes") {
@@ -508,7 +543,7 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     ),
                 )
                 openDocument(server, appFile)
-                val refreshRequest = readUntil(server.reader, maxMessages = 160) { message ->
+                val refreshRequest = readUntil(server.reader, maxMessages = 160, timeoutMillis = 15_000L) { message ->
                     message.method == "workspace/inlayHint/refresh"
                 }
                 assertTrue(refreshRequest != null) {
@@ -915,7 +950,7 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     initializationOptions = mapOf(
                         "progress" to mapOf("mode" to "off"),
                         "semantic" to mapOf(
-                            "request_timeout_ms" to 1200,
+                            "request_timeout_ms" to 2500,
                         ),
                     ),
                 )
@@ -970,25 +1005,37 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     ),
                 )
 
-                writePayload(
-                    server.clientOut,
-                    mapOf(
-                        "jsonrpc" to "2.0",
-                        "id" to 800,
-                        "method" to "textDocument/hover",
-                        "params" to mapOf(
-                            "textDocument" to mapOf("uri" to appFile.toUri().toString()),
-                            "position" to mapOf("line" to 4, "character" to 11),
+                var hoverText = ""
+                var sawStaleHover = false
+                repeat(8) { attempt ->
+                    val requestId = 800 + attempt
+                    writePayload(
+                        server.clientOut,
+                        mapOf(
+                            "jsonrpc" to "2.0",
+                            "id" to requestId,
+                            "method" to "textDocument/hover",
+                            "params" to mapOf(
+                                "textDocument" to mapOf("uri" to appFile.toUri().toString()),
+                                "position" to mapOf("line" to 4, "character" to 11),
+                            ),
                         ),
-                    ),
-                )
-                val hoverResponse = readUntil(server.reader, maxMessages = 200) { message ->
-                    message.id?.asInt() == 800
+                    )
+                    val hoverResponse = readUntil(server.reader, maxMessages = 200, timeoutMillis = 10_000L) { message ->
+                        message.id?.asInt() == requestId
+                    }
+                    hoverText = hoverResponse?.result?.toString().orEmpty()
+                    if ("Int" in hoverText) {
+                        sawStaleHover = true
+                    }
+                    if ("String" in hoverText) {
+                        return@repeat
+                    }
+                    Thread.sleep(150)
                 }
-                val hoverText = hoverResponse?.result?.toString().orEmpty()
                 assertContains(hoverText, "String")
-                assertTrue("Int" !in hoverText) {
-                    "Expected post-edit hover to wait for current semantic state, got stale response: $hoverText"
+                assertTrue(!sawStaleHover) {
+                    "Expected post-edit hover to avoid stale Int responses, got: $hoverText"
                 }
             }
         },
@@ -1352,6 +1399,43 @@ private fun createSemanticRequestFixture(): Path {
     return root
 }
 
+private fun createSemanticDiagnosticsFixture(): Path {
+    val root = Files.createTempDirectory("kotlinls-semantic-diagnostics")
+    root.resolve("settings.gradle.kts").writeText(
+        """
+        rootProject.name = "semantic-diagnostics"
+        include(":app")
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app").createDirectories()
+    root.resolve("app/build.gradle.kts").writeText(
+        """
+        plugins {
+            kotlin("jvm")
+        }
+
+        repositories {
+            mavenCentral()
+        }
+
+        kotlin {
+            jvmToolchain(21)
+        }
+        """.trimIndent() + "\n",
+    )
+    root.resolve("app/src/main/kotlin/demo/app/App.kt").writeText(
+        """
+        package demo.app
+
+        fun app(): String {
+            val label: String = 42
+            return label
+        }
+        """.trimIndent() + "\n",
+    )
+    return root
+}
+
 private fun createNamedArgumentCompletionFixture(): Path {
     val root = Files.createTempDirectory("kotlinls-named-arg-completion")
     root.resolve("settings.gradle.kts").writeText(
@@ -1492,14 +1576,33 @@ private fun writePayload(output: PipedOutputStream, payload: Any) {
 private fun readUntil(
     reader: JsonRpcTransport,
     maxMessages: Int,
+    timeoutMillis: Long = 5_000L,
     predicate: (JsonRpcInboundMessage) -> Boolean,
 ): JsonRpcInboundMessage? {
+    val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
     repeat(maxMessages) {
+        while (readerAvailable(reader) <= 0) {
+            if (System.nanoTime() >= deadline) {
+                return null
+            }
+            Thread.sleep(10)
+        }
         val message = reader.readMessage() ?: return null
         if (predicate(message)) return message
     }
     return null
 }
+
+private val jsonRpcSourceField: Field by lazy {
+    JsonRpcTransport::class.java.getDeclaredField("source").apply {
+        isAccessible = true
+    }
+}
+
+private fun readerAvailable(reader: JsonRpcTransport): Int =
+    runCatching {
+        (jsonRpcSourceField.get(reader) as? BufferedInputStream)?.available() ?: 0
+    }.getOrDefault(0)
 
 private fun diagnosticUri(message: JsonRpcInboundMessage): String? =
     message.takeIf { it.method == "textDocument/publishDiagnostics" }

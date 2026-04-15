@@ -31,6 +31,7 @@ import kotlin.jvm.functions.Function1
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
+import java.util.Comparator
 import kotlin.io.path.createDirectories
 import kotlin.io.path.extension
 import kotlin.io.path.name
@@ -270,7 +271,11 @@ class KotlinWorkspaceAnalyzer(
                 )
             }
         }
-        val snapshotRoot = workspaceCache.snapshotRoot
+        val snapshotRoot = if (normalizedIncludedPaths == null) {
+            workspaceCache.snapshotRoot
+        } else {
+            focusedSnapshotRoot(workspaceCache.snapshotRoot, normalizedIncludedPaths)
+        }
         val mirrorToOriginal = linkedMapOf<Path, Path>()
         val originalToMirror = linkedMapOf<Path, Path>()
         val textByOriginal = linkedMapOf<Path, String>()
@@ -305,14 +310,7 @@ class KotlinWorkspaceAnalyzer(
             val relative = originalPath.relativeTo(project.root)
             val mirrorPath = snapshotRoot.resolve(relative.toString()).normalize()
             val document = documents.get(originalPath.toUri().toString())
-            val sourceFingerprint = document?.let { openDocumentFingerprint(it.version, it.text) }
-                ?: fileFingerprint(originalPath)
-            val cached = synchronized(mirrorCacheLock) { workspaceCache.files[originalPath] }
-            val current = if (
-                cached == null ||
-                cached.sourceFingerprint != sourceFingerprint ||
-                !Files.exists(mirrorPath)
-            ) {
+            val current = if (normalizedIncludedPaths != null) {
                 mirrorPath.parent?.createDirectories()
                 val fileText = document?.text ?: originalPath.readText()
                 Files.writeString(
@@ -325,14 +323,39 @@ class KotlinWorkspaceAnalyzer(
                 MirroredFileState(
                     mirrorPath = mirrorPath,
                     text = fileText,
-                    sourceFingerprint = sourceFingerprint,
-                ).also { state ->
-                    synchronized(mirrorCacheLock) {
-                        workspaceCache.files[originalPath] = state
-                    }
-                }
+                    sourceFingerprint = document?.let { openDocumentFingerprint(it.version, it.text) }
+                        ?: fileFingerprint(originalPath),
+                )
             } else {
-                cached
+                val sourceFingerprint = document?.let { openDocumentFingerprint(it.version, it.text) }
+                    ?: fileFingerprint(originalPath)
+                val cached = synchronized(mirrorCacheLock) { workspaceCache.files[originalPath] }
+                if (
+                    cached == null ||
+                    cached.sourceFingerprint != sourceFingerprint ||
+                    !Files.exists(mirrorPath)
+                ) {
+                    mirrorPath.parent?.createDirectories()
+                    val fileText = document?.text ?: originalPath.readText()
+                    Files.writeString(
+                        mirrorPath,
+                        fileText,
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.TRUNCATE_EXISTING,
+                        StandardOpenOption.WRITE,
+                    )
+                    MirroredFileState(
+                        mirrorPath = mirrorPath,
+                        text = fileText,
+                        sourceFingerprint = sourceFingerprint,
+                    ).also { state ->
+                        synchronized(mirrorCacheLock) {
+                            workspaceCache.files[originalPath] = state
+                        }
+                    }
+                } else {
+                    cached
+                }
             }
             mirrorToOriginal[current.mirrorPath] = originalPath
             originalToMirror[originalPath] = current.mirrorPath
@@ -378,6 +401,33 @@ class KotlinWorkspaceAnalyzer(
     }
 
     private fun openDocumentFingerprint(version: Int, text: String): String = "open:$version:${text.hashCode()}"
+
+    private fun focusedSnapshotRoot(
+        workspaceSnapshotRoot: Path,
+        includedPaths: Set<Path>,
+    ): Path {
+        val focusedKey = includedPaths
+            .map(Path::toString)
+            .sorted()
+            .joinToString("\n")
+            .hashCode()
+            .toUInt()
+            .toString(16)
+        val focusedRoot = workspaceSnapshotRoot.resolve("focused-$focusedKey")
+        recreateDirectory(focusedRoot)
+        return focusedRoot
+    }
+
+    private fun recreateDirectory(path: Path) {
+        if (Files.exists(path)) {
+            Files.walk(path).use { stream ->
+                stream.sorted(Comparator.reverseOrder()).forEach { candidate ->
+                    Files.deleteIfExists(candidate)
+                }
+            }
+        }
+        path.createDirectories()
+    }
 
     private fun fileFingerprint(path: Path): String =
         "file:${runCatching { Files.getLastModifiedTime(path).toMillis() }.getOrDefault(0L)}:${runCatching { Files.size(path) }.getOrDefault(0L)}"

@@ -2,18 +2,13 @@ local M = {}
 M._runtime_config = nil
 
 local format_on_save_group = vim.api.nvim_create_augroup("AndroidNeovimLspFormatOnSave", { clear = false })
-local format_spinner_frames = { "-", "\\", "|", "/" }
 local format_spinner = {
   active = 0,
-  frame = 1,
-  timer = nil,
 }
 local diagnostics_sync_group = vim.api.nvim_create_augroup("AndroidNeovimLspDiagnostics", { clear = false })
 local progress_spinner = {
   active = {},
   order = {},
-  frame = 1,
-  timer = nil,
 }
 local diagnostics_debounce = {
   pending = {},
@@ -22,6 +17,10 @@ local diagnostics_debounce = {
 local diagnostics_tracking = {
   buffers = {},
 }
+local flush_buffer_diagnostics
+local schedule_buffer_diagnostics_flush
+local complete_format
+local merge_changed_line_range
 local function empty_map(value)
   if value == nil then
     return vim.empty_dict()
@@ -99,7 +98,7 @@ local function split_setup_opts(opts)
   local plugin_opts = {
     diagnostics = normalize_feature_opts(diagnostics_opts, {
       enabled = true,
-      debounce_ms = 100,
+      debounce_ms = 0,
       flush_on_insert_leave = true,
     }),
     inlay_hints = normalize_feature_opts(opts and opts.inlay_hints, { enabled = true }),
@@ -109,12 +108,10 @@ local function split_setup_opts(opts)
       lsp_format = "fallback",
       timeout_ms = 5000,
     }),
-    block_on_save = normalize_feature_opts(opts and opts.block_on_save, { enabled = false }),
   }
   lsp_opts.diagnostics = nil
   lsp_opts.inlay_hints = nil
   lsp_opts.format_on_save = nil
-  lsp_opts.block_on_save = nil
   return lsp_opts, plugin_opts
 end
 
@@ -133,6 +130,24 @@ local function redraw()
   pcall(vim.cmd, "redraw")
 end
 
+local function echo_bottom(message, highlight)
+  message = type(message) == "string" and message or ""
+  if message == "" then
+    return
+  end
+  local level = vim.log.levels.INFO
+  if highlight == "ErrorMsg" then
+    level = vim.log.levels.ERROR
+  elseif highlight == "WarningMsg" then
+    level = vim.log.levels.WARN
+  end
+  local ok = pcall(vim.notify, message, level, vim.tbl_extend("force", {
+    title = "android-neovim-lsp",
+  }, opts or {}))
+  if not ok then return end
+  redraw()
+end
+
 local function diagnostics_timer_key(client_id, uri)
   return string.format("%s::%s", tostring(client_id or 0), uri or "")
 end
@@ -144,16 +159,6 @@ local function diagnostics_state_for_uri(uri)
     end
   end
   return nil, nil
-end
-
-local function diagnostics_namespace(client_id)
-  local ok, lsp_diagnostic = pcall(function()
-    return vim.lsp.diagnostic
-  end)
-  if not ok or type(lsp_diagnostic) ~= "table" or type(lsp_diagnostic.get_namespace) ~= "function" then
-    return nil
-  end
-  return lsp_diagnostic.get_namespace(client_id, false)
 end
 
 local function stop_diagnostics_timer(key)
@@ -178,59 +183,68 @@ end
 local function clear_diagnostics_tracking_for_client(client_id)
   for bufnr, state in pairs(diagnostics_tracking.buffers) do
     if state.client_id == client_id then
-      state.suppressed = false
-      state.pending_diagnostics = nil
-      state.hidden_diagnostics = nil
+      state.changed_lines = {}
+      state.flush_scheduled = false
       state.awaiting_flush_generation = nil
-      local namespace = diagnostics_namespace(client_id)
-      if namespace ~= nil then
-        vim.diagnostic.show(namespace, bufnr)
-      end
+      state.flush_in_flight = false
+      state.queued_flush_reason = nil
     end
   end
 end
 
-local function hide_buffer_diagnostics(bufnr, state)
-  if state == nil or state.suppressed then
-    return
-  end
-
-  local client = state.client_id and vim.lsp.get_client_by_id(state.client_id) or nil
-  if client == nil or client.name ~= "android_neovim_lsp" then
-    return
-  end
-
-  local key = diagnostics_timer_key(client.id, state.uri)
-  diagnostics_debounce.pending[key] = nil
-  stop_diagnostics_timer(key)
-
-  local namespace = diagnostics_namespace(client.id)
-  if namespace ~= nil then
-    state.hidden_diagnostics = vim.deepcopy(vim.diagnostic.get(bufnr, { namespace = namespace }))
-    vim.diagnostic.reset(namespace, bufnr)
-  end
-
-  state.pending_diagnostics = nil
-  state.suppressed = true
-end
-
-local function restore_buffer_diagnostics(bufnr, state)
+local function queue_next_buffer_diagnostics_flush(state, reason)
   if state == nil then
     return
   end
 
-  local client = state.client_id and vim.lsp.get_client_by_id(state.client_id) or nil
-  if client == nil or client.name ~= "android_neovim_lsp" then
+  state.queued_flush_reason = reason or state.queued_flush_reason or "change"
+end
+
+local function perform_format_buffer(bufnr, format_opts, before_text)
+  local function on_complete()
+    complete_format(bufnr, before_text)
+  end
+
+  local ok, conform = pcall(require, "conform")
+  if ok then
+    start_format_status()
+    local attempted = conform.format({
+      bufnr = bufnr,
+      async = false,
+      quiet = format_opts.quiet,
+      lsp_format = format_opts.lsp_format,
+      timeout_ms = format_opts.timeout_ms,
+    }, function()
+      on_complete()
+    end)
+    if attempted == false then
+      stop_format_status()
+    end
     return
   end
 
-  local namespace = diagnostics_namespace(client.id)
-  if namespace ~= nil then
-    if state.hidden_diagnostics ~= nil then
-      vim.diagnostic.set(namespace, bufnr, state.hidden_diagnostics)
-      state.hidden_diagnostics = nil
-    end
-    vim.diagnostic.show(namespace, bufnr)
+  start_format_status()
+  local ok_format = pcall(vim.lsp.buf.format, {
+    bufnr = bufnr,
+    async = false,
+    timeout_ms = format_opts.timeout_ms,
+  })
+  on_complete()
+  if not ok_format then
+    stop_format_status()
+  end
+end
+
+local function finish_buffer_diagnostics_flush(bufnr, state)
+  if state == nil then
+    return
+  end
+
+  state.flush_in_flight = false
+  local reason = state.queued_flush_reason
+  state.queued_flush_reason = nil
+  if not vim.tbl_isempty(state.changed_lines) then
+    schedule_buffer_diagnostics_flush(bufnr, reason or "change")
   end
 end
 
@@ -248,17 +262,6 @@ local function make_publish_diagnostics_handler(default_handler, debounce_ms)
     local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil
     if client == nil or client.name ~= "android_neovim_lsp" or type(params) ~= "table" or type(params.uri) ~= "string" then
       return default_handler(err, params, ctx, config)
-    end
-
-    local bufnr, tracked_state = diagnostics_state_for_uri(params.uri)
-    if bufnr ~= nil and tracked_state ~= nil and tracked_state.client_id == ctx.client_id and tracked_state.suppressed then
-      tracked_state.pending_diagnostics = {
-        err = err,
-        params = params,
-        ctx = ctx,
-        config = config,
-      }
-      return
     end
 
     local uv = vim.uv or vim.loop
@@ -300,7 +303,7 @@ local function make_publish_diagnostics_handler(default_handler, debounce_ms)
   end
 end
 
-local function make_diagnostics_flushed_handler(default_handler)
+local function make_diagnostics_flushed_handler()
   return function(_, params)
     if type(params) ~= "table" or type(params.textDocument) ~= "table" or type(params.textDocument.uri) ~= "string" then
       return
@@ -317,16 +320,7 @@ local function make_diagnostics_flushed_handler(default_handler)
     end
 
     state.awaiting_flush_generation = nil
-    state.suppressed = false
-
-    local pending = state.pending_diagnostics
-    state.pending_diagnostics = nil
-    if pending ~= nil and type(default_handler) == "function" then
-      default_handler(pending.err, pending.params, pending.ctx, pending.config)
-      return
-    end
-
-    restore_buffer_diagnostics(bufnr, state)
+    finish_buffer_diagnostics_flush(bufnr, state)
   end
 end
 
@@ -335,7 +329,7 @@ local function is_insert_like_mode()
   return type(mode) == "string" and mode:match("^[iR]") ~= nil
 end
 
-local function merge_changed_line_range(ranges, start_line, end_line)
+merge_changed_line_range = function(ranges, start_line, end_line)
   local next_start = math.max(0, tonumber(start_line) or 0)
   local next_end = math.max(next_start + 1, tonumber(end_line) or (next_start + 1))
   local merged = {}
@@ -374,13 +368,24 @@ local function merge_changed_line_range(ranges, start_line, end_line)
   end
 end
 
+local function queue_full_buffer_diagnostics_range(bufnr, state)
+  if state == nil then
+    return
+  end
+
+  local line_count = 1
+  if vim.api.nvim_buf_is_valid(bufnr) and vim.api.nvim_buf_is_loaded(bufnr) then
+    line_count = math.max(vim.api.nvim_buf_line_count(bufnr), 1)
+  end
+  merge_changed_line_range(state.changed_lines, 0, line_count)
+end
+
 local function queue_changed_line_range(bufnr, firstline, lastline, new_lastline)
   local state = diagnostics_tracking.buffers[bufnr]
   if state == nil then
     return
   end
 
-  hide_buffer_diagnostics(bufnr, state)
   merge_changed_line_range(
     state.changed_lines,
     firstline,
@@ -395,13 +400,19 @@ local function flush_client_changes(client, bufnr)
   end
 end
 
-local function flush_buffer_diagnostics(bufnr, reason)
+flush_buffer_diagnostics = function(bufnr, reason)
   local state = diagnostics_tracking.buffers[bufnr]
   if state == nil then
     return
   end
 
   state.flush_scheduled = false
+  if state.flush_in_flight then
+    if not vim.tbl_isempty(state.changed_lines) then
+      queue_next_buffer_diagnostics_flush(state, reason)
+    end
+    return
+  end
   if vim.tbl_isempty(state.changed_lines) then
     return
   end
@@ -426,7 +437,7 @@ local function flush_buffer_diagnostics(bufnr, reason)
 
   state.next_flush_generation = (state.next_flush_generation or 0) + 1
   state.awaiting_flush_generation = state.next_flush_generation
-  state.pending_diagnostics = nil
+  state.flush_in_flight = true
 
   flush_client_changes(client, bufnr)
   client:notify("$/android-neovim/flushDiagnostics", {
@@ -440,9 +451,18 @@ local function flush_buffer_diagnostics(bufnr, reason)
   state.changed_lines = {}
 end
 
-local function schedule_buffer_diagnostics_flush(bufnr, reason)
+schedule_buffer_diagnostics_flush = function(bufnr, reason)
   local state = diagnostics_tracking.buffers[bufnr]
-  if state == nil or state.flush_scheduled then
+  if state == nil then
+    return
+  end
+  if state.flush_in_flight then
+    if not vim.tbl_isempty(state.changed_lines) then
+      queue_next_buffer_diagnostics_flush(state, reason)
+    end
+    return
+  end
+  if state.flush_scheduled then
     return
   end
 
@@ -470,11 +490,10 @@ local function ensure_diagnostics_tracking(client, bufnr, plugin_opts)
       client_id = client.id,
       uri = vim.uri_from_bufnr(bufnr),
       attached = false,
-      suppressed = false,
-      pending_diagnostics = nil,
-      hidden_diagnostics = nil,
       next_flush_generation = 0,
       awaiting_flush_generation = nil,
+      flush_in_flight = false,
+      queued_flush_reason = nil,
     }
     diagnostics_tracking.buffers[bufnr] = state
   else
@@ -532,25 +551,6 @@ local function latest_progress_token()
 end
 
 local function render_status()
-  local message = nil
-  if format_spinner.active > 0 then
-    message = string.format("%s Formatting File...", format_spinner_frames[format_spinner.frame])
-  else
-    local token = latest_progress_token()
-    local progress = token and progress_spinner.active[token] or nil
-    if progress then
-      local title = progress.title or "Indexing"
-      local detail = progress.message
-      if detail and detail ~= "" then
-        message = string.format("%s %s: %s", format_spinner_frames[progress_spinner.frame], title, detail)
-      else
-        message = string.format("%s %s...", format_spinner_frames[progress_spinner.frame], title)
-      end
-    end
-  end
-
-  vim.api.nvim_echo({ { message or "", "ModeMsg" } }, false, {})
-  redraw()
 end
 
 local function start_format_status()
@@ -558,23 +558,12 @@ local function start_format_status()
   if format_spinner.active > 1 then
     return
   end
-
-  format_spinner.frame = 1
-  render_status()
-
-  local uv = vim.uv or vim.loop
-  if not uv or type(uv.new_timer) ~= "function" then
-    return
-  end
-
-  format_spinner.timer = uv.new_timer()
-  format_spinner.timer:start(120, 120, vim.schedule_wrap(function()
-    if format_spinner.active == 0 then
-      return
-    end
-    format_spinner.frame = (format_spinner.frame % #format_spinner_frames) + 1
-    render_status()
-  end))
+  local ok, notification = pcall(vim.notify, "Formatting File...", vim.log.levels.INFO, {
+    title = "android-neovim-lsp",
+    timeout = 3000,
+    hide_from_history = true,
+  })
+  if not ok then return end
 end
 
 local function stop_format_status()
@@ -586,48 +575,12 @@ local function stop_format_status()
   if format_spinner.active > 0 then
     return
   end
-
-  if format_spinner.timer then
-    format_spinner.timer:stop()
-    format_spinner.timer:close()
-    format_spinner.timer = nil
-  end
-
-  vim.schedule(function()
-    render_status()
-  end)
 end
 
 local function ensure_progress_status_timer()
-  if progress_spinner.timer then
-    return
-  end
-
-  local uv = vim.uv or vim.loop
-  if not uv or type(uv.new_timer) ~= "function" then
-    return
-  end
-
-  progress_spinner.frame = 1
-  progress_spinner.timer = uv.new_timer()
-  progress_spinner.timer:start(120, 120, vim.schedule_wrap(function()
-    if next(progress_spinner.active) == nil or format_spinner.active > 0 then
-      return
-    end
-    progress_spinner.frame = (progress_spinner.frame % #format_spinner_frames) + 1
-    render_status()
-  end))
 end
 
 local function stop_progress_status_timer()
-  if next(progress_spinner.active) ~= nil then
-    return
-  end
-  if progress_spinner.timer then
-    progress_spinner.timer:stop()
-    progress_spinner.timer:close()
-    progress_spinner.timer = nil
-  end
 end
 
 local function update_progress_status(token, value)
@@ -636,22 +589,26 @@ local function update_progress_status(token, value)
   end
 
   local kind = value.kind
-  if kind == "begin" or kind == "report" then
-    if progress_spinner.active[token] == nil then
-      table.insert(progress_spinner.order, token)
+  if kind == "begin" then
+    local title = value.title or "Indexing"
+    local detail = value.message
+    local message = detail and detail ~= "" and string.format("%s: %s", title, detail) or string.format("%s...", title)
+    local ok, notification = pcall(vim.notify, message, vim.log.levels.INFO, {
+      title = "android-neovim-lsp",
+      timeout = 3000,
+      hide_from_history = true,
+    })
+    if ok then
+      if progress_spinner.active[token] == nil then
+        table.insert(progress_spinner.order, token)
+      end
+      progress_spinner.active[token] = notification
     end
-    progress_spinner.active[token] = {
-      title = value.title,
-      message = value.message,
-      percentage = value.percentage,
-    }
     ensure_progress_status_timer()
   elseif kind == "end" then
     progress_spinner.active[token] = nil
     stop_progress_status_timer()
   end
-
-  vim.schedule(render_status)
 end
 
 local function count_changed_lines(before_text, after_text)
@@ -694,13 +651,45 @@ local function show_format_result(bufnr, before_text)
   end
 
   vim.schedule(function()
-    vim.api.nvim_echo({ { message, "ModeMsg" } }, false, {})
-    redraw()
+    echo_bottom(message, "ModeMsg")
   end)
 end
 
-local function complete_format(bufnr, before_text)
+local function message_highlight_for_type(message_type)
+  if message_type == 1 then
+    return "ErrorMsg"
+  end
+  if message_type == 2 then
+    return "WarningMsg"
+  end
+  return "ModeMsg"
+end
+
+local function make_bottom_message_handler(default_handler)
+  return function(err, result, ctx, config)
+    local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil
+    if client and client.name == "android_neovim_lsp" and type(result) == "table" then
+      local message = result.message
+      if type(message) == "string" and message ~= "" then
+        vim.schedule(function()
+          echo_bottom(message, message_highlight_for_type(result.type))
+        end)
+        return
+      end
+    end
+    if type(default_handler) == "function" then
+      return default_handler(err, result, ctx, config)
+    end
+  end
+end
+
+complete_format = function(bufnr, before_text)
   stop_format_status()
+  local state = diagnostics_tracking.buffers[bufnr]
+  if state ~= nil then
+    queue_full_buffer_diagnostics_range(bufnr, state)
+    schedule_buffer_diagnostics_flush(bufnr, "save")
+  end
   show_format_result(bufnr, before_text)
 end
 
@@ -715,49 +704,7 @@ local function format_buffer(bufnr, format_opts)
     return
   end
   local before_text = buffer_text(bufnr)
-
-  local ok, conform = pcall(require, "conform")
-  if ok then
-    start_format_status()
-    local attempted = conform.format({
-      bufnr = bufnr,
-      async = format_opts.async,
-      quiet = format_opts.quiet,
-      lsp_format = format_opts.lsp_format,
-      timeout_ms = format_opts.timeout_ms,
-    }, function()
-      complete_format(bufnr, before_text)
-    end)
-    if attempted == false then
-      stop_format_status()
-    end
-    return
-  end
-
-  start_format_status()
-  local ok_format = pcall(vim.lsp.buf.format, {
-    bufnr = bufnr,
-    async = format_opts.async,
-    timeout_ms = format_opts.timeout_ms,
-  })
-  if format_opts.async then
-    vim.defer_fn(function()
-      complete_format(bufnr, before_text)
-    end, format_opts.timeout_ms or 1000)
-  else
-    complete_format(bufnr, before_text)
-  end
-  if not ok_format then
-    stop_format_status()
-  end
-end
-
-local function resolve_format_mode(plugin_opts)
-  local block_on_save = plugin_opts.block_on_save and plugin_opts.block_on_save.enabled
-  return {
-    event = block_on_save and "BufWritePre" or "BufWritePost",
-    async = not block_on_save,
-  }
+  perform_format_buffer(bufnr, format_opts, before_text)
 end
 
 local function configure_buffer(client, bufnr, plugin_opts)
@@ -778,12 +725,9 @@ local function configure_buffer(client, bufnr, plugin_opts)
 
   vim.api.nvim_clear_autocmds({ group = format_on_save_group, buffer = bufnr })
   if plugin_opts.format_on_save and plugin_opts.format_on_save.enabled then
-    local format_mode = resolve_format_mode(plugin_opts)
-    local format_opts = vim.tbl_deep_extend("force", {}, plugin_opts.format_on_save, {
-      async = format_mode.async,
-    })
+    local format_opts = vim.tbl_deep_extend("force", {}, plugin_opts.format_on_save)
     vim.b[bufnr].autoformat = false
-    vim.api.nvim_create_autocmd(format_mode.event, {
+    vim.api.nvim_create_autocmd("BufWritePre", {
       group = format_on_save_group,
       buffer = bufnr,
       callback = function(args)
@@ -799,7 +743,8 @@ function M.default_config(opts)
   local user_on_attach = lsp_opts.on_attach
   local user_on_exit = lsp_opts.on_exit
   local user_handlers = vim.deepcopy(lsp_opts.handlers or {})
-  local default_progress_handler = vim.lsp.handlers["$/progress"]
+  local default_show_message_handler = user_handlers["window/showMessage"] or vim.lsp.handlers["window/showMessage"]
+  local default_log_message_handler = user_handlers["window/logMessage"] or vim.lsp.handlers["window/logMessage"]
   local default_publish_diagnostics_handler = user_handlers["textDocument/publishDiagnostics"]
     or vim.lsp.handlers["textDocument/publishDiagnostics"]
   local init_options = vim.deepcopy(lsp_opts.init_options or {})
@@ -817,18 +762,15 @@ function M.default_config(opts)
     default_publish_diagnostics_handler,
     plugin_opts.diagnostics and plugin_opts.diagnostics.enabled ~= false and plugin_opts.diagnostics.debounce_ms or 0
   )
-  user_handlers["$/android-neovim/diagnosticsFlushed"] = make_diagnostics_flushed_handler(
-    default_publish_diagnostics_handler
-  )
-  user_handlers["$/progress"] = function(err, result, ctx, config)
+  user_handlers["$/android-neovim/diagnosticsFlushed"] = make_diagnostics_flushed_handler()
+  user_handlers["$/android-neovim/progress"] = function(_, result, ctx)
     local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil
     if client and client.name == "android_neovim_lsp" and type(result) == "table" then
       update_progress_status(result.token, result.value)
     end
-    if type(default_progress_handler) == "function" then
-      return default_progress_handler(err, result, ctx, config)
-    end
   end
+  user_handlers["window/showMessage"] = make_bottom_message_handler(default_show_message_handler)
+  user_handlers["window/logMessage"] = make_bottom_message_handler(default_log_message_handler)
   lsp_opts.on_attach = function(client, bufnr)
     configure_buffer(client, bufnr, plugin_opts)
     if type(user_on_attach) == "function" then

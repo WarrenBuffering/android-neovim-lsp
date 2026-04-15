@@ -614,21 +614,24 @@ class CompletionService {
             }
             .take(200)
             .forEach { symbol ->
+                val importName = importCompletionName(symbol)
                 val score = when {
-                    symbol.name == context.segmentPrefix -> 230
-                    symbol.name.startsWith(context.segmentPrefix) -> 200
+                    importName == context.segmentPrefix -> 230
+                    importName.startsWith(context.segmentPrefix) -> 200
                     else -> 160
-                } + if (symbol.kind == dev.codex.kotlinls.protocol.SymbolKind.CLASS) 10 else 0
+                } +
+                    if (symbol.kind == dev.codex.kotlinls.protocol.SymbolKind.CLASS) 10 else 0 +
+                    if (importName != symbol.name) -20 else 0
                 val normalizedScore = score + indexedSymbolQuality(symbol) / 25
                 val candidate = RankedCompletion(
                     item = CompletionItem(
-                        label = symbol.name,
+                        label = importName,
                         kind = CompletionItemKind.TEXT,
                         detail = indexedSymbolCompletionDetail(symbol),
                         documentation = indexedSymbolDocumentation(symbol),
                         sortText = scoreToSortKey(normalizedScore),
-                        filterText = symbol.name,
-                        insertText = symbol.name,
+                        filterText = importName,
+                        insertText = importName,
                         insertTextFormat = 1,
                         data = mapOf(
                             "provider" to "index",
@@ -642,7 +645,7 @@ class CompletionService {
                 )
                 mergeRankedCompletion(
                     ranked = ranked,
-                    key = completionCandidateKey(symbol),
+                    key = importCompletionCandidateKey(symbol),
                     candidate = candidate,
                 )
             }
@@ -1171,6 +1174,25 @@ class CompletionService {
         symbol.fqName?.takeIf { it.isNotBlank() }
             ?: buildString {
                 append(symbol.name)
+                append("::")
+                append(symbol.kind)
+                append("::")
+                append(symbol.containerFqName ?: symbol.packageName)
+            }
+
+    private fun importCompletionName(symbol: IndexedSymbol): String =
+        if (symbol.kind == SymbolKind.FUNCTION && symbol.importable && '-' in symbol.name) {
+            symbol.name.substringBefore('-')
+        } else {
+            symbol.name
+        }
+
+    private fun importCompletionCandidateKey(symbol: IndexedSymbol): String =
+        symbol.fqName
+            ?.substringBefore('-')
+            ?.takeIf { it.isNotBlank() }
+            ?: buildString {
+                append(importCompletionName(symbol))
                 append("::")
                 append(symbol.kind)
                 append("::")

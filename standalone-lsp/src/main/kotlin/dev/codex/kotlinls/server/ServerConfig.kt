@@ -48,7 +48,7 @@ internal data class ProgressConfig(
 )
 
 internal data class DiagnosticsConfig(
-    val fastDebounceMillis: Long = 100L,
+    val fastDebounceMillis: Long = 0L,
     val flushOnInsertLeave: Boolean = false,
 )
 

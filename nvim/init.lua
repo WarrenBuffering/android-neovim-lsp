@@ -40,7 +40,6 @@ require("lazy").setup({
         },
         inlay_hints = false,
         format_on_save = true,
-        block_on_save = false,
         on_attach = function(_, bufnr)
           local map = function(mode, lhs, rhs)
             vim.keymap.set(mode, lhs, rhs, { buffer = bufnr, silent = true })

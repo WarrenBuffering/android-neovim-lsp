@@ -164,7 +164,6 @@ Useful plugin options:
 
 - `inlay_hints = false`
 - `format_on_save = true`
-- `block_on_save = false`
 
 ### Format On Save
 
