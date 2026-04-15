@@ -202,7 +202,7 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
         }
         ApplicationManager.getApplication().runReadAction((Computable<Void>) () -> {
-            PsiFile psiFile = PsiManager.getInstance(project).findFile(handle.virtualFile());
+            PsiFile psiFile = PsiManager.getInstance(project).findFile(handle.sourceVirtualFile());
             if (psiFile != null) {
                 psiFile.getTextLength();
             }
@@ -620,10 +620,6 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         return stripped.isEmpty() ? null : stripped;
     }
 
-<<<<<<< HEAD
-    private AnalysisHandle loadAnalysisHandle(Project project, String filePath, String requestedText) {
-        VirtualFile sourceVirtualFile = ApplicationManager.getApplication().runReadAction(
-=======
     private String renderKDocMarkdown(KDoc kDoc) {
         if (kDoc == null) {
             return null;
@@ -754,9 +750,8 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         return all;
     }
 
-    private DocumentHandle loadDocumentHandle(String filePath) {
-        VirtualFile virtualFile = ApplicationManager.getApplication().runReadAction(
->>>>>>> 2949bac (Checkpoint current diagnostics and indexing work)
+    private AnalysisHandle loadAnalysisHandle(Project project, String filePath, String requestedText) {
+        VirtualFile sourceVirtualFile = ApplicationManager.getApplication().runReadAction(
             (Computable<VirtualFile>) () -> LocalFileSystem.getInstance().refreshAndFindFileByNioFile(Path.of(filePath))
         );
         if (sourceVirtualFile == null) {
