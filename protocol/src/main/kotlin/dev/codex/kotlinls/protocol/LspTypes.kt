@@ -88,6 +88,17 @@ data class DidSaveTextDocumentParams(
 )
 
 @JsonInclude(JsonInclude.Include.NON_NULL)
+data class DidChangeWatchedFilesParams(
+    val changes: List<FileEvent>,
+)
+
+@JsonInclude(JsonInclude.Include.NON_NULL)
+data class FileEvent(
+    val uri: DocumentUri,
+    val type: Int,
+)
+
+@JsonInclude(JsonInclude.Include.NON_NULL)
 data class WorkspaceFolder(
     val uri: String,
     val name: String,

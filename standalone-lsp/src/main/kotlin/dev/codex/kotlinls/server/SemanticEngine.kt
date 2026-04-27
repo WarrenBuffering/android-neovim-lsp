@@ -286,8 +286,8 @@ internal class BridgeK2SemanticEngine private constructor(
             pendingDocumentSyncs.remove(params.textDocument.uri)
         }
         val items = awaitMemoized(key) {
-            val activeBridge = acquireBridge() ?: return@awaitMemoized null
             withForegroundRequest {
+                val activeBridge = acquireBridge() ?: return@withForegroundRequest null
                 activeBridge.complete(project.root, path, text, offset)
             }
         } ?: return null
@@ -309,8 +309,8 @@ internal class BridgeK2SemanticEngine private constructor(
             pendingDocumentSyncs.remove(params.textDocument.uri)
         }
         val hover = awaitMemoized(key) {
-            val activeBridge = acquireBridge() ?: return@awaitMemoized null
             withForegroundRequest {
+                val activeBridge = acquireBridge() ?: return@withForegroundRequest null
                 activeBridge.hover(project.root, path, text, offset)
             }
         } ?: return null
@@ -332,8 +332,8 @@ internal class BridgeK2SemanticEngine private constructor(
             pendingDocumentSyncs.remove(params.textDocument.uri)
         }
         val locations = awaitMemoized(key) {
-            val activeBridge = acquireBridge() ?: return@awaitMemoized null
             withForegroundRequest {
+                val activeBridge = acquireBridge() ?: return@withForegroundRequest null
                 activeBridge.definition(project.root, path, text, offset)
             }
         } ?: return null
@@ -352,13 +352,13 @@ internal class BridgeK2SemanticEngine private constructor(
         val uri = params.textDocument.uri
         val key = SemanticRequestKey("format-document", uri, version, projectGeneration, "document")
         val edits = awaitMemoized(key, timeoutMillis = null) {
-            val bridged = projectRoot
-                ?.let { root ->
-                    val activeBridge = acquireBridge() ?: return@let null
-                    withForegroundRequest {
+            val bridged = withForegroundRequest {
+                projectRoot
+                    ?.let { root ->
+                        val activeBridge = acquireBridge() ?: return@let null
                         activeBridge.formatDocument(root, path, text)
                     }
-                }
+            }
             if (bridged != null) {
                 formatterService.editsForFormattedText(text, bridged)
             } else {
@@ -385,16 +385,16 @@ internal class BridgeK2SemanticEngine private constructor(
         val uri = params.textDocument.uri
         val key = SemanticRequestKey("format-range", uri, version, projectGeneration, "${params.range.start.line}:${params.range.start.character}")
         val edits = awaitMemoized(key, timeoutMillis = null) {
-            val bridged = projectRoot
-                ?.let { root ->
-                    val activeBridge = acquireBridge() ?: return@let null
-                    val lineIndex = LineIndex.build(text)
-                    val startOffset = lineIndex.offset(params.range.start)
-                    val endOffset = lineIndex.offset(params.range.end)
-                    withForegroundRequest {
+            val bridged = withForegroundRequest {
+                projectRoot
+                    ?.let { root ->
+                        val activeBridge = acquireBridge() ?: return@let null
+                        val lineIndex = LineIndex.build(text)
+                        val startOffset = lineIndex.offset(params.range.start)
+                        val endOffset = lineIndex.offset(params.range.end)
                         activeBridge.formatRange(root, path, text, startOffset, endOffset)
                     }
-                }
+            }
             if (bridged != null) {
                 formatterService.editsForFormattedText(text, bridged)
             } else {

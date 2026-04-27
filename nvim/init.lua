@@ -40,6 +40,7 @@ require("lazy").setup({
         },
         inlay_hints = false,
         format_on_save = true,
+        format_timeout_ms = 120000,
         on_attach = function(_, bufnr)
           local map = function(mode, lhs, rhs)
             vim.keymap.set(mode, lhs, rhs, { buffer = bufnr, silent = true })
@@ -51,7 +52,7 @@ require("lazy").setup({
           map("n", "<leader>cr", vim.lsp.buf.rename)
           map("n", "<leader>ca", vim.lsp.buf.code_action)
           map("n", "<leader>cf", function()
-            vim.lsp.buf.format({ async = true })
+            vim.lsp.buf.format({ async = true, timeout_ms = 120000 })
           end)
         end,
       })

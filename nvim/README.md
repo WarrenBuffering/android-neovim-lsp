@@ -68,6 +68,8 @@ The repo's `nvim/init.lua` also bootstraps `lazy.nvim` and `nvim-lspconfig`, so 
 require("android_neovim_lsp").setup({
   inlay_hints = false,
   format_on_save = true,
+  format_timeout_ms = 120000,
+  hover_bottom_padding_lines = 2,
   install = true,
   version = nil,
 })
@@ -75,7 +77,20 @@ require("android_neovim_lsp").setup({
 
 When `install = true`, the runtime prefers building from the local checkout when available and otherwise falls back to the release installer. Set `version` to pin a specific release tag such as `"v0.1.3"`.
 
-When `format_on_save` is enabled, the runtime disables LazyVim-style Kotlin autoformatting for that buffer and manages formatting itself synchronously on `BufWritePre`, so the formatted buffer contents are what get written to disk. If [`conform.nvim`](https://github.com/stevearc/conform.nvim) is installed, it is used automatically; otherwise the runtime falls back to `vim.lsp.buf.format()`.
+When `format_on_save` is enabled, the runtime disables LazyVim-style Kotlin autoformatting for that buffer and manages formatting itself synchronously on `BufWritePre`, so the formatted buffer contents are what get written to disk. If [`conform.nvim`](https://github.com/stevearc/conform.nvim) is installed, it is used automatically; otherwise the runtime falls back to `vim.lsp.buf.format()`. `format_timeout_ms` defaults to `120000` to give cold IntelliJ-backed formatter starts enough room. `hover_bottom_padding_lines` defaults to `2` so hover floats have a little breathing room below the final line.
+
+## Status Commands
+
+The runtime registers a few introspection commands:
+
+```vim
+:AndroidNeovimLspHelp
+:AndroidNeovimLspIndexStatus
+:AndroidNeovimLspIndexedFiles
+:AndroidNeovimLspCacheStatus
+```
+
+`Help` opens a command reference. `IndexStatus` opens a combined view with project source index progress, open file cache state, dependency cache state, compiler analysis state, and indexed file details. `IndexedFiles` focuses on source files and whether they are indexed. `CacheStatus` focuses on compiler analysis modules and dependency packages.
 
 ## Mason
 

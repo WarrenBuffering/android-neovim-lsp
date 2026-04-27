@@ -16,10 +16,12 @@ local progress_spinner = {
   active = {},
   order = {},
 }
-local format_request_timeout_ms = 30000
+local default_format_request_timeout_ms = 120000
+local format_request_timeout_ms = default_format_request_timeout_ms
 local format_request_quiet = true
 local format_lsp_mode = "fallback"
 local diagnostics_debounce_ms = 0
+local default_hover_bottom_padding_lines = 2
 local diagnostics_debounce = {
   pending = {},
   timers = {},
@@ -27,6 +29,8 @@ local diagnostics_debounce = {
 local diagnostics_tracking = {
   buffers = {},
 }
+local user_commands_registered = false
+local initialization_announced_clients = {}
 local flush_buffer_diagnostics
 local schedule_buffer_diagnostics_flush
 local complete_format
@@ -354,9 +358,14 @@ end
 
 local function split_setup_opts(opts)
   local lsp_opts = vim.deepcopy(opts or {})
+  local format_timeout_ms = tonumber(opts and opts.format_timeout_ms) or default_format_request_timeout_ms
+  local hover_bottom_padding_lines = tonumber(opts and opts.hover_bottom_padding_lines)
+    or default_hover_bottom_padding_lines
   local plugin_opts = {
     inlay_hints_enabled = opts and opts.inlay_hints,
     format_on_save_enabled = opts and opts.format_on_save == true,
+    format_timeout_ms = format_timeout_ms,
+    hover_bottom_padding_lines = math.max(hover_bottom_padding_lines, 0),
     install = {
       enabled = opts and opts.install == true,
       version = nil,
@@ -367,6 +376,8 @@ local function split_setup_opts(opts)
   plugin_opts.install.version = opts and opts.version or nil
   lsp_opts.inlay_hints = nil
   lsp_opts.format_on_save = nil
+  lsp_opts.format_timeout_ms = nil
+  lsp_opts.hover_bottom_padding_lines = nil
   lsp_opts.install = nil
   lsp_opts.install_root = nil
   lsp_opts.version = nil
@@ -459,6 +470,7 @@ local function queue_next_buffer_diagnostics_flush(state, reason)
 end
 
 local function perform_format_buffer(bufnr, before_text)
+  local timeout_ms = tonumber(vim.b[bufnr].android_neovim_lsp_format_timeout_ms) or format_request_timeout_ms
   local function on_complete()
     complete_format(bufnr, before_text)
   end
@@ -471,7 +483,7 @@ local function perform_format_buffer(bufnr, before_text)
       async = false,
       quiet = format_request_quiet,
       lsp_format = format_lsp_mode,
-      timeout_ms = format_request_timeout_ms,
+      timeout_ms = timeout_ms,
     })
     on_complete()
     if not ok_format or attempted == false then
@@ -484,7 +496,7 @@ local function perform_format_buffer(bufnr, before_text)
   local ok_format = pcall(vim.lsp.buf.format, {
     bufnr = bufnr,
     async = false,
-    timeout_ms = format_request_timeout_ms,
+    timeout_ms = timeout_ms,
   })
   on_complete()
   if not ok_format then
@@ -825,6 +837,17 @@ end
 local function stop_progress_status_timer()
 end
 
+local function progress_message(value)
+  local title = value.title or "Indexing"
+  local detail = value.message
+  local percentage = tonumber(value.percentage)
+  local prefix = percentage and string.format("%s %d%%", title, percentage) or title
+  if detail and detail ~= "" then
+    return string.format("%s: %s", prefix, detail)
+  end
+  return string.format("%s...", prefix)
+end
+
 local function update_progress_status(token, value)
   if type(token) ~= "string" or type(value) ~= "table" then
     return
@@ -832,9 +855,7 @@ local function update_progress_status(token, value)
 
   local kind = value.kind
   if kind == "begin" then
-    local title = value.title or "Indexing"
-    local detail = value.message
-    local message = detail and detail ~= "" and string.format("%s: %s", title, detail) or string.format("%s...", title)
+    local message = progress_message(value)
     local ok, notification = pcall(vim.notify, message, vim.log.levels.INFO, {
       title = "android-neovim-lsp",
       timeout = 3000,
@@ -847,9 +868,32 @@ local function update_progress_status(token, value)
       progress_spinner.active[token] = notification
     end
     ensure_progress_status_timer()
+  elseif kind == "report" then
+    vim.schedule(function()
+      local ok, notification = pcall(vim.notify, progress_message(value), vim.log.levels.INFO, {
+        title = "android-neovim-lsp",
+        timeout = 1500,
+        hide_from_history = true,
+        replace = progress_spinner.active[token],
+      })
+      if ok and notification then
+        progress_spinner.active[token] = notification
+      end
+    end)
   elseif kind == "end" then
-    progress_spinner.active[token] = nil
-    stop_progress_status_timer()
+    vim.schedule(function()
+      local ok, notification = pcall(vim.notify, progress_message(value), vim.log.levels.INFO, {
+        title = "android-neovim-lsp",
+        timeout = 1800,
+        hide_from_history = true,
+        replace = progress_spinner.active[token],
+      })
+      if ok and notification then
+        progress_spinner.active[token] = notification
+      end
+      progress_spinner.active[token] = nil
+      stop_progress_status_timer()
+    end)
   end
 end
 
@@ -974,6 +1018,287 @@ local function make_bottom_message_handler(default_handler)
   end
 end
 
+local function make_hover_handler(default_handler, bottom_padding_lines)
+  return function(err, result, ctx, config)
+    if err or not result or not result.contents or bottom_padding_lines <= 0 then
+      if type(default_handler) == "function" then
+        return default_handler(err, result, ctx, config)
+      end
+      return
+    end
+
+    local lines = vim.lsp.util.convert_input_to_markdown_lines(result.contents) or {}
+    lines = vim.lsp.util.trim_empty_lines(lines)
+    if vim.tbl_isempty(lines) then
+      return
+    end
+
+    for _ = 1, bottom_padding_lines do
+      table.insert(lines, "")
+    end
+    table.insert(lines, "###")
+
+    config = vim.tbl_extend("force", config or {}, {
+      focus_id = ctx and ctx.method or "textDocument/hover",
+    })
+    return vim.lsp.util.open_floating_preview(lines, "markdown", config)
+  end
+end
+
+local function active_android_client(bufnr)
+  bufnr = bufnr or 0
+  local clients
+  if vim.lsp.get_clients then
+    clients = vim.lsp.get_clients({ bufnr = bufnr, name = "android_neovim_lsp" })
+    if not clients or vim.tbl_isempty(clients) then
+      clients = vim.lsp.get_clients({ name = "android_neovim_lsp" })
+    end
+  else
+    clients = vim.lsp.get_active_clients({ bufnr = bufnr, name = "android_neovim_lsp" })
+    if not clients or vim.tbl_isempty(clients) then
+      clients = vim.lsp.get_active_clients({ name = "android_neovim_lsp" })
+    end
+  end
+  return clients and clients[1] or nil
+end
+
+local function as_number(value, default)
+  local number = tonumber(value)
+  if number == nil then
+    return default or 0
+  end
+  return number
+end
+
+local function yes_no(value)
+  if value == nil then
+    return "unknown"
+  end
+  return value and "yes" or "no"
+end
+
+local function percent_text(value)
+  return string.format("%.1f%%", as_number(value, 0))
+end
+
+local function append_index_overview(lines, report)
+  if not report.projectLoaded then
+    table.insert(lines, "Project: not loaded")
+    if report.message then
+      table.insert(lines, "Message: " .. report.message)
+    end
+    return
+  end
+
+  local fast = report.fastIndex or {}
+  local support = report.supportCache or {}
+  local semantic = report.semanticCache or {}
+  table.insert(lines, "Root: " .. tostring(report.root or "unknown"))
+  table.insert(lines, "Project generation: " .. tostring(report.projectGeneration or "unknown"))
+  table.insert(lines, string.format(
+    "Project source index: %d / %d files (%s), %d symbols, ready: %s",
+    as_number(fast.filesIndexed),
+    as_number(fast.filesTotal),
+    percent_text(fast.percentage),
+    as_number(fast.symbols),
+    yes_no(fast.ready)
+  ))
+  table.insert(lines, string.format(
+    "Open file cache: %d persisted files, %d open documents",
+    as_number(fast.cachedFiles),
+    as_number(report.openDocuments)
+  ))
+  table.insert(lines, string.format(
+    "Dependency cache: manifest: %s, fully loaded: %s, %d symbols, %d packages",
+    yes_no(support.manifestAvailable),
+    yes_no(support.fullyLoaded),
+    as_number(support.symbols),
+    as_number(support.packagesLoaded)
+  ))
+  table.insert(lines, string.format(
+    "Compiler analysis cache: enabled: %s, loaded: %d / %d modules, current: %d, symbol-ready: %d",
+    yes_no(semantic.enabled),
+    as_number(semantic.modulesLoaded),
+    as_number(semantic.modulesTotal),
+    as_number(semantic.modulesCurrent),
+    as_number(semantic.modulesFullyIndexed)
+  ))
+end
+
+local function append_index_files(lines, report)
+  local files = report.files or {}
+  table.insert(lines, "")
+  table.insert(lines, "Files")
+  if #files == 0 then
+    table.insert(lines, "  No file details returned.")
+    return
+  end
+  for _, file in ipairs(files) do
+    local mark = file.indexed and "[x]" or "[ ]"
+    local flags = {}
+    if file.open then
+      table.insert(flags, "open")
+    end
+    if file.cache then
+      table.insert(flags, file.cache)
+    end
+    local suffix = ""
+    if #flags > 0 then
+      suffix = " (" .. table.concat(flags, ", ") .. ")"
+    end
+    table.insert(lines, string.format(
+      "  %s %s [%s, %s, %d symbols]%s",
+      mark,
+      tostring(file.relativePath or file.path or "unknown"),
+      tostring(file.module or "unknown"),
+      tostring(file.rootKind or "source"),
+      as_number(file.symbols),
+      suffix
+    ))
+  end
+end
+
+local function append_cache_details(lines, report)
+  local semantic = report.semanticCache or {}
+  local support = report.supportCache or {}
+  table.insert(lines, "")
+  table.insert(lines, "Compiler Analysis Modules")
+  local modules = semantic.modules or {}
+  if #modules == 0 then
+    table.insert(lines, "  No compiler analysis modules loaded or configured.")
+  else
+    for _, module in ipairs(modules) do
+      local state = "missing"
+      if module.validating then
+        state = "validating-symbols"
+      elseif module.fullyIndexed then
+        state = module.compilerReady and "compiler+symbols" or "saved-symbols"
+      elseif module.loaded then
+        state = module.current and "loaded" or "stale"
+      end
+      table.insert(lines, string.format(
+        "  %s %s: %s, validated: %s, %d symbols, %d files",
+        tostring(module.module or "unknown"),
+        tostring(module.moduleName or ""),
+        state,
+        yes_no(module.validated),
+        as_number(module.symbols),
+        as_number(module.files)
+      ))
+    end
+  end
+  table.insert(lines, "")
+  table.insert(lines, "Dependency Packages")
+  local packages = support.packages or {}
+  if #packages == 0 then
+    table.insert(lines, "  No dependency packages loaded yet.")
+  else
+    for _, package_name in ipairs(packages) do
+      table.insert(lines, "  " .. tostring(package_name))
+    end
+  end
+end
+
+local function render_index_status(report, view)
+  local lines = {
+    "Android Neovim LSP Index Status",
+    string.rep("=", 32),
+    "",
+  }
+  append_index_overview(lines, report or {})
+  if view == "files" or view == "all" then
+    append_index_files(lines, report or {})
+  end
+  if view == "cache" or view == "all" then
+    append_cache_details(lines, report or {})
+  end
+  return lines
+end
+
+local function open_status_buffer(title, lines)
+  local buf = vim.api.nvim_create_buf(false, true)
+  local uv = vim.uv or vim.loop
+  pcall(vim.api.nvim_buf_set_name, buf, string.format("%s/%d", title, uv.hrtime()))
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "android-neovim-lsp-status"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.cmd("botright split")
+  vim.api.nvim_win_set_buf(0, buf)
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_buf_is_valid(buf) then
+      vim.api.nvim_buf_delete(buf, { force = true })
+    end
+  end, { buffer = buf, silent = true, desc = "Close status view" })
+end
+
+local function request_index_status(view)
+  local client = active_android_client(0)
+  if not client then
+    echo_bottom("android-neovim-lsp is not attached to this buffer", "WarningMsg")
+    return
+  end
+  local command = "kotlinls.indexStatus"
+  if view == "files" then
+    command = "kotlinls.indexedFiles"
+  elseif view == "cache" then
+    command = "kotlinls.cacheStatus"
+  end
+  client.request("workspace/executeCommand", { command = command }, function(err, result)
+    if err then
+      vim.schedule(function()
+        echo_bottom("Index status failed: " .. tostring(err.message or err), "ErrorMsg")
+      end)
+      return
+    end
+    vim.schedule(function()
+      open_status_buffer("android-neovim-lsp://" .. view, render_index_status(result or {}, view))
+    end)
+  end, 0)
+end
+
+local function open_help()
+  open_status_buffer("android-neovim-lsp://help", {
+    "Android Neovim LSP Commands",
+    string.rep("=", 28),
+    "",
+    ":AndroidNeovimLspHelp",
+    "  Show this command reference.",
+    "",
+    ":AndroidNeovimLspIndexStatus",
+    "  Show project source index coverage, open file cache state, dependency cache state, and compiler analysis state.",
+    "",
+    ":AndroidNeovimLspIndexedFiles",
+    "  Show all discovered source files with indexed/missing state, module, root kind, symbol count, and cache source.",
+    "",
+    ":AndroidNeovimLspCacheStatus",
+    "  Show compiler analysis modules and dependency package cache state.",
+    "",
+    "Status views are scratch buffers. Press q to close them.",
+  })
+end
+
+local function register_user_commands()
+  if user_commands_registered or not vim.api.nvim_create_user_command then
+    return
+  end
+  user_commands_registered = true
+  vim.api.nvim_create_user_command("AndroidNeovimLspHelp", function()
+    open_help()
+  end, { desc = "Show android-neovim-lsp command help", force = true })
+  vim.api.nvim_create_user_command("AndroidNeovimLspIndexStatus", function()
+    request_index_status("all")
+  end, { desc = "Show android-neovim-lsp index and cache status", force = true })
+  vim.api.nvim_create_user_command("AndroidNeovimLspIndexedFiles", function()
+    request_index_status("files")
+  end, { desc = "Show android-neovim-lsp indexed source files", force = true })
+  vim.api.nvim_create_user_command("AndroidNeovimLspCacheStatus", function()
+    request_index_status("cache")
+  end, { desc = "Show android-neovim-lsp cache status", force = true })
+end
+
 complete_format = function(bufnr, before_text)
   stop_format_status()
   flash_format_changes(bufnr, before_text)
@@ -999,8 +1324,19 @@ local function format_buffer(bufnr)
   perform_format_buffer(bufnr, before_text)
 end
 
+local function announce_initializing(client)
+  local key = client and (client.id or client.name) or "default"
+  if initialization_announced_clients[key] then
+    return
+  end
+  initialization_announced_clients[key] = true
+  echo_bottom("Android Neovim LSP Initializing", "ModeMsg")
+end
+
 local function configure_buffer(client, bufnr, plugin_opts)
+  announce_initializing(client)
   ensure_diagnostics_tracking(client, bufnr, plugin_opts)
+  vim.b[bufnr].android_neovim_lsp_format_timeout_ms = plugin_opts.format_timeout_ms
 
   if plugin_opts.inlay_hints_enabled ~= nil then
     local supports_inlay_hints = client.supports_method and client:supports_method("textDocument/inlayHint")
@@ -1037,6 +1373,7 @@ function M.default_config(opts)
   local user_handlers = vim.deepcopy(lsp_opts.handlers or {})
   local default_show_message_handler = user_handlers["window/showMessage"] or vim.lsp.handlers["window/showMessage"]
   local default_log_message_handler = user_handlers["window/logMessage"] or vim.lsp.handlers["window/logMessage"]
+  local default_hover_handler = user_handlers["textDocument/hover"] or vim.lsp.handlers["textDocument/hover"]
   local default_publish_diagnostics_handler = user_handlers["textDocument/publishDiagnostics"]
     or vim.lsp.handlers["textDocument/publishDiagnostics"]
   local init_options = vim.deepcopy(lsp_opts.init_options or {})
@@ -1060,6 +1397,10 @@ function M.default_config(opts)
   end
   user_handlers["window/showMessage"] = make_bottom_message_handler(default_show_message_handler)
   user_handlers["window/logMessage"] = make_bottom_message_handler(default_log_message_handler)
+  user_handlers["textDocument/hover"] = make_hover_handler(
+    default_hover_handler,
+    plugin_opts.hover_bottom_padding_lines
+  )
   lsp_opts.on_attach = function(client, bufnr)
     configure_buffer(client, bufnr, plugin_opts)
     if type(user_on_attach) == "function" then
@@ -1100,6 +1441,7 @@ function M.setup(opts)
   opts = opts or {}
   local config = M.default_config(opts)
   M._runtime_config = config
+  register_user_commands()
   local server_name = "android_neovim_lsp"
   local has_native_lsp_api = vim.lsp and type(vim.lsp.config) == "function" and type(vim.lsp.enable) == "function"
   local ok_lspconfig, lspconfig = pcall(require, "lspconfig")

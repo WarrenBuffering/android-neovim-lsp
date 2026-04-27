@@ -79,6 +79,8 @@ require("android_neovim_lsp").setup({
 require("android_neovim_lsp").setup({
   inlay_hints = false,
   format_on_save = true,
+  format_timeout_ms = 120000,
+  hover_bottom_padding_lines = 2,
   install = true,
   version = nil,
 })
@@ -94,6 +96,10 @@ require("android_neovim_lsp").setup({
 ```
 
 When `install = true`, the runtime prefers building from the local checkout when available and otherwise falls back to the release installer. Set `version` to pin a specific GitHub release tag such as `"v0.1.3"`. When `version` is set, the runtime installs that release bundle and skips re-downloading it if the managed install root already matches.
+
+## Status Commands
+
+The Neovim runtime registers `:AndroidNeovimLspHelp`, `:AndroidNeovimLspIndexStatus`, `:AndroidNeovimLspIndexedFiles`, and `:AndroidNeovimLspCacheStatus` for inspecting available commands, project source index coverage, open file cache state, dependency cache state, compiler analysis state, and indexed source files.
 
 ## Manual Install
 

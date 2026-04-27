@@ -113,6 +113,22 @@ class LightweightWorkspaceIndexBuilder(
         )
     }
 
+    fun cachedFileStatuses(project: ImportedProject): Map<Path, LightweightIndexedFileStatus> {
+        val projectRoot = project.root.normalize()
+        return synchronized(cacheLock) {
+            projectCaches.getOrPut(projectRoot) { loadProjectCache(projectRoot) }
+                .files
+                .mapValues { (path, cached) ->
+                    LightweightIndexedFileStatus(
+                        path = path.normalize(),
+                        moduleName = cached.moduleName,
+                        symbolCount = cached.symbols.size,
+                        openDocumentVersion = cached.openDocumentVersion,
+                    )
+                }
+        }
+    }
+
     fun requiresBackgroundRefresh(project: ImportedProject): Boolean {
         val projectRoot = project.root.normalize()
         val projectCache = synchronized(cacheLock) {
@@ -667,6 +683,13 @@ enum class DocumentCacheStatus {
     MISSING,
     STALE,
 }
+
+data class LightweightIndexedFileStatus(
+    val path: Path,
+    val moduleName: String,
+    val symbolCount: Int,
+    val openDocumentVersion: Int?,
+)
 
 private data class RootEntry(
     val moduleName: String,
