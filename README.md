@@ -79,7 +79,7 @@ require("android_neovim_lsp").setup({
 require("android_neovim_lsp").setup({
   inlay_hints = false,
   format_on_save = true,
-  format_timeout_ms = 120000,
+  format_timeout_ms = 30000,
   hover_bottom_padding_lines = 2,
   install = true,
   version = nil,

@@ -22,8 +22,13 @@ class SupportSymbolIndexBuilder(
     fun load(project: ImportedProject): SupportSymbolLayer? {
         val projectRoot = project.root.normalize()
         val fingerprint = supportLayerFingerprint(project)
-        cachedLayer(projectRoot, fingerprint)?.let { return it }
-        val persisted = persistentSupportCache.load(projectRoot, fingerprint) ?: return null
+        cachedLayer(projectRoot, fingerprint)?.let { cached ->
+            if (sourcePathsPresent(cached)) return cached
+            clearCachedLayer(projectRoot)
+        }
+        val persisted = persistentSupportCache.load(projectRoot, fingerprint)
+            ?.takeIf(::sourcePathsPresent)
+            ?: return null
         synchronized(cacheLock) {
             supportSymbolLayers[projectRoot] = persisted
         }
@@ -38,19 +43,28 @@ class SupportSymbolIndexBuilder(
         val fingerprint = supportLayerFingerprint(project)
         val cached = cachedLayer(projectRoot, fingerprint)
         if (cached != null) {
+            if (!sourcePathsPresent(cached)) {
+                clearCachedLayer(projectRoot)
+                return build(project).filterPackages(packageNames)
+            }
             val requested = packageNames.map(String::trim).toSet()
-            return cached.copy(
-                symbols = cached.symbols.filter { symbol -> symbol.packageName.trim() in requested },
-            )
+            return cached.filterPackages(requested)
         }
-        return persistentSupportCache.loadPackages(projectRoot, fingerprint, packageNames)
+        val persisted = persistentSupportCache.loadPackages(projectRoot, fingerprint, packageNames)
+        if (persisted != null && sourcePathsPresent(persisted)) {
+            return persisted
+        }
+        return build(project).filterPackages(packageNames)
     }
 
     fun build(project: ImportedProject): SupportSymbolLayer {
         val projectRoot = project.root.normalize()
         val fingerprint = supportLayerFingerprint(project)
-        cachedLayer(projectRoot, fingerprint)?.let { return it }
-        persistentSupportCache.load(projectRoot, fingerprint)?.let { cached ->
+        cachedLayer(projectRoot, fingerprint)?.let { cached ->
+            if (sourcePathsPresent(cached)) return cached
+            clearCachedLayer(projectRoot)
+        }
+        persistentSupportCache.load(projectRoot, fingerprint)?.takeIf(::sourcePathsPresent)?.let { cached ->
             synchronized(cacheLock) {
                 supportSymbolLayers[projectRoot] = cached
             }
@@ -89,11 +103,29 @@ class SupportSymbolIndexBuilder(
                 ?.takeIf { it.fingerprint == fingerprint }
         }
 
+    private fun clearCachedLayer(projectRoot: Path) {
+        synchronized(cacheLock) {
+            supportSymbolLayers.remove(projectRoot)
+        }
+    }
+
+    private fun sourcePathsPresent(layer: SupportSymbolLayer): Boolean =
+        layer.symbols.asSequence()
+            .filter { symbol -> symbol.path.extension in setOf("kt", "kts", "java") }
+            .all { symbol -> symbol.path.isRegularFile() }
+
+    private fun SupportSymbolLayer.filterPackages(packageNames: Set<String>): SupportSymbolLayer {
+        val requested = packageNames.map(String::trim).toSet()
+        return copy(
+            symbols = symbols.filter { symbol -> symbol.packageName.trim() in requested },
+        )
+    }
+
     private fun supportLayerFingerprint(project: ImportedProject): String =
         buildString {
             val projectRoot = project.root.normalize()
             val sourceBackedBinaryNames = sourceBackedBinaryNames(project)
-            append("support-index-v5-runtime-java-stubs")
+            append("support-index-v6-durable-source-mirror")
             append('\n')
             project.modules.sortedBy { it.gradlePath }.forEach { module ->
                 append(module.gradlePath)

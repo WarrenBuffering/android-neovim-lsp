@@ -351,7 +351,7 @@ internal class BridgeK2SemanticEngine private constructor(
     ): List<TextEdit>? {
         val uri = params.textDocument.uri
         val key = SemanticRequestKey("format-document", uri, version, projectGeneration, "document")
-        val edits = awaitMemoized(key, timeoutMillis = null) {
+        val edits = awaitMemoized(key, timeoutMillis = semanticConfig.formatTimeoutMillis) {
             val bridged = withForegroundRequest {
                 projectRoot
                     ?.let { root ->
@@ -369,7 +369,7 @@ internal class BridgeK2SemanticEngine private constructor(
                     requireExternalFormatter = true,
                 )
             }
-        } ?: return null
+        } ?: throw IllegalStateException("Formatting timed out after ${semanticConfig.formatTimeoutMillis}ms")
         if (!isCurrentVersion(uri, version)) return null
         return edits
     }
@@ -384,7 +384,7 @@ internal class BridgeK2SemanticEngine private constructor(
     ): List<TextEdit>? {
         val uri = params.textDocument.uri
         val key = SemanticRequestKey("format-range", uri, version, projectGeneration, "${params.range.start.line}:${params.range.start.character}")
-        val edits = awaitMemoized(key, timeoutMillis = null) {
+        val edits = awaitMemoized(key, timeoutMillis = semanticConfig.formatTimeoutMillis) {
             val bridged = withForegroundRequest {
                 projectRoot
                     ?.let { root ->
@@ -405,7 +405,7 @@ internal class BridgeK2SemanticEngine private constructor(
                     requireExternalFormatter = true,
                 )
             }
-        } ?: return null
+        } ?: throw IllegalStateException("Formatting timed out after ${semanticConfig.formatTimeoutMillis}ms")
         if (!isCurrentVersion(uri, version)) return null
         return edits
     }
@@ -568,11 +568,31 @@ internal class BridgeK2SemanticEngine private constructor(
                 future.get(timeoutMillis, TimeUnit.MILLISECONDS) as T?
             }
         } catch (_: java.util.concurrent.TimeoutException) {
+            future.cancel(true)
+            if (key.feature.startsWith("format-")) {
+                resetBridgeAfterFormattingTimeout(key, timeoutMillis)
+            }
             null
         } catch (_: java.util.concurrent.CancellationException) {
             null
+        } catch (error: java.util.concurrent.ExecutionException) {
+            throw error.cause ?: error
         } finally {
             future.whenComplete { _, _ -> inFlight.remove(key, future) }
+        }
+    }
+
+    private fun resetBridgeAfterFormattingTimeout(key: SemanticRequestKey, timeoutMillis: Long?) {
+        val currentBridge = synchronized(this) {
+            bridge.also {
+                bridge = null
+            }
+        }
+        if (currentBridge != null) {
+            System.err.println(
+                "[android-neovim-lsp] ${key.feature} timed out after ${timeoutMillis ?: 0}ms; restarting JetBrains bridge",
+            )
+            runCatching { currentBridge.close() }
         }
     }
 

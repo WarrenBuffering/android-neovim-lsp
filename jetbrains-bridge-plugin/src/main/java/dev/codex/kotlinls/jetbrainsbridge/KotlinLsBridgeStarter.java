@@ -67,11 +67,14 @@ import java.io.BufferedWriter;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -251,16 +254,30 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Missing format payload");
         }
         Project project = openProject(payload.projectRoot());
-        AnalysisHandle handle = loadAnalysisHandle(project, payload.filePath(), payload.text());
-        if (handle == null) {
-            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to open file: " + payload.filePath());
+        if (payload.text() == null) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Missing format text");
         }
-        String currentText = handle.document().getText();
-        replaceDocumentText(project, handle.document(), currentText);
-        // IntelliJ formatting can operate on the PSI/document model without waiting for full smart-mode indexing.
-        // Blocking here makes synchronous LSP formatting requests time out on large Android projects.
-        String formattedText = formatDocument(project, handle, payload.rangeStart(), payload.rangeEnd());
-        return new BridgeResponse(request.id(), true, "formatted", List.of(), List.of(), null, formattedText, null);
+        Path tempFile = null;
+        try {
+            tempFile = createFormattingTempFile(payload.filePath(), payload.text());
+            FormattingHandle handle = loadFormattingHandle(project, tempFile);
+            if (handle == null) {
+                return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, "Unable to create formatting document: " + payload.filePath());
+            }
+            // IntelliJ formatting can operate on the PSI/document model without waiting for full smart-mode indexing.
+            // Blocking here makes synchronous LSP formatting requests time out on large Android projects.
+            String formattedText = formatDocument(project, handle, payload.rangeStart(), payload.rangeEnd());
+            return new BridgeResponse(request.id(), true, "formatted", List.of(), List.of(), null, formattedText, null);
+        } catch (Throwable t) {
+            return new BridgeResponse(request.id(), false, null, List.of(), List.of(), null, null, stackTrace(t));
+        } finally {
+            if (tempFile != null) {
+                try {
+                    Files.deleteIfExists(tempFile);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
     }
 
     private Project openProject(String projectRoot) {
@@ -295,7 +312,7 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         );
     }
 
-    private String formatDocument(Project project, AnalysisHandle handle, int rangeStart, int rangeEnd) {
+    private String formatDocument(Project project, FormattingHandle handle, int rangeStart, int rangeEnd) {
         AtomicReference<String> formattedText = new AtomicReference<>();
         ApplicationManager.getApplication().invokeAndWait(
             () -> formattedText.set(WriteCommandAction.writeCommandAction(project).compute(() -> {
@@ -315,6 +332,75 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             ModalityState.nonModal()
         );
         return formattedText.get();
+    }
+
+    private FormattingHandle loadFormattingHandle(Project project, Path tempFile) {
+        return ApplicationManager.getApplication().runReadAction((Computable<FormattingHandle>) () -> {
+            VirtualFile virtualFile = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(tempFile);
+            if (virtualFile == null) {
+                return null;
+            }
+            PsiFile psiFile = PsiManager.getInstance(project).findFile(virtualFile);
+            if (psiFile == null) {
+                return null;
+            }
+            Document document = FileDocumentManager.getInstance().getDocument(virtualFile);
+            if (document == null) {
+                document = PsiDocumentManager.getInstance(project).getDocument(psiFile);
+            }
+            if (document == null) {
+                return null;
+            }
+            return new FormattingHandle(psiFile, document);
+        });
+    }
+
+    private Path createFormattingTempFile(String filePath, String text) throws java.io.IOException {
+        String fileName = formattingFileName(filePath);
+        int dotIndex = fileName.lastIndexOf('.');
+        String baseName = dotIndex > 0 ? fileName.substring(0, dotIndex) : fileName;
+        String extension = dotIndex >= 0 ? fileName.substring(dotIndex) : ".kt";
+        String prefix = baseName.replaceAll("[^A-Za-z0-9_.-]", "_");
+        if (prefix.length() < 3) {
+            prefix = "kls" + prefix;
+        }
+        Path parent = formattingTempParent(filePath);
+        Path tempFile = parent == null ? Files.createTempFile(
+            "android-neovim-lsp-format-" + prefix + "-",
+            extension.isBlank() ? ".kt" : extension
+        ) : Files.createTempFile(
+            parent,
+            prefix + ".android-neovim-lsp-format-",
+            extension.isBlank() ? ".kt" : extension
+        );
+        Files.writeString(tempFile, text, StandardCharsets.UTF_8);
+        return tempFile;
+    }
+
+    private Path formattingTempParent(String filePath) {
+        if (filePath == null || filePath.isBlank()) {
+            return null;
+        }
+        try {
+            Path parent = Path.of(filePath).getParent();
+            if (parent != null && Files.isDirectory(parent) && Files.isWritable(parent)) {
+                return parent;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private String formattingFileName(String filePath) {
+        if (filePath == null || filePath.isBlank()) {
+            return "Snippet.kt";
+        }
+        try {
+            String fileName = Path.of(filePath).getFileName().toString();
+            return fileName.isBlank() ? "Snippet.kt" : fileName;
+        } catch (Throwable ignored) {
+            return "Snippet.kt";
+        }
     }
 
     private String renderHoverMarkdown(Project project, AnalysisHandle handle, int offset) {
@@ -471,22 +557,85 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
             return null;
         }
         Document targetDocument = documentForElement(file, sourceHandle);
-        if (targetDocument == null) {
+        String targetText = targetDocument != null ? targetDocument.getText() : file.getText();
+        if (targetText == null) {
             return null;
         }
         TextRange range = preferredTextRange(element);
-        int startOffset = Math.max(0, Math.min(range.getStartOffset(), targetDocument.getTextLength()));
-        int endOffset = Math.max(startOffset, Math.min(range.getEndOffset(), targetDocument.getTextLength()));
-        String uri = sourceHandle != null && file == sourceHandle.psiFile()
-            ? sourceHandle.sourceVirtualFile().getUrl()
-            : file.getVirtualFile() != null ? file.getVirtualFile().getUrl() : null;
+        int textLength = targetDocument != null ? targetDocument.getTextLength() : targetText.length();
+        int startOffset = Math.max(0, Math.min(range.getStartOffset(), textLength));
+        int endOffset = Math.max(startOffset, Math.min(range.getEndOffset(), textLength));
+        String uri = navigationUri(file, targetText, sourceHandle);
         if (uri == null) {
             return null;
         }
+        BridgePosition start = targetDocument != null
+            ? positionForOffset(targetDocument, startOffset)
+            : positionForOffset(targetText, startOffset);
+        BridgePosition end = targetDocument != null
+            ? positionForOffset(targetDocument, endOffset)
+            : positionForOffset(targetText, endOffset);
         return new BridgeLocation(
             uri,
-            new BridgeRange(positionForOffset(targetDocument, startOffset), positionForOffset(targetDocument, endOffset))
+            new BridgeRange(start, end)
         );
+    }
+
+    private String navigationUri(PsiFile file, String targetText, AnalysisHandle sourceHandle) {
+        if (sourceHandle != null && file == sourceHandle.psiFile()) {
+            return sourceHandle.sourceVirtualFile().getUrl();
+        }
+        VirtualFile virtualFile = file.getVirtualFile();
+        String url = virtualFile != null ? virtualFile.getUrl() : null;
+        if (url != null && url.startsWith("file://") && isSourceNavigationUrl(url)) {
+            return url;
+        }
+        return materializeNavigationTarget(file, virtualFile, targetText);
+    }
+
+    private boolean isSourceNavigationUrl(String url) {
+        String lowerUrl = url.toLowerCase(Locale.ROOT);
+        return lowerUrl.endsWith(".kt") || lowerUrl.endsWith(".kts") || lowerUrl.endsWith(".java");
+    }
+
+    private String materializeNavigationTarget(PsiFile file, VirtualFile virtualFile, String text) {
+        if (text == null) return null;
+        String url = virtualFile != null ? virtualFile.getUrl() : null;
+        String identity = url != null && !url.isBlank() ? url : file.getName() + ":" + Integer.toUnsignedString(text.hashCode(), 16);
+        try {
+            String cacheKey = Integer.toUnsignedString(identity.hashCode(), 16);
+            Path targetDir = Path.of(System.getProperty("java.io.tmpdir"), "android-neovim-lsp-navigation", cacheKey);
+            Files.createDirectories(targetDir);
+            Path target = targetDir.resolve(navigationFileName(file, virtualFile, text));
+            Files.writeString(target, text, StandardCharsets.UTF_8);
+            return target.toUri().toString();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private String navigationFileName(PsiFile file, VirtualFile virtualFile, String text) {
+        String name = virtualFile != null ? virtualFile.getName() : null;
+        if (name == null || name.isBlank()) {
+            name = file.getName();
+        }
+        if (name == null || name.isBlank()) {
+            name = "Definition.kt";
+        }
+        if (name.endsWith(".class")) {
+            String baseName = name.substring(0, name.length() - ".class".length());
+            String languageId = file.getLanguage().getID().toLowerCase(Locale.ROOT);
+            if (languageId.contains("kotlin") || text.contains("fun ") || text.contains("val ")) {
+                name = baseName + ".kt";
+            } else if (languageId.contains("java") || text.contains(" class ") || text.contains(" interface ")) {
+                name = baseName + ".java";
+            }
+        }
+        name = name.replaceAll("[^A-Za-z0-9_.-]", "_");
+        if (name.isBlank()) {
+            return "Definition.kt";
+        }
+        return name;
     }
 
     private Document documentForElement(PsiFile file, AnalysisHandle sourceHandle) {
@@ -497,7 +646,11 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         if (virtualFile == null) {
             return null;
         }
-        return FileDocumentManager.getInstance().getDocument(virtualFile);
+        Document document = FileDocumentManager.getInstance().getDocument(virtualFile);
+        if (document != null) {
+            return document;
+        }
+        return PsiDocumentManager.getInstance(sourceHandle.project()).getDocument(file);
     }
 
     private TextRange preferredTextRange(PsiElement element) {
@@ -514,6 +667,19 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
         int safeOffset = Math.max(0, Math.min(offset, document.getTextLength()));
         int line = document.getLineNumber(safeOffset);
         int lineStart = document.getLineStartOffset(line);
+        return new BridgePosition(line, safeOffset - lineStart);
+    }
+
+    private BridgePosition positionForOffset(String text, int offset) {
+        int safeOffset = Math.max(0, Math.min(offset, text.length()));
+        int line = 0;
+        int lineStart = 0;
+        for (int i = 0; i < safeOffset; i += 1) {
+            if (text.charAt(i) == '\n') {
+                line += 1;
+                lineStart = i + 1;
+            }
+        }
         return new BridgePosition(line, safeOffset - lineStart);
     }
 
@@ -1059,6 +1225,8 @@ public final class KotlinLsBridgeStarter extends ApplicationStarterBase {
     ) {}
 
     private record AnalysisHandle(Project project, VirtualFile sourceVirtualFile, PsiFile psiFile, Document document) {}
+
+    private record FormattingHandle(PsiFile psiFile, Document document) {}
 
     private record BridgeLocation(String uri, BridgeRange range) {}
 

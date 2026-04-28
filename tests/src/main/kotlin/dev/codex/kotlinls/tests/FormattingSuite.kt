@@ -134,6 +134,77 @@ fun formattingSuite(): TestSuite {
                 }
                 assertContains(formatted, "fun greet(name: String) =")
             },
+            TestCase("sorts imports without semantic analysis") {
+                val content = """
+                    package demo
+
+                    import kotlin.text.trim as trimText
+                    import kotlin.collections.setOf
+                    import kotlin.collections.listOf
+                    import kotlin.collections.setOf
+
+                    fun greet() = listOf("a").joinToString()
+                """.trimIndent()
+                val formatted = formattingService.sortImportsForText(content)
+                val imports = formatted
+                    .lineSequence()
+                    .filter { it.startsWith("import ") }
+                    .toList()
+                assertEquals(
+                    listOf(
+                        "import kotlin.collections.listOf",
+                        "import kotlin.collections.setOf",
+                        "import kotlin.text.trim as trimText",
+                    ),
+                    imports,
+                )
+            },
+            TestCase("removes spaces around qualified access dots from formatter output") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    fun run(state: State) {
+                        state . copy()
+                    }
+                """.trimIndent()
+                val bridgeFormattingService = FormattingService(
+                    intellijFormatterBridge = FormatterBridge { _, _, _ ->
+                        """
+                        package demo
+
+                        fun run(state: State) {
+                            state . copy(
+                                enabled = state . enabled,
+                                text = "state . copy",
+                            )
+                            // state . copy
+                            value .. other
+                        }
+                        """.trimIndent()
+                    },
+                )
+                val edits = bridgeFormattingService.formatDocumentText(
+                    path = appFile,
+                    text = content,
+                    params = DocumentFormattingParams(
+                        textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                        options = FormattingOptions(tabSize = 4, insertSpaces = true),
+                    ),
+                )
+                val formatted = applyEdits(content, edits)
+                assertContains(formatted, "state.copy(")
+                assertContains(formatted, "enabled = state.enabled")
+                assertContains(formatted, """"state . copy"""")
+                assertContains(formatted, "// state . copy")
+                assertContains(formatted, "value .. other")
+                val bridgeEdits = bridgeFormattingService.editsForFormattedText(
+                    original = "fun run() { state.copy() }",
+                    formatted = "fun run() { state . copy() }",
+                )
+                assertEquals("fun run() { state.copy() }", applyEdits("fun run() { state.copy() }", bridgeEdits))
+            },
             TestCase("range formatting only edits overlapping formatted changes") {
                 val root = FixtureSupport.fixture("simple-jvm-app")
                 val project = importer.importProject(root)

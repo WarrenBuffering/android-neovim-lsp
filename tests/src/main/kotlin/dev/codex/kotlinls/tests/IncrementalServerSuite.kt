@@ -38,6 +38,9 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                 assertTrue(!sawSemanticAnalysis) { "Expected fast diagnostics before semantic analysis progress started" }
                 val codes = firstDiagnostic?.params?.get("diagnostics")?.mapNotNull { it.get("code")?.asText() }.orEmpty()
                 assertTrue("package-mismatch" in codes) { "Expected package mismatch diagnostic, got $codes" }
+                assertEquals(1, firstDiagnostic?.params?.get("version")?.asInt()) {
+                    "Expected diagnostics to be stamped with the opened document version"
+                }
             }
         },
         TestCase("publishes semantic diagnostics before semantic index starts") {
@@ -419,6 +422,9 @@ fun incrementalServerSuite(): TestSuite = TestSuite(
                     .orEmpty()
                 assertTrue("unresolved-import-symbol" in diagnosticCodes) {
                     "Expected explicit diagnostics flush to publish unresolved import diagnostics, got $diagnosticCodes"
+                }
+                assertEquals(2, flushedDiagnostics?.params?.get("version")?.asInt()) {
+                    "Expected flushed diagnostics to be stamped with the changed document version"
                 }
             }
         },

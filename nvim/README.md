@@ -68,7 +68,7 @@ The repo's `nvim/init.lua` also bootstraps `lazy.nvim` and `nvim-lspconfig`, so 
 require("android_neovim_lsp").setup({
   inlay_hints = false,
   format_on_save = true,
-  format_timeout_ms = 120000,
+  format_timeout_ms = 30000,
   hover_bottom_padding_lines = 2,
   install = true,
   version = nil,
@@ -77,7 +77,7 @@ require("android_neovim_lsp").setup({
 
 When `install = true`, the runtime prefers building from the local checkout when available and otherwise falls back to the release installer. Set `version` to pin a specific release tag such as `"v0.1.3"`.
 
-When `format_on_save` is enabled, the runtime disables LazyVim-style Kotlin autoformatting for that buffer and manages formatting itself synchronously on `BufWritePre`, so the formatted buffer contents are what get written to disk. If [`conform.nvim`](https://github.com/stevearc/conform.nvim) is installed, it is used automatically; otherwise the runtime falls back to `vim.lsp.buf.format()`. `format_timeout_ms` defaults to `120000` to give cold IntelliJ-backed formatter starts enough room. `hover_bottom_padding_lines` defaults to `2` so hover floats have a little breathing room below the final line.
+The runtime disables LazyVim-style Kotlin autoformatting for attached Kotlin buffers so formatting always goes through android-neovim-lsp. When `format_on_save` is enabled, it manages formatting synchronously on `BufWritePre`, so the formatted buffer contents are what get written to disk. Manual formatting through `:AndroidNeovimLspFormat` or the buffer-local `<leader>cf` mapping uses the same formatting path and result highlighting. `format_timeout_ms` defaults to `30000` and is passed to both the Neovim request watchdog and the server formatter timeout. `hover_bottom_padding_lines` defaults to `2` so hover floats have a little breathing room below the final line.
 
 ## Status Commands
 

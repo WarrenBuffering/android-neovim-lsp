@@ -10,18 +10,20 @@ local format_on_save_group = vim.api.nvim_create_augroup("AndroidNeovimLspFormat
 local format_flash_namespace = vim.api.nvim_create_namespace("AndroidNeovimLspFormatFlash")
 local format_spinner = {
   active = 0,
+  notification = nil,
+  generation = 0,
 }
 local diagnostics_sync_group = vim.api.nvim_create_augroup("AndroidNeovimLspDiagnostics", { clear = false })
 local progress_spinner = {
   active = {},
   order = {},
 }
-local default_format_request_timeout_ms = 120000
+local default_format_request_timeout_ms = 30000
 local format_request_timeout_ms = default_format_request_timeout_ms
-local format_request_quiet = true
-local format_lsp_mode = "fallback"
 local diagnostics_debounce_ms = 0
 local default_hover_bottom_padding_lines = 2
+local active_format_buffers = {}
+local next_format_request_id = 0
 local diagnostics_debounce = {
   pending = {},
   timers = {},
@@ -34,6 +36,7 @@ local initialization_announced_clients = {}
 local flush_buffer_diagnostics
 local schedule_buffer_diagnostics_flush
 local complete_format
+local format_buffer
 local merge_changed_line_range
 local start_format_status
 local stop_format_status
@@ -399,7 +402,13 @@ local function redraw()
   pcall(vim.cmd, "redraw")
 end
 
-local function echo_bottom(message, highlight)
+local function close_notification(notification)
+  if type(notification) == "table" and type(notification.close) == "function" then
+    pcall(notification.close, notification)
+  end
+end
+
+local function echo_bottom(message, highlight, opts)
   message = type(message) == "string" and message or ""
   if message == "" then
     return
@@ -428,6 +437,26 @@ local function diagnostics_state_for_uri(uri)
     end
   end
   return nil, nil
+end
+
+local function diagnostics_publish_is_stale(params)
+  if type(params) ~= "table" or type(params.uri) ~= "string" then
+    return false
+  end
+
+  local published_version = tonumber(params.version)
+  if published_version == nil then
+    return false
+  end
+
+  local bufnr = diagnostics_state_for_uri(params.uri)
+  if bufnr == nil or not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  local versions = vim.lsp.util and vim.lsp.util.buf_versions or nil
+  local current_version = versions and tonumber(versions[bufnr]) or nil
+  return current_version ~= nil and published_version < current_version
 end
 
 local function stop_diagnostics_timer(key)
@@ -469,38 +498,198 @@ local function queue_next_buffer_diagnostics_flush(state, reason)
   state.queued_flush_reason = reason or "change"
 end
 
-local function perform_format_buffer(bufnr, before_text)
-  local timeout_ms = tonumber(vim.b[bufnr].android_neovim_lsp_format_timeout_ms) or format_request_timeout_ms
-  local function on_complete()
-    complete_format(bufnr, before_text)
+local function android_format_client(bufnr)
+  local clients
+  if vim.lsp.get_clients then
+    clients = vim.lsp.get_clients({
+      bufnr = bufnr,
+      name = "android_neovim_lsp",
+      method = "textDocument/formatting",
+    })
+  else
+    clients = vim.lsp.get_active_clients({
+      bufnr = bufnr,
+      name = "android_neovim_lsp",
+    })
+  end
+  return clients and clients[1] or nil
+end
+
+local function buffer_changedtick(bufnr)
+  if vim.api.nvim_buf_get_changedtick then
+    local ok, changedtick = pcall(vim.api.nvim_buf_get_changedtick, bufnr)
+    if ok then
+      return changedtick
+    end
+  end
+  return vim.b[bufnr].changedtick
+end
+
+local function lsp_error_message(err)
+  if type(err) == "table" then
+    return tostring(err.message or err.data or vim.inspect(err))
+  end
+  return tostring(err)
+end
+
+local function cancel_format_request(state)
+  if state == nil or state.client == nil or state.request_id == nil then
+    return
+  end
+  if type(state.client.cancel_request) == "function" then
+    pcall(state.client.cancel_request, state.client, state.request_id)
+  end
+end
+
+local function finish_format_request(bufnr, request_id, ok, message)
+  local state = active_format_buffers[bufnr]
+  if state == nil or state.id ~= request_id or state.done then
+    return false
   end
 
-  local ok, conform = pcall(require, "conform")
+  state.done = true
+  active_format_buffers[bufnr] = nil
+  local notification = stop_format_status()
   if ok then
-    start_format_status()
-    local ok_format, attempted = pcall(conform.format, {
-      bufnr = bufnr,
-      async = false,
-      quiet = format_request_quiet,
-      lsp_format = format_lsp_mode,
-      timeout_ms = timeout_ms,
-    })
-    on_complete()
-    if not ok_format or attempted == false then
-      stop_format_status()
+    complete_format(bufnr, state.before_text, notification)
+  else
+    local formatted = message or "Formatting failed"
+    vim.schedule(function()
+      echo_bottom(formatted, "ErrorMsg", {
+        replace = notification,
+        timeout = 3000,
+      })
+    end)
+  end
+  return true
+end
+
+local function request_android_format(bufnr, timeout_ms, before_text)
+  local client = android_format_client(bufnr)
+  if client == nil then
+    return nil, "android-neovim-lsp formatter is not attached"
+  end
+
+  local params
+  vim.api.nvim_buf_call(bufnr, function()
+    params = vim.lsp.util.make_formatting_params({})
+  end)
+
+  next_format_request_id = next_format_request_id + 1
+  local request_id = next_format_request_id
+  local state = {
+    id = request_id,
+    done = false,
+    client = client,
+    request_id = nil,
+    before_text = before_text,
+    changedtick = buffer_changedtick(bufnr),
+  }
+  active_format_buffers[bufnr] = state
+
+  local function complete_on_main(fn)
+    if vim.in_fast_event and vim.in_fast_event() then
+      vim.schedule(fn)
+    else
+      fn()
     end
-    return
+  end
+
+  local request_ok, lsp_request_id = client:request("textDocument/formatting", params, function(err, result)
+    complete_on_main(function()
+      local current = active_format_buffers[bufnr]
+      if current == nil or current.id ~= request_id or current.done then
+        return
+      end
+      if err then
+        finish_format_request(bufnr, request_id, false, "Formatting failed: " .. lsp_error_message(err))
+        return
+      end
+      if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
+        finish_format_request(bufnr, request_id, false, "Formatting failed: buffer is no longer loaded")
+        return
+      end
+      if buffer_changedtick(bufnr) ~= current.changedtick then
+        finish_format_request(bufnr, request_id, false, "Formatting skipped: buffer changed while formatting")
+        return
+      end
+
+      local ok_apply, apply_error = pcall(
+        vim.lsp.util.apply_text_edits,
+        result or {},
+        bufnr,
+        client.offset_encoding
+      )
+      if not ok_apply then
+        finish_format_request(bufnr, request_id, false, "Formatting failed: " .. tostring(apply_error))
+        return
+      end
+      finish_format_request(bufnr, request_id, true, nil)
+    end)
+  end, bufnr)
+
+  if request_ok == false or request_ok == nil then
+    active_format_buffers[bufnr] = nil
+    return nil, "format request could not be sent"
+  end
+  state.request_id = lsp_request_id or request_ok
+
+  vim.defer_fn(function()
+    local current = active_format_buffers[bufnr]
+    if current == nil or current.id ~= request_id or current.done then
+      return
+    end
+    cancel_format_request(current)
+    finish_format_request(
+      bufnr,
+      request_id,
+      false,
+      string.format("Formatting timed out after %dms", timeout_ms)
+    )
+  end, timeout_ms)
+
+  return state, nil
+end
+
+local function perform_format_buffer(bufnr, before_text, opts)
+  opts = opts or {}
+  local timeout_ms = tonumber(vim.b[bufnr].android_neovim_lsp_format_timeout_ms) or format_request_timeout_ms
+  local function on_failure(message)
+    local notification = stop_format_status()
+    vim.schedule(function()
+      echo_bottom(message, "ErrorMsg", {
+        replace = notification,
+        timeout = 3000,
+      })
+    end)
   end
 
   start_format_status()
-  local ok_format = pcall(vim.lsp.buf.format, {
-    bufnr = bufnr,
-    async = false,
-    timeout_ms = timeout_ms,
-  })
-  on_complete()
-  if not ok_format then
-    stop_format_status()
+  local ok_call, state, format_error = pcall(request_android_format, bufnr, timeout_ms, before_text)
+  if not ok_call then
+    active_format_buffers[bufnr] = nil
+    on_failure("Formatting failed: " .. tostring(state))
+    return
+  end
+  if state == nil then
+    active_format_buffers[bufnr] = nil
+    on_failure("Formatting failed: " .. tostring(format_error))
+    return
+  end
+
+  if opts.wait == true then
+    local waited = vim.wait(timeout_ms + 250, function()
+      return state.done == true
+    end, 10)
+    if not waited and state.done ~= true then
+      cancel_format_request(state)
+      finish_format_request(
+        bufnr,
+        state.id,
+        false,
+        string.format("Formatting timed out after %dms", timeout_ms)
+      )
+    end
   end
 end
 
@@ -518,13 +707,18 @@ local function make_publish_diagnostics_handler(default_handler, debounce_ms)
   end
 
   local delay = tonumber(debounce_ms) or 0
-  if delay <= 0 then
-    return default_handler
-  end
 
   return function(err, params, ctx, config)
     local client = ctx and ctx.client_id and vim.lsp.get_client_by_id(ctx.client_id) or nil
     if client == nil or client.name ~= "android_neovim_lsp" or type(params) ~= "table" or type(params.uri) ~= "string" then
+      return default_handler(err, params, ctx, config)
+    end
+
+    if diagnostics_publish_is_stale(params) then
+      return
+    end
+
+    if delay <= 0 then
       return default_handler(err, params, ctx, config)
     end
 
@@ -559,6 +753,10 @@ local function make_publish_diagnostics_handler(default_handler, debounce_ms)
 
       local active_client = pending.ctx and pending.ctx.client_id and vim.lsp.get_client_by_id(pending.ctx.client_id) or nil
       if active_client == nil or active_client.name ~= "android_neovim_lsp" then
+        return
+      end
+
+      if diagnostics_publish_is_stale(pending.params) then
         return
       end
 
@@ -812,23 +1010,36 @@ start_format_status = function()
   if format_spinner.active > 1 then
     return
   end
-  local ok, notification = pcall(vim.notify, "Formatting File...", vim.log.levels.INFO, {
-    title = "android-neovim-lsp",
-    timeout = 3000,
-    hide_from_history = true,
-  })
-  if not ok then return end
+  format_spinner.generation = format_spinner.generation + 1
+  local generation = format_spinner.generation
+  vim.defer_fn(function()
+    if format_spinner.active == 0 or format_spinner.generation ~= generation then
+      return
+    end
+    local ok, notification = pcall(vim.notify, "Formatting File...", vim.log.levels.INFO, {
+      title = "android-neovim-lsp",
+      timeout = 1200,
+      hide_from_history = true,
+    })
+    if not ok then return end
+    format_spinner.notification = notification
+  end, 150)
 end
 
 stop_format_status = function()
   if format_spinner.active == 0 then
-    return
+    return nil
   end
 
   format_spinner.active = format_spinner.active - 1
   if format_spinner.active > 0 then
-    return
+    return nil
   end
+  format_spinner.generation = format_spinner.generation + 1
+  local notification = format_spinner.notification
+  format_spinner.notification = nil
+  close_notification(notification)
+  return notification
 end
 
 local function ensure_progress_status_timer()
@@ -967,7 +1178,7 @@ local function flash_format_changes(bufnr, before_text)
   end, 180)
 end
 
-local function show_format_result(bufnr, before_text)
+local function show_format_result(bufnr, before_text, notification)
   if before_text == nil then
     return
   end
@@ -986,7 +1197,10 @@ local function show_format_result(bufnr, before_text)
   end
 
   vim.schedule(function()
-    echo_bottom(message, "ModeMsg")
+    echo_bottom(message, "ModeMsg", {
+      replace = notification,
+      timeout = 2000,
+    })
   end)
 end
 
@@ -1297,21 +1511,24 @@ local function register_user_commands()
   vim.api.nvim_create_user_command("AndroidNeovimLspCacheStatus", function()
     request_index_status("cache")
   end, { desc = "Show android-neovim-lsp cache status", force = true })
+  vim.api.nvim_create_user_command("AndroidNeovimLspFormat", function()
+    M.format({ bufnr = vim.api.nvim_get_current_buf(), manual = true })
+  end, { desc = "Format current buffer with android-neovim-lsp", force = true })
 end
 
-complete_format = function(bufnr, before_text)
-  stop_format_status()
+complete_format = function(bufnr, before_text, notification)
   flash_format_changes(bufnr, before_text)
   local state = diagnostics_tracking.buffers[bufnr]
   if state ~= nil then
     queue_full_buffer_diagnostics_range(bufnr, state)
     schedule_buffer_diagnostics_flush(bufnr, "save")
   end
-  show_format_result(bufnr, before_text)
+  show_format_result(bufnr, before_text, notification)
 end
 
-local function format_buffer(bufnr)
-  if vim.g.autoformat == false then
+format_buffer = function(bufnr, opts)
+  opts = opts or {}
+  if opts.manual ~= true and vim.g.autoformat == false then
     return
   end
   if not vim.api.nvim_buf_is_valid(bufnr) or not vim.api.nvim_buf_is_loaded(bufnr) then
@@ -1320,8 +1537,24 @@ local function format_buffer(bufnr)
   if not vim.bo[bufnr].modifiable or vim.bo[bufnr].readonly then
     return
   end
+  if active_format_buffers[bufnr] then
+    if opts.manual == true then
+      echo_bottom("Formatting already in progress", "WarningMsg")
+    end
+    return
+  end
+  active_format_buffers[bufnr] = true
   local before_text = buffer_text(bufnr)
-  perform_format_buffer(bufnr, before_text)
+  perform_format_buffer(bufnr, before_text, {
+    wait = opts.manual ~= true,
+  })
+end
+
+function M.format(opts)
+  opts = opts or {}
+  format_buffer(opts.bufnr or vim.api.nvim_get_current_buf(), {
+    manual = opts.manual ~= false,
+  })
 end
 
 local function announce_initializing(client)
@@ -1337,6 +1570,9 @@ local function configure_buffer(client, bufnr, plugin_opts)
   announce_initializing(client)
   ensure_diagnostics_tracking(client, bufnr, plugin_opts)
   vim.b[bufnr].android_neovim_lsp_format_timeout_ms = plugin_opts.format_timeout_ms
+  vim.keymap.set("n", "<leader>cf", function()
+    M.format({ bufnr = bufnr, manual = true })
+  end, { buffer = bufnr, desc = "Format with android-neovim-lsp" })
 
   if plugin_opts.inlay_hints_enabled ~= nil then
     local supports_inlay_hints = client.supports_method and client:supports_method("textDocument/inlayHint")
@@ -1352,13 +1588,13 @@ local function configure_buffer(client, bufnr, plugin_opts)
   end
 
   vim.api.nvim_clear_autocmds({ group = format_on_save_group, buffer = bufnr })
+  vim.b[bufnr].autoformat = false
   if plugin_opts.format_on_save_enabled then
-    vim.b[bufnr].autoformat = false
     vim.api.nvim_create_autocmd("BufWritePre", {
       group = format_on_save_group,
       buffer = bufnr,
       callback = function(args)
-        format_buffer(args.buf)
+        format_buffer(args.buf, { manual = false })
       end,
     })
   end
@@ -1377,6 +1613,13 @@ function M.default_config(opts)
   local default_publish_diagnostics_handler = user_handlers["textDocument/publishDiagnostics"]
     or vim.lsp.handlers["textDocument/publishDiagnostics"]
   local init_options = vim.deepcopy(lsp_opts.init_options or {})
+  init_options.semantic = vim.tbl_deep_extend(
+    "force",
+    init_options.semantic or {},
+    {
+      format_timeout_ms = plugin_opts.format_timeout_ms,
+    }
+  )
   init_options.diagnostics = vim.tbl_deep_extend(
     "force",
     init_options.diagnostics or {},

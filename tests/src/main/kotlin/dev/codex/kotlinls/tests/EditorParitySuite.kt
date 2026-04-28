@@ -4,6 +4,7 @@ import dev.codex.kotlinls.analysis.KotlinWorkspaceAnalyzer
 import dev.codex.kotlinls.codeactions.CodeActionService
 import dev.codex.kotlinls.completion.CompletionService
 import dev.codex.kotlinls.hover.HoverAndSignatureService
+import dev.codex.kotlinls.index.IndexedSymbol
 import dev.codex.kotlinls.index.LightweightWorkspaceIndexBuilder
 import dev.codex.kotlinls.index.SupportSymbolIndexBuilder
 import dev.codex.kotlinls.index.WorkspaceIndex
@@ -17,6 +18,7 @@ import dev.codex.kotlinls.protocol.CodeActionParams
 import dev.codex.kotlinls.protocol.InlayHintParams
 import dev.codex.kotlinls.protocol.Position
 import dev.codex.kotlinls.protocol.Range
+import dev.codex.kotlinls.protocol.SymbolKind
 import dev.codex.kotlinls.protocol.TextDocumentIdentifier
 import dev.codex.kotlinls.protocol.TextDocumentItem
 import dev.codex.kotlinls.workspace.TextDocumentStore
@@ -118,6 +120,70 @@ fun editorParitySuite(): TestSuite {
                     ),
                 )
                 assertContains(hover?.contents?.value ?: "", "class Greeting")
+            },
+            TestCase("uses the cursor token before trusting same-file declaration ranges") {
+                val root = FixtureSupport.fixtureCopy("simple-jvm-app")
+                val project = importer.importProject(root)
+                val file = root.resolve("src/main/kotlin/demo/BroadRangeHover.kt")
+                val content = """
+                    package demo
+
+                    import java.util.UUID
+
+                    data class Content(
+                        val id: UUID,
+                    )
+                """.trimIndent() + "\n"
+                file.writeText(content)
+                val projectIndex = lightweightIndexBuilder.build(project, TextDocumentStore())
+                val contentLine = content.lines().indexOfFirst { it.contains("data class Content") }
+                val contentDeclarationLine = content.lines()[contentLine]
+                val broadContentRange = Range(
+                    Position(contentLine, 0),
+                    Position(contentLine, contentDeclarationLine.length),
+                )
+                val uuidSymbol = IndexedSymbol(
+                    id = "java.util.UUID",
+                    name = "UUID",
+                    fqName = "java.util.UUID",
+                    kind = SymbolKind.CLASS,
+                    path = root.resolve("runtime/java/util/UUID.java"),
+                    uri = root.resolve("runtime/java/util/UUID.java").toUri().toString(),
+                    range = Range(Position(0, 0), Position(0, 10)),
+                    selectionRange = Range(Position(0, 6), Position(0, 10)),
+                    signature = "class UUID",
+                    documentation = "UUID docs",
+                    packageName = "java.util",
+                    moduleName = "support",
+                    importable = true,
+                )
+                val index = WorkspaceIndex(
+                    symbols = projectIndex.symbols.map { symbol ->
+                        if (symbol.name == "Content") {
+                            symbol.copy(selectionRange = broadContentRange)
+                        } else {
+                            symbol
+                        }
+                    } + uuidSymbol,
+                    references = emptyList(),
+                    callEdges = emptyList(),
+                )
+                val uuidLine = content.lines().indexOfFirst { it.contains("val id: UUID") }
+                val uuidColumn = content.lines()[uuidLine].indexOf("UUID") + 1
+                val hover = hoverService.hoverFromIndex(
+                    index = index,
+                    path = file,
+                    text = content,
+                    params = dev.codex.kotlinls.protocol.TextDocumentPositionParams(
+                        textDocument = TextDocumentIdentifier(file.toUri().toString()),
+                        position = Position(uuidLine, uuidColumn),
+                    ),
+                )
+                val hoverText = hover?.contents?.value ?: error("Expected UUID hover from the index")
+                assertContains(hoverText, "class UUID")
+                assertTrue("data class Content" !in hoverText) {
+                    "Expected UUID hover, got Content hover: $hoverText"
+                }
             },
             TestCase("navigates from Kotlin to Java source definitions") {
                 val root = FixtureSupport.fixture("mixed-kotlin-java")

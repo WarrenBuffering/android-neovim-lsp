@@ -69,7 +69,7 @@ class FormattingService(
                 usedImports = UsedImportInfo(emptySet(), emptySet()),
             )
         }
-        return diffEdits(text, formatted)
+        return diffEdits(text, normalizeQualifiedAccessSpacing(formatted))
     }
 
     fun formatRangeText(
@@ -80,7 +80,7 @@ class FormattingService(
     ): List<TextEdit> {
         if (requireExternalFormatter) {
             val formatted = requireExternalFormatterText(path, text)
-            return diffEdits(text, formatted)
+            return diffEdits(text, normalizeQualifiedAccessSpacing(formatted))
         }
         return emptyList()
     }
@@ -88,7 +88,7 @@ class FormattingService(
     fun editsForFormattedText(
         original: String,
         formatted: String,
-    ): List<TextEdit> = diffEdits(original, formatted)
+    ): List<TextEdit> = diffEdits(original, normalizeQualifiedAccessSpacing(formatted))
 
     fun formatDocument(snapshot: WorkspaceAnalysisSnapshot, params: DocumentFormattingParams): List<TextEdit> {
         val file = snapshot.filesByUri[params.textDocument.uri] ?: return emptyList()
@@ -100,7 +100,7 @@ class FormattingService(
             usedImports(snapshot.bindingContext, file),
         )
         val withOrganizedImports = organizeImportsForText(snapshot, params.textDocument.uri, formatted) ?: formatted
-        return diffEdits(file.text, withOrganizedImports)
+        return diffEdits(file.text, normalizeQualifiedAccessSpacing(withOrganizedImports))
     }
 
     fun formatRange(snapshot: WorkspaceAnalysisSnapshot, params: DocumentRangeFormattingParams): List<TextEdit> {
@@ -113,11 +113,12 @@ class FormattingService(
             scopeElement = scopeElement,
             usedImports = usedImports(snapshot.bindingContext, file),
         )
-        if (replacement == file.text.substring(scopeRange.startOffset, scopeRange.endOffset)) return emptyList()
+        val normalizedReplacement = normalizeQualifiedAccessSpacing(replacement)
+        if (normalizedReplacement == file.text.substring(scopeRange.startOffset, scopeRange.endOffset)) return emptyList()
         return listOf(
             TextEdit(
                 range = LineIndex.build(file.text).range(scopeRange.startOffset, scopeRange.endOffset),
-                newText = replacement,
+                newText = normalizedReplacement,
             ),
         )
     }
@@ -144,6 +145,29 @@ class FormattingService(
             parsedImports,
             usedImports(snapshot.bindingContext, file),
         )
+    }
+
+    fun sortImportsForText(text: String): String {
+        val block = textImportBlock(text) ?: return text
+        val sortedImports = block.imports
+            .distinctBy { it.key() }
+            .sortedWith(
+                compareBy<TextImportEntry>(
+                    { if (it.alias == null) 0 else 1 },
+                    { it.path.replace("`", "") },
+                    { it.alias.orEmpty() },
+                ),
+            )
+            .map { it.render() }
+        val currentImports = block.imports.map { it.render() }
+        if (sortedImports == currentImports) return text
+
+        val endsWithNewline = text.endsWith('\n')
+        val body = if (endsWithNewline) text.dropLast(1) else text
+        val lines = if (body.isEmpty()) mutableListOf("") else body.split('\n').toMutableList()
+        lines.subList(block.startLine, block.endLineExclusive).clear()
+        lines.addAll(block.startLine, sortedImports)
+        return lines.joinToString("\n") + if (endsWithNewline) "\n" else ""
     }
 
     fun lintDocument(path: Path, text: String): List<Diagnostic> = emptyList()
@@ -531,6 +555,159 @@ class FormattingService(
         return lines.joinToString("\n")
     }
 
+    private fun textImportBlock(text: String): TextImportBlock? {
+        val body = if (text.endsWith('\n')) text.dropLast(1) else text
+        val lines = if (body.isEmpty()) emptyList() else body.split('\n')
+        val firstImportLine = lines.indexOfFirst { it.isTextImportLine() }
+        if (firstImportLine < 0) return null
+
+        var cursor = firstImportLine
+        var lastImportLine = firstImportLine
+        val imports = mutableListOf<TextImportEntry>()
+        while (cursor < lines.size) {
+            val line = lines[cursor]
+            val entry = line.toTextImportEntry()
+            when {
+                entry != null -> {
+                    imports += entry
+                    lastImportLine = cursor
+                }
+                line.isBlank() -> Unit
+                else -> break
+            }
+            cursor += 1
+        }
+        if (imports.size < 2) return null
+        return TextImportBlock(
+            startLine = firstImportLine,
+            endLineExclusive = lastImportLine + 1,
+            imports = imports,
+        )
+    }
+
+    private fun String.isTextImportLine(): Boolean = trimStart().startsWith("import ")
+
+    private fun String.toTextImportEntry(): TextImportEntry? {
+        val trimmed = trim()
+        if (!trimmed.startsWith("import ")) return null
+        val body = trimmed.removePrefix("import ").trim()
+        if (body.isBlank()) return null
+        val aliasParts = body.split(Regex("""\s+as\s+"""), limit = 2)
+        val importPath = aliasParts[0].trim()
+        val alias = aliasParts.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
+        if (importPath.isBlank()) return null
+        return TextImportEntry(path = importPath, alias = alias)
+    }
+
+    private fun normalizeQualifiedAccessSpacing(text: String): String {
+        if (" ." !in text && ". " !in text && "\t." !in text && ".\t" !in text) return text
+        val output = StringBuilder(text.length)
+        var index = 0
+        while (index < text.length) {
+            val current = text[index]
+            when {
+                current == '/' && text.getOrNull(index + 1) == '/' -> {
+                    val end = text.indexOf('\n', startIndex = index).let { if (it == -1) text.length else it }
+                    output.append(text, index, end)
+                    index = end
+                }
+
+                current == '/' && text.getOrNull(index + 1) == '*' -> {
+                    val end = text.indexOf("*/", startIndex = index + 2).let { if (it == -1) text.length else it + 2 }
+                    output.append(text, index, end)
+                    index = end
+                }
+
+                current == '"' && text.startsWith("\"\"\"", index) -> {
+                    val end = text.indexOf("\"\"\"", startIndex = index + 3).let { if (it == -1) text.length else it + 3 }
+                    output.append(text, index, end)
+                    index = end
+                }
+
+                current == '"' || current == '\'' -> {
+                    val end = quotedLiteralEnd(text, index, current)
+                    output.append(text, index, end)
+                    index = end
+                }
+
+                current == '.' && isSpacedQualifiedAccessDot(text, index) -> {
+                    while (output.isNotEmpty() && output.last().isHorizontalWhitespace()) {
+                        output.setLength(output.length - 1)
+                    }
+                    output.append('.')
+                    index += 1
+                    while (index < text.length && text[index].isHorizontalWhitespace()) {
+                        index += 1
+                    }
+                }
+
+                else -> {
+                    output.append(current)
+                    index += 1
+                }
+            }
+        }
+        return output.toString()
+    }
+
+    private fun isSpacedQualifiedAccessDot(text: String, dotIndex: Int): Boolean {
+        val leftIndex = previousNonHorizontalWhitespaceOnSameLine(text, dotIndex - 1) ?: return false
+        val rightIndex = nextNonHorizontalWhitespaceOnSameLine(text, dotIndex + 1) ?: return false
+        if (leftIndex == dotIndex - 1 && rightIndex == dotIndex + 1) return false
+        val left = text[leftIndex]
+        val right = text[rightIndex]
+        if (left == '?' || left == '.' || right == '.') return false
+        if (left.isDigit() && right.isDigit()) return false
+        return left.isQualifiedAccessLeft() && right.isQualifiedAccessRight()
+    }
+
+    private fun previousNonHorizontalWhitespaceOnSameLine(text: String, start: Int): Int? {
+        var index = start
+        while (index >= 0) {
+            when (text[index]) {
+                ' ', '\t', '\r' -> index -= 1
+                '\n' -> return null
+                else -> return index
+            }
+        }
+        return null
+    }
+
+    private fun nextNonHorizontalWhitespaceOnSameLine(text: String, start: Int): Int? {
+        var index = start
+        while (index < text.length) {
+            when (text[index]) {
+                ' ', '\t', '\r' -> index += 1
+                '\n' -> return null
+                else -> return index
+            }
+        }
+        return null
+    }
+
+    private fun quotedLiteralEnd(text: String, start: Int, quote: Char): Int {
+        var index = start + 1
+        var escaped = false
+        while (index < text.length) {
+            val current = text[index]
+            when {
+                escaped -> escaped = false
+                current == '\\' -> escaped = true
+                current == quote -> return index + 1
+            }
+            index += 1
+        }
+        return text.length
+    }
+
+    private fun Char.isHorizontalWhitespace(): Boolean = this == ' ' || this == '\t' || this == '\r'
+
+    private fun Char.isQualifiedAccessLeft(): Boolean =
+        this == '`' || this == ')' || this == ']' || this == '_' || isLetterOrDigit()
+
+    private fun Char.isQualifiedAccessRight(): Boolean =
+        this == '`' || this == '_' || isLetter()
+
     private fun usedImports(
         bindingContext: BindingContext,
         file: dev.codex.kotlinls.analysis.AnalyzedFile,
@@ -751,6 +928,25 @@ private data class UsedImportInfo(
     val simpleNames: Set<String>,
     val fqNames: Set<String>,
 )
+
+private data class TextImportBlock(
+    val startLine: Int,
+    val endLineExclusive: Int,
+    val imports: List<TextImportEntry>,
+)
+
+private data class TextImportEntry(
+    val path: String,
+    val alias: String? = null,
+) {
+    fun key(): String = if (alias == null) path else "$path as $alias"
+
+    fun render(): String = if (alias == null) {
+        "import $path"
+    } else {
+        "import $path as $alias"
+    }
+}
 
 private data class ImportEntry(
     val path: String,

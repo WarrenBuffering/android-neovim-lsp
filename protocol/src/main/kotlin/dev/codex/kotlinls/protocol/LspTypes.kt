@@ -206,6 +206,7 @@ data class Diagnostic(
 data class PublishDiagnosticsParams(
     val uri: DocumentUri,
     val diagnostics: List<Diagnostic>,
+    val version: Int? = null,
 )
 
 @JsonInclude(JsonInclude.Include.NON_NULL)

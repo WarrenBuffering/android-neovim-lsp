@@ -21,6 +21,9 @@ internal data class KotlinLsConfig(
                     requestTimeoutMillis = parsed.semantic.requestTimeoutMillis
                         ?.coerceAtLeast(100L)
                         ?: SemanticConfig().requestTimeoutMillis,
+                    formatTimeoutMillis = parsed.semantic.formatTimeoutMillis
+                        ?.coerceAtLeast(1_000L)
+                        ?: SemanticConfig().formatTimeoutMillis,
                 ),
                 progress = ProgressConfig(
                     mode = ProgressMode.from(parsed.progress.mode),
@@ -29,6 +32,9 @@ internal data class KotlinLsConfig(
                     fastDebounceMillis = parsed.diagnostics.fastDebounceMillis
                         ?.coerceAtLeast(0L)
                         ?: DiagnosticsConfig().fastDebounceMillis,
+                    semanticDebounceMillis = parsed.diagnostics.semanticDebounceMillis
+                        ?.coerceAtLeast(0L)
+                        ?: DiagnosticsConfig().semanticDebounceMillis,
                 ),
             )
         }
@@ -39,6 +45,7 @@ internal data class SemanticConfig(
     val backend: SemanticBackend = SemanticBackend.K2_BRIDGE,
     val prefetch: SemanticPrefetchMode = SemanticPrefetchMode.ACTIVE_FILE,
     val requestTimeoutMillis: Long = 1_200L,
+    val formatTimeoutMillis: Long = 30_000L,
 )
 
 internal data class ProgressConfig(
@@ -47,6 +54,7 @@ internal data class ProgressConfig(
 
 internal data class DiagnosticsConfig(
     val fastDebounceMillis: Long = 0L,
+    val semanticDebounceMillis: Long = 250L,
 )
 
 internal enum class SemanticBackend {
@@ -100,6 +108,8 @@ private data class RawSemanticConfig(
     val prefetch: String? = null,
     @param:JsonProperty("request_timeout_ms")
     val requestTimeoutMillis: Long? = null,
+    @param:JsonProperty("format_timeout_ms")
+    val formatTimeoutMillis: Long? = null,
 )
 
 private data class RawProgressConfig(
@@ -109,4 +119,6 @@ private data class RawProgressConfig(
 private data class RawDiagnosticsConfig(
     @param:JsonProperty("fast_debounce_ms")
     val fastDebounceMillis: Long? = null,
+    @param:JsonProperty("semantic_debounce_ms")
+    val semanticDebounceMillis: Long? = null,
 )

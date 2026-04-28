@@ -10,7 +10,7 @@ import kotlin.io.path.exists
 import kotlin.io.path.writeText
 
 class RuntimeClassSourceMirror(
-    private val baseDir: Path = Path.of(System.getProperty("java.io.tmpdir"), "android-neovim-lsp-runtime-sources"),
+    private val baseDir: Path = IndexCachePaths.root().resolve("runtime-sources"),
     private val javaVersion: String = System.getProperty("java.version"),
 ) {
     fun materialize(runtimeClass: Class<*>): Path {

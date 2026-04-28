@@ -191,8 +191,11 @@ class JetBrainsCompletionBridge private constructor(
                 rangeEnd = -1,
             ),
         )
-        if (!response.success) return null
+        if (!response.success) {
+            throw IllegalStateException(response.error ?: "JetBrains formatter bridge failed")
+        }
         return response.formattedText
+            ?: throw IllegalStateException("JetBrains formatter bridge returned no formatted text")
     }
 
     @Synchronized
@@ -215,8 +218,11 @@ class JetBrainsCompletionBridge private constructor(
                 rangeEnd = endOffset,
             ),
         )
-        if (!response.success) return null
+        if (!response.success) {
+            throw IllegalStateException(response.error ?: "JetBrains formatter bridge failed")
+        }
         return response.formattedText
+            ?: throw IllegalStateException("JetBrains formatter bridge returned no formatted text")
     }
 
     @Synchronized

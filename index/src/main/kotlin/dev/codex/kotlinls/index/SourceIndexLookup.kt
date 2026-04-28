@@ -14,12 +14,12 @@ object SourceIndexLookup {
         val normalizedPath = path.normalize()
         val ownDeclarations = index.symbolsByPath[normalizedPath].orEmpty()
         val currentModuleName = ownDeclarations.firstOrNull()?.moduleName
+        val token = identifierAt(text, position) ?: return null
         ownDeclarations
-            .filter { contains(it.selectionRange, position) }
+            .filter { it.name == token && contains(it.selectionRange, position) }
             .minByOrNull { spanSize(it.selectionRange) }
             ?.let { return it }
 
-        val token = identifierAt(text, position) ?: return null
         val imports = imports(text)
         val defaultImportedPackages = defaultImportPackages(normalizedPath)
         resolveImported(index, imports, defaultImportedPackages, token, normalizedPath, currentModuleName)?.let { return it }
@@ -154,7 +154,7 @@ object SourceIndexLookup {
             .toList()
 
     private fun contains(range: dev.codex.kotlinls.protocol.Range, position: Position): Boolean =
-        compare(range.start, position) <= 0 && compare(position, range.end) <= 0
+        compare(range.start, position) <= 0 && compare(position, range.end) < 0
 
     private fun compare(left: Position, right: Position): Int =
         when {
