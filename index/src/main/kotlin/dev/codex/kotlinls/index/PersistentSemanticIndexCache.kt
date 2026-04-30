@@ -73,60 +73,62 @@ class PersistentSemanticIndexCache(
         val cacheFile = cacheFile(projectRoot, moduleGradlePath)
         runCatching {
             cacheFile.parent?.createDirectories()
-            val tempFile = cacheFile.resolveSibling("${cacheFile.fileName}.tmp")
-            Json.mapper.writeValue(
-                tempFile.toFile(),
-                PersistedSemanticIndexCache(
-                    schemaVersion = SCHEMA_VERSION,
-                    fingerprint = fingerprint,
-                    projectRoot = projectRoot.normalize().toString(),
-                    moduleGradlePath = moduleGradlePath,
-                    fileContentHashes = fileContentHashes,
-                    symbols = index.symbols.map { symbol ->
-                        PersistedSemanticIndexedSymbol(
-                            id = symbol.id,
-                            name = symbol.name,
-                            fqName = symbol.fqName,
-                            kind = symbol.kind,
-                            path = symbol.path.normalize().toString(),
-                            uri = symbol.uri,
-                            range = symbol.range,
-                            selectionRange = symbol.selectionRange,
-                            containerName = symbol.containerName,
-                            containerFqName = symbol.containerFqName,
-                            signature = symbol.signature,
-                            documentation = symbol.documentation,
-                            packageName = symbol.packageName,
-                            moduleName = symbol.moduleName,
-                            importable = symbol.importable,
-                            receiverType = symbol.receiverType,
-                            resultType = symbol.resultType,
-                            parameterCount = symbol.parameterCount,
-                            supertypes = symbol.supertypes,
-                            parameters = symbol.parameters,
-                            enumEntries = symbol.enumEntries,
-                            enumValue = symbol.enumValue,
-                        )
-                    },
-                    references = index.references.map { reference ->
-                        PersistedSemanticIndexedReference(
-                            symbolId = reference.symbolId,
-                            path = reference.path.normalize().toString(),
-                            uri = reference.uri,
-                            range = reference.range,
-                            containerSymbolId = reference.containerSymbolId,
-                        )
-                    },
-                    callEdges = index.callEdges.map { edge ->
-                        PersistedSemanticCallEdge(
-                            callerSymbolId = edge.callerSymbolId,
-                            calleeSymbolId = edge.calleeSymbolId,
-                            range = edge.range,
-                            path = edge.path.normalize().toString(),
-                        )
-                    },
-                ),
+            val persisted = PersistedSemanticIndexCache(
+                schemaVersion = SCHEMA_VERSION,
+                fingerprint = fingerprint,
+                projectRoot = projectRoot.normalize().toString(),
+                moduleGradlePath = moduleGradlePath,
+                fileContentHashes = fileContentHashes,
+                symbols = index.symbols.map { symbol ->
+                    PersistedSemanticIndexedSymbol(
+                        id = symbol.id,
+                        name = symbol.name,
+                        fqName = symbol.fqName,
+                        kind = symbol.kind,
+                        path = symbol.path.normalize().toString(),
+                        uri = symbol.uri,
+                        range = symbol.range,
+                        selectionRange = symbol.selectionRange,
+                        containerName = symbol.containerName,
+                        containerFqName = symbol.containerFqName,
+                        signature = symbol.signature,
+                        documentation = symbol.documentation,
+                        packageName = symbol.packageName,
+                        moduleName = symbol.moduleName,
+                        importable = symbol.importable,
+                        receiverType = symbol.receiverType,
+                        resultType = symbol.resultType,
+                        parameterCount = symbol.parameterCount,
+                        supertypes = symbol.supertypes,
+                        parameters = symbol.parameters,
+                        enumEntries = symbol.enumEntries,
+                        enumValue = symbol.enumValue,
+                    )
+                },
+                references = index.references.map { reference ->
+                    PersistedSemanticIndexedReference(
+                        symbolId = reference.symbolId,
+                        path = reference.path.normalize().toString(),
+                        uri = reference.uri,
+                        range = reference.range,
+                        containerSymbolId = reference.containerSymbolId,
+                    )
+                },
+                callEdges = index.callEdges.map { edge ->
+                    PersistedSemanticCallEdge(
+                        callerSymbolId = edge.callerSymbolId,
+                        calleeSymbolId = edge.calleeSymbolId,
+                        range = edge.range,
+                        path = edge.path.normalize().toString(),
+                    )
+                },
             )
+            val nextContent = Json.mapper.writeValueAsString(persisted)
+            if (cacheFile.exists() && Files.readString(cacheFile) == nextContent) {
+                return@runCatching
+            }
+            val tempFile = cacheFile.resolveSibling("${cacheFile.fileName}.tmp")
+            Files.writeString(tempFile, nextContent)
             Files.move(tempFile, cacheFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
         }
     }

@@ -81,6 +81,51 @@ fun editorParitySuite(): TestSuite {
                     "Expected lightweight enum entry completions, got ${labels.take(10)}"
                 }
             },
+            TestCase("offers implicit it member completions from the lightweight source index") {
+                val root = FixtureSupport.fixtureCopy("simple-jvm-app")
+                val project = importer.importProject(root)
+                val file = root.resolve("src/main/kotlin/demo/ImplicitItCompletion.kt")
+                val content = """
+                    package demo
+
+                    import java.util.UUID
+
+                    data class IncidentShareItem(
+                        val incident: String,
+                        val distanceInMiles: Double?,
+                    )
+
+                    class ManageAccessViewModel(
+                        private val incidentsById: Map<UUID, IncidentShareItem>,
+                    ) {
+                        private val sortedIncidents: List<IncidentShareItem>
+                            get() = incidentsById.values.sortedWith(
+                                compareBy(
+                                    { it.distanceInMiles == null },
+                                    { it.distanceInMiles },
+                                    { it.incide }
+                                )
+                            )
+                    }
+                """.trimIndent() + "\n"
+                file.writeText(content)
+                val index = lightweightIndexBuilder.build(project, TextDocumentStore())
+                val line = content.lines().indexOfFirst { it.contains("it.incide") }
+                val column = content.lines()[line].indexOf("incide") + "incide".length
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = file,
+                    text = content,
+                    params = CompletionParams(
+                        textDocument = TextDocumentIdentifier(file.toUri().toString()),
+                        position = Position(line, column),
+                    ),
+                )
+                val labels = completions.items.take(10).map { it.label }
+                assertTrue("incident" in labels) {
+                    "Expected lightweight implicit it member completion for incident, got $labels"
+                }
+            },
             TestCase("resolves workspace definitions from the lightweight source index") {
                 val root = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(root)

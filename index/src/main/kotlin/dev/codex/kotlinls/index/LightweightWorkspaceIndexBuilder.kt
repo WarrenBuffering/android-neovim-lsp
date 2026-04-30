@@ -664,7 +664,7 @@ class LightweightWorkspaceIndexBuilder(
         current == 1 || current == total || current % 50 == 0
 
     companion object {
-        private const val SCHEMA_VERSION = 5
+        private const val SCHEMA_VERSION = 6
         private val SOURCE_FILE_EXTENSIONS = setOf("kt", "kts", "java")
 
         private fun defaultIndexCacheRoot(): Path {

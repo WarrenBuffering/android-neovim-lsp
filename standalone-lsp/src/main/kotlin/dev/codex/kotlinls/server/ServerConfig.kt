@@ -29,6 +29,11 @@ internal data class KotlinLsConfig(
                     mode = ProgressMode.from(parsed.progress.mode),
                 ),
                 diagnostics = DiagnosticsConfig(
+                    bridgeEnabled = parsed.diagnostics.bridgeEnabled
+                        ?: DiagnosticsConfig().bridgeEnabled,
+                    bridgeTimeoutMillis = parsed.diagnostics.bridgeTimeoutMillis
+                        ?.coerceAtLeast(100L)
+                        ?: DiagnosticsConfig().bridgeTimeoutMillis,
                     fastDebounceMillis = parsed.diagnostics.fastDebounceMillis
                         ?.coerceAtLeast(0L)
                         ?: DiagnosticsConfig().fastDebounceMillis,
@@ -53,6 +58,8 @@ internal data class ProgressConfig(
 )
 
 internal data class DiagnosticsConfig(
+    val bridgeEnabled: Boolean = false,
+    val bridgeTimeoutMillis: Long = 30_000L,
     val fastDebounceMillis: Long = 0L,
     val semanticDebounceMillis: Long = 250L,
 )
@@ -117,6 +124,10 @@ private data class RawProgressConfig(
 )
 
 private data class RawDiagnosticsConfig(
+    @param:JsonProperty("bridge")
+    val bridgeEnabled: Boolean? = null,
+    @param:JsonProperty("bridge_timeout_ms")
+    val bridgeTimeoutMillis: Long? = null,
     @param:JsonProperty("fast_debounce_ms")
     val fastDebounceMillis: Long? = null,
     @param:JsonProperty("semantic_debounce_ms")

@@ -61,8 +61,8 @@ class KotlinSourceIndexer : AutoCloseable {
                     uri = path.toDocumentUri(),
                     range = ktFile.rangeOf(declaration.textRange.startOffset, declaration.textRange.endOffset),
                     selectionRange = ktFile.rangeOf(selectionTarget.textRange.startOffset, selectionTarget.textRange.endOffset),
-                    containerName = declaration.containingClassOrObject?.name,
-                    containerFqName = declaration.containingClassOrObject?.let { owner ->
+                    containerName = declaration.indexedContainer()?.name,
+                    containerFqName = declaration.indexedContainer()?.let { owner ->
                         owner.indexedFqName(packageName, owner.name)
                     },
                     signature = declaration.signatureText(),
@@ -105,6 +105,11 @@ class KotlinSourceIndexer : AutoCloseable {
                 declarations.forEach { child ->
                     addAll(child.collectIndexableDeclarations())
                 }
+                if (this@collectIndexableDeclarations is KtClass) {
+                    primaryConstructorParameters
+                        .filter { parameter -> parameter.hasValOrVar() }
+                        .forEach { parameter -> add(parameter) }
+                }
                 primaryConstructor?.let { add(it) }
                 secondaryConstructors.forEach { add(it) }
             }
@@ -112,6 +117,7 @@ class KotlinSourceIndexer : AutoCloseable {
 
     private fun KtNamedDeclaration.isIndexCandidate(): Boolean {
         if (this is KtProperty && isLocal) return false
+        if (this is KtParameter && hasValOrVar() && containingClassOrObject is KtClass) return true
         if (this is KtEnumEntry) return true
         val parent = parent
         return parent is KtFile || parent is KtClassOrObject || this is KtConstructor<*>
@@ -134,6 +140,9 @@ class KotlinSourceIndexer : AutoCloseable {
         return (listOfNotNull(packageName.takeIf { it.isNotBlank() }) + owners + name).joinToString(".")
     }
 
+    private fun KtNamedDeclaration.indexedContainer(): KtClassOrObject? =
+        containingClassOrObject ?: parentsWithSelf.filterIsInstance<KtClassOrObject>().firstOrNull()
+
     private fun KtNamedDeclaration.indexedKind(): Int = when {
         this is KtEnumEntry -> SymbolKind.ENUM_MEMBER
         this is KtClass && isInterface() -> SymbolKind.INTERFACE
@@ -155,6 +164,7 @@ class KotlinSourceIndexer : AutoCloseable {
         is KtConstructor<*> -> containingClassOrObject?.indexedFqName(packageName, containingClassOrObject?.name)
         is KtNamedFunction -> typeReference?.text
         is KtProperty -> typeReference?.text ?: initializer?.inferredResultType(containingKtFile, packageName)
+        is KtParameter -> typeReference?.text
         is KtClassOrObject -> fqName
         else -> null
     }

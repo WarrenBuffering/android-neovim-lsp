@@ -2,6 +2,7 @@ package dev.codex.kotlinls.completion
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.module.kotlin.readValue
+import dev.codex.kotlinls.protocol.Diagnostic
 import dev.codex.kotlinls.protocol.Json
 import dev.codex.kotlinls.protocol.Hover
 import dev.codex.kotlinls.protocol.IntellijHomeLocator
@@ -22,6 +23,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.io.path.name
 import kotlin.io.path.readLines
@@ -43,6 +45,14 @@ class JetBrainsCompletionBridge private constructor(
     private val socket: Socket
     private val reader: BufferedReader
     private val writer: BufferedWriter
+    private val statusLock = Any()
+    private val requestedPluginIds = requestedBridgePluginIds(ideaHome)
+    private val requiredPluginIds = requiredBridgePluginIds(requestedPluginIds)
+    private var currentRequest: BridgeRequestStatus? = null
+    private var requestCount: Long = 0
+    private var successCount: Long = 0
+    private var failureCount: Long = 0
+    private var lastRequest: BridgeFinishedRequestStatus? = null
 
     init {
         val pluginDir = preparePluginDir()
@@ -60,8 +70,8 @@ class JetBrainsCompletionBridge private constructor(
                 add("-Didea.log.path=${sandboxRoot.resolve("log")}")
                 add("-Dapple.awt.UIElement=true")
                 add("-Didea.kotlin.plugin.use.k2=true")
-                add("-Didea.load.plugins.id=org.jetbrains.kotlin,com.intellij.java,dev.codex.kotlinls.jetbrains-bridge")
-                add("-Didea.required.plugins.id=org.jetbrains.kotlin,com.intellij.java,dev.codex.kotlinls.jetbrains-bridge")
+                add("-Didea.load.plugins.id=${requestedPluginIds.joinToString(",")}")
+                add("-Didea.required.plugins.id=${requiredPluginIds.joinToString(",")}")
                 add("-cp")
                 add(classpath.joinToString(":"))
                 add(mainClass)
@@ -99,6 +109,34 @@ class JetBrainsCompletionBridge private constructor(
 
     val detectedIdeaHome: Path
         get() = ideaHome
+
+    fun statusSnapshot(): Map<String, Any?> {
+        val alive = runCatching { process.isAlive }.getOrDefault(false)
+        val socketOpen = runCatching { socket.isConnected && !socket.isClosed }.getOrDefault(false)
+        return synchronized(statusLock) {
+            val current = currentRequest
+            mapOf(
+                "state" to when {
+                    current != null -> "running"
+                    !alive || !socketOpen -> "crashed"
+                    else -> "idle"
+                },
+                "pid" to runCatching { process.pid() }.getOrNull(),
+                "alive" to alive,
+                "socketOpen" to socketOpen,
+                "ideaHome" to ideaHome.toString(),
+                "sandboxRoot" to sandboxRoot.toString(),
+                "plugins" to requestedPluginIds,
+                "requests" to mapOf(
+                    "total" to requestCount,
+                    "succeeded" to successCount,
+                    "failed" to failureCount,
+                ),
+                "currentRequest" to current?.toMap(),
+                "lastRequest" to lastRequest?.toMap(),
+            )
+        }
+    }
 
     @Synchronized
     fun syncDocument(
@@ -171,6 +209,22 @@ class JetBrainsCompletionBridge private constructor(
         )
         if (!response.success) return null
         return response.locations.map { it.toProtocol() }
+    }
+
+    @Synchronized
+    fun diagnostics(
+        projectRoot: Path,
+        filePath: Path,
+        text: String,
+    ): List<Diagnostic>? {
+        val response = sendRequest(
+            method = "diagnostics",
+            payload = payloadFor(projectRoot, filePath, text, offset = 0, limit = 0),
+        )
+        if (!response.success) {
+            throw IllegalStateException(response.error ?: "JetBrains diagnostics bridge failed")
+        }
+        return response.diagnostics.map { it.toProtocol() }
     }
 
     @Synchronized
@@ -274,15 +328,104 @@ class JetBrainsCompletionBridge private constructor(
         method: String,
         payload: CompletionPayload,
     ): BridgeResponse {
+        val requestId = requestIds.getAndIncrement()
         val request = BridgeRequest(
-            id = requestIds.getAndIncrement(),
+            id = requestId,
             method = method,
             payload = payload,
         )
-        writer.write(Json.mapper.writeValueAsString(request))
-        writer.write('\n'.code)
-        writer.flush()
-        return readResponse()
+        beginRequest(requestId, method, payload)
+        val startedAtMillis = System.currentTimeMillis()
+        return try {
+            writer.write(Json.mapper.writeValueAsString(request))
+            writer.write('\n'.code)
+            writer.flush()
+            val response = readResponse()
+            finishRequest(
+                id = requestId,
+                method = method,
+                payload = payload,
+                durationMillis = System.currentTimeMillis() - startedAtMillis,
+                success = response.success,
+                message = response.message,
+                error = response.error,
+                itemCount = response.items.size,
+                locationCount = response.locations.size,
+                diagnosticCount = response.diagnostics.size,
+                diagnosticSummaries = response.diagnostics.take(20).map { it.toStatusMap() },
+            )
+            response
+        } catch (error: Throwable) {
+            finishRequest(
+                id = requestId,
+                method = method,
+                payload = payload,
+                durationMillis = System.currentTimeMillis() - startedAtMillis,
+                success = false,
+                message = null,
+                error = error.message ?: error::class.java.simpleName,
+                itemCount = 0,
+                locationCount = 0,
+                diagnosticCount = 0,
+                diagnosticSummaries = emptyList(),
+            )
+            throw error
+        }
+    }
+
+    private fun beginRequest(id: Long, method: String, payload: CompletionPayload) {
+        val now = System.currentTimeMillis()
+        synchronized(statusLock) {
+            requestCount += 1
+            currentRequest = BridgeRequestStatus(
+                id = id,
+                method = method,
+                filePath = payload.filePath.takeIf(String::isNotBlank),
+                projectRoot = payload.projectRoot.takeIf(String::isNotBlank),
+                startedAtMillis = now,
+            )
+        }
+    }
+
+    private fun finishRequest(
+        id: Long,
+        method: String,
+        payload: CompletionPayload,
+        durationMillis: Long,
+        success: Boolean,
+        message: String?,
+        error: String?,
+        itemCount: Int,
+        locationCount: Int,
+        diagnosticCount: Int,
+        diagnosticSummaries: List<Map<String, Any?>>,
+    ) {
+        val now = System.currentTimeMillis()
+        synchronized(statusLock) {
+            if (currentRequest?.id == id) {
+                currentRequest = null
+            }
+            if (success) {
+                successCount += 1
+            } else {
+                failureCount += 1
+            }
+            lastRequest = BridgeFinishedRequestStatus(
+                id = id,
+                method = method,
+                filePath = payload.filePath.takeIf(String::isNotBlank),
+                projectRoot = payload.projectRoot.takeIf(String::isNotBlank),
+                durationMillis = durationMillis.coerceAtLeast(0),
+                success = success,
+                message = message,
+                error = error,
+                itemCount = itemCount,
+                locationCount = locationCount,
+                diagnosticCount = diagnosticCount,
+                diagnostics = diagnosticSummaries,
+                finishedAtMillis = now,
+            )
+        }
     }
 
     private fun preparePluginDir(): Path {
@@ -313,6 +456,10 @@ class JetBrainsCompletionBridge private constructor(
     }
 
     companion object {
+        private val lastStartupFailure = AtomicReference<String?>(null)
+
+        fun lastStartupFailure(): String? = lastStartupFailure.get()
+
         fun detect(forceEnable: Boolean = false, projectRoot: Path? = null): JetBrainsCompletionBridge? {
             IntellijHomeLocator.configuredIdeaHome(projectRoot)?.let { configured ->
                 val pluginJar = locatePluginJar() ?: return null
@@ -339,6 +486,42 @@ class JetBrainsCompletionBridge private constructor(
             (System.getProperty("kotlinls.enableIntellijBridge")
                 ?: System.getenv("KOTLINLS_ENABLE_INTELLIJ_BRIDGE"))
                 ?.equals("true", ignoreCase = true) == true
+
+        private fun requestedBridgePluginIds(ideaHome: Path): List<String> {
+            val pluginsRoot = ideaHome.resolve("plugins")
+            fun hasPluginDir(name: String): Boolean = Files.isDirectory(pluginsRoot.resolve(name))
+            return buildList {
+                add("org.jetbrains.kotlin")
+                add("com.intellij.java")
+                if (hasPluginDir("json")) add("com.intellij.modules.json")
+                if (hasPluginDir("properties")) add("com.intellij.properties")
+                if (hasPluginDir("toml")) add("org.toml.lang")
+                if (hasPluginDir("Groovy")) add("org.intellij.groovy")
+                if (hasPluginDir("junit")) add("JUnit")
+                if (hasPluginDir("webp")) add("intellij.webp")
+                if (hasPluginDir("gradle")) add("com.intellij.gradle")
+                if (hasPluginDir("gradle-java")) add("org.jetbrains.plugins.gradle")
+                if (hasPluginDir("smali")) add("com.android.tools.idea.smali")
+                if (hasPluginDir("gradle-declarative")) add("com.android.tools.gradle.dcl")
+                if (hasPluginDir("android")) add("org.jetbrains.android")
+                if (hasPluginDir("compose-ide-plugin")) add("com.intellij.compose")
+                if (hasPluginDir("android-compose-ide-plugin")) add("androidx.compose.plugins.idea")
+                add("dev.codex.kotlinls.jetbrains-bridge")
+            }.distinct()
+        }
+
+        private fun requiredBridgePluginIds(requestedPluginIds: List<String>): List<String> {
+            val mandatoryIfRequested = setOf(
+                "org.jetbrains.kotlin",
+                "com.intellij.java",
+                "com.intellij.gradle",
+                "org.jetbrains.plugins.gradle",
+                "org.jetbrains.android",
+                "androidx.compose.plugins.idea",
+                "dev.codex.kotlinls.jetbrains-bridge",
+            )
+            return requestedPluginIds.filter(mandatoryIfRequested::contains)
+        }
 
         private fun fromIdeaHome(
             ideaHome: Path,
@@ -405,6 +588,13 @@ class JetBrainsCompletionBridge private constructor(
                     pluginJar = pluginJar,
                     extraPluginJars = extraPluginJars,
                 )
+            }.onSuccess {
+                lastStartupFailure.set(null)
+            }.onFailure { error ->
+                val message = "JetBrains bridge startup failed for $normalizedHome: ${error.message ?: error::class.java.simpleName}"
+                lastStartupFailure.set(message)
+                System.err.println("[android-neovim-lsp] $message")
+                error.printStackTrace(System.err)
             }.getOrNull()
         }
 
@@ -478,6 +668,57 @@ private data class BridgeRequest(
     val payload: CompletionPayload? = null,
 )
 
+private data class BridgeRequestStatus(
+    val id: Long,
+    val method: String,
+    val filePath: String?,
+    val projectRoot: String?,
+    val startedAtMillis: Long,
+) {
+    fun toMap(): Map<String, Any?> =
+        mapOf(
+            "id" to id,
+            "method" to method,
+            "filePath" to filePath,
+            "projectRoot" to projectRoot,
+            "startedAtMillis" to startedAtMillis,
+            "durationMillis" to (System.currentTimeMillis() - startedAtMillis).coerceAtLeast(0),
+        )
+}
+
+private data class BridgeFinishedRequestStatus(
+    val id: Long,
+    val method: String,
+    val filePath: String?,
+    val projectRoot: String?,
+    val durationMillis: Long,
+    val success: Boolean,
+    val message: String?,
+    val error: String?,
+    val itemCount: Int,
+    val locationCount: Int,
+    val diagnosticCount: Int,
+    val diagnostics: List<Map<String, Any?>>,
+    val finishedAtMillis: Long,
+) {
+    fun toMap(): Map<String, Any?> =
+        mapOf(
+            "id" to id,
+            "method" to method,
+            "filePath" to filePath,
+            "projectRoot" to projectRoot,
+            "durationMillis" to durationMillis,
+            "success" to success,
+            "message" to message,
+            "error" to error,
+            "itemCount" to itemCount,
+            "locationCount" to locationCount,
+            "diagnosticCount" to diagnosticCount,
+            "diagnostics" to diagnostics,
+            "finishedAtMillis" to finishedAtMillis,
+        )
+}
+
 private data class CompletionPayload(
     val projectRoot: String,
     val filePath: String,
@@ -497,8 +738,37 @@ private data class BridgeResponse(
     val locations: List<BridgeLocation> = emptyList(),
     val hoverMarkdown: String? = null,
     val formattedText: String? = null,
+    val diagnostics: List<BridgeDiagnostic> = emptyList(),
     val error: String? = null,
 )
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+private data class BridgeDiagnostic(
+    val range: BridgeRange = BridgeRange(),
+    val severity: Int = 1,
+    val code: String? = null,
+    val source: String? = null,
+    val message: String = "",
+) {
+    fun toProtocol(): Diagnostic =
+        Diagnostic(
+            range = range.toProtocol(),
+            severity = severity,
+            code = code?.takeIf { it.isNotBlank() },
+            source = source?.takeIf { it.isNotBlank() },
+            message = message,
+        )
+
+    fun toStatusMap(): Map<String, Any?> =
+        mapOf(
+            "line" to range.start.line,
+            "character" to range.start.character,
+            "severity" to severity,
+            "code" to code,
+            "source" to source,
+            "message" to message,
+        )
+}
 
 @JsonIgnoreProperties(ignoreUnknown = true)
 private data class BridgeLocation(

@@ -366,6 +366,7 @@ local function split_setup_opts(opts)
     or default_hover_bottom_padding_lines
   local plugin_opts = {
     inlay_hints_enabled = opts and opts.inlay_hints,
+    bridge_diagnostics_enabled = opts == nil or opts.bridge_diagnostics ~= false,
     format_on_save_enabled = opts and opts.format_on_save == true,
     format_timeout_ms = format_timeout_ms,
     hover_bottom_padding_lines = math.max(hover_bottom_padding_lines, 0),
@@ -378,6 +379,7 @@ local function split_setup_opts(opts)
   }
   plugin_opts.install.version = opts and opts.version or nil
   lsp_opts.inlay_hints = nil
+  lsp_opts.bridge_diagnostics = nil
   lsp_opts.format_on_save = nil
   lsp_opts.format_timeout_ms = nil
   lsp_opts.hover_bottom_padding_lines = nil
@@ -1295,6 +1297,17 @@ local function percent_text(value)
   return string.format("%.1f%%", as_number(value, 0))
 end
 
+local function list_text(value)
+  if type(value) ~= "table" or vim.tbl_isempty(value) then
+    return "none"
+  end
+  local items = {}
+  for _, item in ipairs(value) do
+    table.insert(items, tostring(item))
+  end
+  return table.concat(items, ", ")
+end
+
 local function append_index_overview(lines, report)
   if not report.projectLoaded then
     table.insert(lines, "Project: not loaded")
@@ -1429,6 +1442,144 @@ local function render_index_status(report, view)
   return lines
 end
 
+local function append_request_details(lines, label, request)
+  if type(request) ~= "table" then
+    table.insert(lines, "    " .. label .. ": none")
+    return
+  end
+  table.insert(lines, string.format(
+    "    %s: #%s %s, %sms, success: %s",
+    label,
+    tostring(request.id or "?"),
+    tostring(request.method or "unknown"),
+    tostring(request.durationMillis or "?"),
+    yes_no(request.success)
+  ))
+  if request.filePath and request.filePath ~= "" then
+    table.insert(lines, "      file: " .. tostring(request.filePath))
+  end
+  if request.message and request.message ~= "" then
+    table.insert(lines, "      message: " .. tostring(request.message))
+  end
+  if request.error and request.error ~= "" then
+    table.insert(lines, "      error: " .. tostring(request.error))
+  end
+  if request.diagnosticCount ~= nil then
+    table.insert(lines, string.format(
+      "      results: %d diagnostics, %d completions, %d locations",
+      as_number(request.diagnosticCount),
+      as_number(request.itemCount),
+      as_number(request.locationCount)
+    ))
+  end
+  local diagnostics = request.diagnostics or {}
+  if type(diagnostics) == "table" and #diagnostics > 0 then
+    table.insert(lines, "      diagnostics:")
+    for index, diagnostic in ipairs(diagnostics) do
+      if index > 10 then
+        table.insert(lines, string.format("        ... %d more", #diagnostics - 10))
+        break
+      end
+      table.insert(lines, string.format(
+        "        %s:%s [%s/%s] %s",
+        tostring((diagnostic.line or 0) + 1),
+        tostring((diagnostic.character or 0) + 1),
+        tostring(diagnostic.severity or "?"),
+        tostring(diagnostic.code or diagnostic.source or "diagnostic"),
+        tostring(diagnostic.message or "")
+      ))
+    end
+  end
+end
+
+local function render_bridge_status(report)
+  local lines = {
+    "Android Neovim LSP Bridge Status",
+    string.rep("=", 33),
+    "",
+  }
+  table.insert(lines, "Project: " .. (report.projectLoaded and tostring(report.root or "loaded") or "not loaded"))
+  table.insert(lines, "Backend: " .. tostring(report.backend or "unknown"))
+  local diagnostics = report.diagnostics or {}
+  table.insert(lines, string.format(
+    "Diagnostics bridge: requested: %s, enabled: %s, timeout: %sms",
+    yes_no(diagnostics.bridgeRequested),
+    yes_no(diagnostics.bridgeEnabled),
+    tostring(diagnostics.bridgeTimeoutMillis or "?")
+  ))
+
+  local scheduler = report.diagnosticScheduler or {}
+  table.insert(lines, "")
+  table.insert(lines, "Diagnostics Scheduler")
+  table.insert(lines, string.format(
+    "  running: %s, generation: %s, pending full refresh: %s",
+    yes_no(scheduler.running),
+    tostring(scheduler.generation or "?"),
+    yes_no(scheduler.pendingFullRefresh)
+  ))
+  table.insert(lines, "  pending uris: " .. list_text(scheduler.pendingUris))
+  table.insert(lines, "  forced uris: " .. list_text(scheduler.forceUris))
+  table.insert(lines, "  deferred uris: " .. list_text(scheduler.deferredUris))
+  if scheduler.publishDueInMillis ~= nil then
+    table.insert(lines, "  next publish due in: " .. tostring(scheduler.publishDueInMillis) .. "ms")
+  end
+
+  table.insert(lines, "")
+  table.insert(lines, "Bridges")
+  local bridges = report.bridges or {}
+  if #bridges == 0 then
+    table.insert(lines, "  No bridges are configured or visible to the server.")
+    return lines
+  end
+  for _, bridge in ipairs(bridges) do
+    local runtime = bridge.runtime or {}
+    local sync = bridge.sync or {}
+    local requests = runtime.requests or {}
+    table.insert(lines, string.format(
+      "  %s: %s",
+      tostring(bridge.name or bridge.type or "bridge"),
+      tostring(bridge.state or runtime.state or "unknown")
+    ))
+    if bridge.startupError then
+      table.insert(lines, "    startup error: " .. tostring(bridge.startupError))
+    end
+    table.insert(lines, "    features: " .. list_text(bridge.features))
+    table.insert(lines, string.format(
+      "    pid: %s, alive: %s, socket: %s",
+      tostring(runtime.pid or "none"),
+      yes_no(runtime.alive),
+      yes_no(runtime.socketOpen)
+    ))
+    if runtime.ideaHome then
+      table.insert(lines, "    idea home: " .. tostring(runtime.ideaHome))
+    end
+    if type(runtime.plugins) == "table" and #runtime.plugins > 0 then
+      table.insert(lines, "    loaded plugins: " .. list_text(runtime.plugins))
+    end
+    table.insert(lines, string.format(
+      "    requests: %d total, %d succeeded, %d failed",
+      as_number(requests.total),
+      as_number(requests.succeeded),
+      as_number(requests.failed)
+    ))
+    append_request_details(lines, "current", runtime.currentRequest)
+    append_request_details(lines, "last", runtime.lastRequest)
+    table.insert(lines, string.format(
+      "    foreground requests: %d, in-flight server requests: %d",
+      as_number(bridge.foregroundRequests),
+      type(bridge.inFlightRequests) == "table" and #bridge.inFlightRequests or 0
+    ))
+    table.insert(lines, string.format(
+      "    sync: startup scheduled: %s, drain scheduled: %s, pending warmups: %d, pending documents: %d",
+      yes_no(sync.startupScheduled),
+      yes_no(sync.syncDrainScheduled),
+      type(sync.pendingProjectWarmups) == "table" and #sync.pendingProjectWarmups or 0,
+      type(sync.pendingDocumentSyncs) == "table" and #sync.pendingDocumentSyncs or 0
+    ))
+  end
+  return lines
+end
+
 local function open_status_buffer(title, lines)
   local buf = vim.api.nvim_create_buf(false, true)
   local uv = vim.uv or vim.loop
@@ -1437,7 +1588,21 @@ local function open_status_buffer(title, lines)
   vim.bo[buf].bufhidden = "wipe"
   vim.bo[buf].swapfile = false
   vim.bo[buf].filetype = "android-neovim-lsp-status"
-  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  local normalized_lines = {}
+  for _, line in ipairs(lines or {}) do
+    local text = tostring(line or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    local start = 1
+    while true do
+      local newline = text:find("\n", start, true)
+      if not newline then
+        table.insert(normalized_lines, text:sub(start))
+        break
+      end
+      table.insert(normalized_lines, text:sub(start, newline - 1))
+      start = newline + 1
+    end
+  end
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, normalized_lines)
   vim.bo[buf].modifiable = false
   vim.cmd("botright split")
   vim.api.nvim_win_set_buf(0, buf)
@@ -1459,16 +1624,19 @@ local function request_index_status(view)
     command = "kotlinls.indexedFiles"
   elseif view == "cache" then
     command = "kotlinls.cacheStatus"
+  elseif view == "bridges" then
+    command = "kotlinls.bridgeStatus"
   end
   client.request("workspace/executeCommand", { command = command }, function(err, result)
     if err then
       vim.schedule(function()
-        echo_bottom("Index status failed: " .. tostring(err.message or err), "ErrorMsg")
+        echo_bottom("Status request failed: " .. tostring(err.message or err), "ErrorMsg")
       end)
       return
     end
     vim.schedule(function()
-      open_status_buffer("android-neovim-lsp://" .. view, render_index_status(result or {}, view))
+      local lines = view == "bridges" and render_bridge_status(result or {}) or render_index_status(result or {}, view)
+      open_status_buffer("android-neovim-lsp://" .. view, lines)
     end)
   end, 0)
 end
@@ -1489,6 +1657,9 @@ local function open_help()
     "",
     ":AndroidNeovimLspCacheStatus",
     "  Show compiler analysis modules and dependency package cache state.",
+    "",
+    ":AndroidNeovimLspBridgeStatus",
+    "  Show JetBrains bridge lifecycle state, active request, last request, diagnostics queue, and pending document syncs.",
     "",
     "Status views are scratch buffers. Press q to close them.",
   })
@@ -1511,6 +1682,9 @@ local function register_user_commands()
   vim.api.nvim_create_user_command("AndroidNeovimLspCacheStatus", function()
     request_index_status("cache")
   end, { desc = "Show android-neovim-lsp cache status", force = true })
+  vim.api.nvim_create_user_command("AndroidNeovimLspBridgeStatus", function()
+    request_index_status("bridges")
+  end, { desc = "Show android-neovim-lsp bridge status", force = true })
   vim.api.nvim_create_user_command("AndroidNeovimLspFormat", function()
     M.format({ bufnr = vim.api.nvim_get_current_buf(), manual = true })
   end, { desc = "Format current buffer with android-neovim-lsp", force = true })
@@ -1624,6 +1798,7 @@ function M.default_config(opts)
     "force",
     init_options.diagnostics or {},
     {
+      bridge = plugin_opts.bridge_diagnostics_enabled,
       fast_debounce_ms = diagnostics_debounce_ms,
     }
   )

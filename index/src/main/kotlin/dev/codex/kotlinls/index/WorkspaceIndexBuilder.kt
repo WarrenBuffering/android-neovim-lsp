@@ -33,6 +33,7 @@ import org.jetbrains.kotlin.psi.psiUtil.containingClassOrObject
 import org.jetbrains.kotlin.psi.psiUtil.parentsWithSelf
 import org.jetbrains.kotlin.resolve.BindingContext
 import org.jetbrains.kotlin.resolve.DescriptorUtils
+import org.jetbrains.kotlin.types.KotlinType
 import java.nio.file.Path
 import java.nio.file.Files
 import kotlin.io.path.extension
@@ -59,7 +60,7 @@ class WorkspaceIndexBuilder(
 
         val totalFiles = filteredFiles.size.coerceAtLeast(1)
         filteredFiles.forEachIndexed { index, file ->
-            file.ktFile.collectDescendantsOfType<KtNamedDeclaration>().forEach { declaration ->
+            file.ktFile.indexableDeclarations().forEach { declaration ->
                 declaration.name ?: return@forEach
                 val symbol = declaration.toIndexedSymbol(file, snapshot.bindingContext)
                 symbolAccumulator += symbol
@@ -118,6 +119,20 @@ class WorkspaceIndexBuilder(
     private fun shouldReportProgress(current: Int, total: Int): Boolean =
         current == 1 || current == total || current % 25 == 0
 
+    private fun KtFile.indexableDeclarations(): List<KtNamedDeclaration> {
+        val declarations = collectDescendantsOfType<KtNamedDeclaration>().toMutableList()
+        collectDescendantsOfType<KtClass>().forEach { ktClass ->
+            ktClass.primaryConstructorParameters
+                .filter { parameter -> parameter.hasValOrVar() }
+                .forEach { parameter ->
+                    if (parameter !in declarations) {
+                        declarations += parameter
+                    }
+                }
+        }
+        return declarations
+    }
+
     private fun KtNamedDeclaration.toIndexedSymbol(
         file: AnalyzedFile,
         bindingContext: BindingContext,
@@ -145,7 +160,7 @@ class WorkspaceIndexBuilder(
             uri = file.uri,
             range = file.ktFile.rangeOf(textRange.startOffset, textRange.endOffset),
             selectionRange = file.ktFile.rangeOf(selectionTarget.textRange.startOffset, selectionTarget.textRange.endOffset),
-            containerName = containingClassOrObject?.name,
+            containerName = containingClassName(descriptor?.descriptor),
             containerFqName = containingTypeFqName(descriptor?.descriptor),
             signature = signatureText(),
             documentation = KDocMarkdownRenderer.render(docComment),
@@ -200,9 +215,17 @@ class WorkspaceIndexBuilder(
         val original: DeclarationDescriptor,
     )
 
+    private fun KtNamedDeclaration.containingClassName(descriptor: DeclarationDescriptor?): String? =
+        containingClassOrObject?.name
+            ?: ((descriptor as? ValueParameterDescriptor)?.containingDeclaration as? ConstructorDescriptor)
+                ?.constructedClass
+                ?.name
+                ?.asString()
+
     private fun containingTypeFqName(descriptor: DeclarationDescriptor?): String? =
         when (val container = descriptor?.containingDeclaration) {
             is ClassDescriptor -> DescriptorUtils.getFqNameSafe(container).asString()
+            is ConstructorDescriptor -> DescriptorUtils.getFqNameSafe(container.constructedClass).asString()
             else -> null
         }
 
@@ -218,18 +241,24 @@ class WorkspaceIndexBuilder(
     private fun resultType(descriptor: DeclarationDescriptor?): String? =
         when (descriptor) {
             is ConstructorDescriptor -> descriptor.constructedClass.let { DescriptorUtils.getFqNameSafe(it).asString() }
-            is FunctionDescriptor -> descriptor.returnType?.constructor?.declarationDescriptor?.let { DescriptorUtils.getFqNameSafe(it).asString() }
-                ?: descriptor.returnType?.toString()
+            is FunctionDescriptor -> descriptor.returnType.typeName()
 
-            is PropertyDescriptor -> descriptor.type.constructor.declarationDescriptor?.let { DescriptorUtils.getFqNameSafe(it).asString() }
-                ?: descriptor.type.toString()
+            is PropertyDescriptor -> descriptor.type.typeName()
 
-            is VariableDescriptor -> descriptor.type.constructor.declarationDescriptor?.let { DescriptorUtils.getFqNameSafe(it).asString() }
-                ?: descriptor.type.toString()
+            is VariableDescriptor -> descriptor.type.typeName()
 
             is ClassDescriptor -> DescriptorUtils.getFqNameSafe(descriptor).asString()
             else -> null
         }
+
+    private fun KotlinType?.typeName(): String? {
+        val type = this ?: return null
+        val rendered = type.toString()
+        if ('<' in rendered) return rendered
+        return type.constructor.declarationDescriptor
+            ?.let { DescriptorUtils.getFqNameSafe(it).asString() }
+            ?: rendered
+    }
 
     private fun parameterCount(descriptor: DeclarationDescriptor?): Int =
         (descriptor as? CallableDescriptor)?.valueParameters?.size ?: 0

@@ -539,6 +539,71 @@ fun featureSuite(): TestSuite {
                     "Expected member completion to exclude unrelated globals, got $labels"
                 }
             },
+            TestCase("infers implicit it members inside comparator lambdas from the sorted receiver") {
+                val root = FixtureSupport.fixture("simple-jvm-app")
+                val project = importer.importProject(root)
+                val store = TextDocumentStore()
+                val appFile = root.resolve("src/main/kotlin/demo/App.kt")
+                val content = """
+                    package demo
+
+                    import java.util.UUID
+
+                    data class IncidentShareItem(
+                        val incident: String,
+                        val distanceInMiles: Double?,
+                    )
+
+                    class ManageAccessViewModel(
+                        private val incidentsById: Map<UUID, IncidentShareItem>,
+                    ) {
+                        private val sortedIncidents: List<IncidentShareItem>
+                            get() = incidentsById.values.sortedWith(
+                                compareBy(
+                                    { it.distanceInMiles == null },
+                                    { it.distanceInMiles },
+                                    { it.incide }
+                                )
+                            )
+                    }
+                """.trimIndent()
+                store.open(
+                    dev.codex.kotlinls.protocol.TextDocumentItem(
+                        uri = appFile.toUri().toString(),
+                        languageId = "kotlin",
+                        version = 38,
+                        text = content,
+                    ),
+                )
+                val snapshot = analyzer.analyze(project, store)
+                val index = indexBuilder.build(snapshot)
+                val line = content.lines().indexOfFirst { it.contains("it.incide") }
+                val column = content.lines()[line].indexOf("incide") + "incide".length
+                val params = CompletionParams(
+                    textDocument = TextDocumentIdentifier(appFile.toUri().toString()),
+                    position = Position(line, column),
+                )
+                val decision = completionService.classifyCompletionRoute(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = params,
+                    bridgeAvailable = true,
+                )
+                assertEquals(CompletionRoute.INDEX, decision.route) {
+                    "Expected implicit it comparator completion to stay on the fast index, got $decision"
+                }
+                val completions = completionService.completeFromIndex(
+                    index = index,
+                    path = appFile,
+                    text = content,
+                    params = params,
+                )
+                val labels = completions.items.take(10).map { it.label }
+                assertTrue("incident" in labels) {
+                    "Expected implicit it member completion for incident, got $labels"
+                }
+            },
             TestCase("routes simple member access to the local index when indexed members exist") {
                 val root = FixtureSupport.fixture("multi-module")
                 val project = importer.importProject(root)

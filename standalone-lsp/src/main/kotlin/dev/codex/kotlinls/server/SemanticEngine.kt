@@ -9,6 +9,7 @@ import dev.codex.kotlinls.protocol.CompletionItem
 import dev.codex.kotlinls.protocol.CompletionItemKind
 import dev.codex.kotlinls.protocol.CompletionList
 import dev.codex.kotlinls.protocol.CompletionParams
+import dev.codex.kotlinls.protocol.Diagnostic
 import dev.codex.kotlinls.protocol.DocumentFormattingParams
 import dev.codex.kotlinls.protocol.DocumentRangeFormattingParams
 import dev.codex.kotlinls.protocol.Hover
@@ -34,6 +35,7 @@ internal data class SemanticEngineCapabilities(
     val formatting: Boolean = false,
     val rangeFormatting: Boolean = false,
     val hover: Boolean = false,
+    val diagnostics: Boolean = false,
     val signatureHelp: Boolean = false,
     val references: Boolean = false,
     val implementations: Boolean = false,
@@ -53,6 +55,8 @@ internal interface SemanticEngine : AutoCloseable {
     val capabilities: SemanticEngineCapabilities
 
     fun onProjectChanged(project: ImportedProject?)
+
+    fun bridgeStatus(): List<Map<String, Any?>> = emptyList()
 
     fun invalidate(uri: String, version: Int? = null)
 
@@ -91,6 +95,16 @@ internal interface SemanticEngine : AutoCloseable {
         params: TextDocumentPositionParams,
         projectGeneration: Int,
     ): List<Location>?
+
+    fun diagnostics(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        uri: String,
+        projectGeneration: Int,
+        timeoutMillis: Long,
+    ): List<Diagnostic>?
 
     fun formatDocument(
         projectRoot: Path?,
@@ -157,6 +171,16 @@ internal class DisabledSemanticEngine(
         projectGeneration: Int,
     ): List<Location>? = null
 
+    override fun diagnostics(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        uri: String,
+        projectGeneration: Int,
+        timeoutMillis: Long,
+    ): List<Diagnostic>? = null
+
     override fun formatDocument(
         projectRoot: Path?,
         path: Path,
@@ -213,6 +237,7 @@ internal class BridgeK2SemanticEngine private constructor(
         formatting = true,
         rangeFormatting = true,
         hover = true,
+        diagnostics = true,
     )
 
     override fun onProjectChanged(project: ImportedProject?) {
@@ -237,6 +262,49 @@ internal class BridgeK2SemanticEngine private constructor(
         synchronized(pendingSyncLock) {
             pendingDocumentSyncs.remove(uri)
         }
+    }
+
+    override fun bridgeStatus(): List<Map<String, Any?>> {
+        val activeBridge = synchronized(this) { bridge }
+        val syncState = synchronized(pendingSyncLock) {
+            mapOf(
+                "startupScheduled" to bridgeStartupScheduled,
+                "pendingProjectWarmups" to pendingProjectWarmups.map(Path::toString),
+                "pendingDocumentSyncs" to pendingDocumentSyncs.values.map { sync ->
+                    mapOf(
+                        "uri" to sync.uri,
+                        "path" to sync.path.toString(),
+                        "version" to sync.version,
+                        "priority" to sync.priority,
+                    )
+                },
+                "syncDrainScheduled" to (pendingSyncDrain != null),
+                "syncDrainGeneration" to syncDrainGeneration,
+            )
+        }
+        val runtimeStatus = activeBridge?.statusSnapshot().orEmpty()
+        return listOf(
+            mapOf(
+                "name" to "JetBrains process bridge",
+                "type" to "jetbrains-process",
+                "backend" to requestedBackend.name.lowercase(),
+                "features" to listOf("completion", "hover", "definition", "diagnostics", "formatting", "range-formatting", "document-sync"),
+                "state" to (runtimeStatus["state"] ?: if (syncState["startupScheduled"] == true) "starting" else "not-started"),
+                "runtime" to runtimeStatus,
+                "startupError" to JetBrainsCompletionBridge.lastStartupFailure(),
+                "sync" to syncState,
+                "foregroundRequests" to foregroundRequests.get(),
+                "inFlightRequests" to inFlight.keys.map { key ->
+                    mapOf(
+                        "feature" to key.feature,
+                        "uri" to key.uri,
+                        "version" to key.version,
+                        "projectGeneration" to key.projectGeneration,
+                        "detail" to key.detail,
+                    )
+                },
+            ),
+        )
     }
 
     override fun prefetch(
@@ -339,6 +407,30 @@ internal class BridgeK2SemanticEngine private constructor(
         } ?: return null
         if (!isCurrentVersion(params.textDocument.uri, version)) return null
         return locations
+    }
+
+    override fun diagnostics(
+        project: ImportedProject,
+        path: Path,
+        text: String,
+        version: Int?,
+        uri: String,
+        projectGeneration: Int,
+        timeoutMillis: Long,
+    ): List<Diagnostic>? {
+        val key = SemanticRequestKey("diagnostics", uri, version, projectGeneration, "file")
+        cancelStaleDiagnosticsRequests(uri, key)
+        synchronized(pendingSyncLock) {
+            pendingDocumentSyncs.remove(uri)
+        }
+        val diagnostics = awaitMemoized(key, timeoutMillis = timeoutMillis) {
+            withForegroundRequest {
+                val activeBridge = acquireBridge(project.root) ?: return@withForegroundRequest null
+                activeBridge.diagnostics(project.root, path, text)
+            }
+        } ?: return null
+        if (!isCurrentVersion(uri, version)) return null
+        return diagnostics
     }
 
     override fun formatDocument(
@@ -569,8 +661,8 @@ internal class BridgeK2SemanticEngine private constructor(
             }
         } catch (_: java.util.concurrent.TimeoutException) {
             future.cancel(true)
-            if (key.feature.startsWith("format-")) {
-                resetBridgeAfterFormattingTimeout(key, timeoutMillis)
+            if (key.feature.startsWith("format-") || key.feature == "diagnostics") {
+                resetBridgeAfterRequestTimeout(key, timeoutMillis)
             }
             null
         } catch (_: java.util.concurrent.CancellationException) {
@@ -582,7 +674,16 @@ internal class BridgeK2SemanticEngine private constructor(
         }
     }
 
-    private fun resetBridgeAfterFormattingTimeout(key: SemanticRequestKey, timeoutMillis: Long?) {
+    private fun cancelStaleDiagnosticsRequests(uri: String, keep: SemanticRequestKey) {
+        inFlight.forEach { (key, future) ->
+            if (key.feature == "diagnostics" && key.uri == uri && key != keep) {
+                future.cancel(true)
+                inFlight.remove(key, future)
+            }
+        }
+    }
+
+    private fun resetBridgeAfterRequestTimeout(key: SemanticRequestKey, timeoutMillis: Long?) {
         val currentBridge = synchronized(this) {
             bridge.also {
                 bridge = null

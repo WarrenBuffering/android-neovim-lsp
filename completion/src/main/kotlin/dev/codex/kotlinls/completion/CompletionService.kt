@@ -880,18 +880,25 @@ class CompletionService {
         prefix: String,
     ): List<IndexedSymbol> {
         val chain = receiverAccessChain(text, offset) ?: return emptyList()
-        val receiverType = inferReceiverChainType(index, path, text, chain)
+        val receiverType = inferReceiverChainType(index, path, text, chain, offset)
             ?: fallbackNumericReceiverType(chain)
             ?: return emptyList()
         val receiverShortName = normalizeTypeShortName(receiverType) ?: return emptyList()
         val receiverFqName = normalizeTypeFqName(receiverType)
         val indexed = receiverCandidates(index, prefix, receiverShortName, receiverFqName)
+        val localConstructorProperties = sourceConstructorParameterReceiverCandidates(
+            path = path,
+            text = text,
+            prefix = prefix,
+            receiverShortName = receiverShortName,
+            receiverFqName = receiverFqName,
+        )
         val reflected = reflectiveReceiverCandidates(
             prefix = prefix,
             receiverType = receiverShortName,
             receiverTypeFqName = receiverFqName,
         )
-        return (indexed + reflected).distinctBy { it.id }
+        return (indexed + localConstructorProperties + reflected).distinctBy { it.id }
     }
 
     private fun receiverCandidates(
@@ -901,7 +908,7 @@ class CompletionService {
         receiverFqName: String?,
     ): List<IndexedSymbol> {
         val hierarchy = receiverTypeHierarchy(index, receiverShortName, receiverFqName)
-        return index.completionCandidates(prefix)
+        val indexedMembers = index.completionCandidates(prefix)
             .filter { symbol ->
                 symbol.kind != SymbolKind.CLASS &&
                     symbol.kind != SymbolKind.INTERFACE &&
@@ -911,6 +918,162 @@ class CompletionService {
             }
             .take(200)
             .toList()
+        val constructorProperties = constructorParameterReceiverCandidates(
+            index = index,
+            prefix = prefix,
+            receiverShortName = receiverShortName,
+            receiverFqName = receiverFqName,
+            hierarchy = hierarchy,
+        )
+        return (indexedMembers + constructorProperties).distinctBy { it.id }
+    }
+
+    private fun constructorParameterReceiverCandidates(
+        index: WorkspaceIndex,
+        prefix: String,
+        receiverShortName: String,
+        receiverFqName: String?,
+        hierarchy: ReceiverTypeHierarchy,
+    ): List<IndexedSymbol> {
+        return index.symbols.asSequence()
+            .filter { symbol ->
+                symbol.kind in setOf(SymbolKind.CLASS, SymbolKind.INTERFACE) &&
+                    symbol.parameters.isNotEmpty() &&
+                    typeSymbolMatches(symbol, receiverShortName, receiverFqName, hierarchy)
+            }
+            .flatMap { owner ->
+                owner.parameters.asSequence()
+                    .filter { parameter -> parameter.name.startsWith(prefix, ignoreCase = true) }
+                    .map { parameter ->
+                        IndexedSymbol(
+                            id = "${owner.id}#constructor-property:${parameter.name}",
+                            name = parameter.name,
+                            fqName = owner.fqName?.let { "${it}.${parameter.name}" },
+                            kind = SymbolKind.PROPERTY,
+                            path = owner.path,
+                            uri = owner.uri,
+                            range = owner.range,
+                            selectionRange = owner.selectionRange,
+                            containerName = owner.name,
+                            containerFqName = owner.fqName,
+                            signature = buildString {
+                                append("val ")
+                                append(parameter.name)
+                                parameter.type?.let { type ->
+                                    append(": ")
+                                    append(type)
+                                }
+                            },
+                            documentation = null,
+                            packageName = owner.packageName,
+                            moduleName = owner.moduleName,
+                            importable = false,
+                            resultType = parameter.type,
+                        )
+                    }
+            }
+            .take(100)
+            .toList()
+    }
+
+    private fun sourceConstructorParameterReceiverCandidates(
+        path: Path,
+        text: String,
+        prefix: String,
+        receiverShortName: String,
+        receiverFqName: String?,
+    ): List<IndexedSymbol> {
+        val className = normalizeTypeShortName(receiverFqName ?: receiverShortName) ?: return emptyList()
+        val classPattern = Regex("""\bclass\s+${Regex.escape(className)}\b""")
+        val packageName = SourceIndexLookup.packageName(text)
+        val lineIndex = LineIndex.build(text)
+        return classPattern.findAll(text).flatMap { match ->
+            val openParenthesis = text.indexOf('(', startIndex = match.range.last + 1)
+                .takeIf { it >= 0 }
+                ?: return@flatMap emptySequence()
+            val closeParenthesis = matchingCloseParenthesis(text, openParenthesis) ?: return@flatMap emptySequence()
+            splitTopLevelParameters(text.substring(openParenthesis + 1, closeParenthesis)).asSequence()
+                .mapNotNull { segment ->
+                    val propertyMatch = Regex("""\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.+)$""")
+                        .find(segment.trim())
+                        ?: return@mapNotNull null
+                    val name = propertyMatch.groupValues[1]
+                    if (!name.startsWith(prefix, ignoreCase = true)) return@mapNotNull null
+                    val type = propertyMatch.groupValues[2]
+                        .substringBefore('=')
+                        .trim()
+                        .takeIf { it.isNotBlank() }
+                    val nameOffset = text.indexOf(name, startIndex = openParenthesis).coerceAtLeast(match.range.first)
+                    IndexedSymbol(
+                        id = "${path.toUri()}#$className.$name@primary-constructor",
+                        name = name,
+                        fqName = listOfNotNull(
+                            receiverFqName ?: packageName.takeIf { it.isNotBlank() }?.let { "$it.$className" },
+                            name,
+                        ).joinToString(".").takeIf { it.isNotBlank() },
+                        kind = SymbolKind.PROPERTY,
+                        path = path,
+                        uri = path.toUri().toString(),
+                        range = lineIndex.range(nameOffset, nameOffset + name.length),
+                        selectionRange = lineIndex.range(nameOffset, nameOffset + name.length),
+                        containerName = className,
+                        containerFqName = receiverFqName ?: packageName.takeIf { it.isNotBlank() }?.let { "$it.$className" },
+                        signature = buildString {
+                            append("val ")
+                            append(name)
+                            type?.let {
+                                append(": ")
+                                append(it)
+                            }
+                        },
+                        documentation = null,
+                        packageName = packageName,
+                        moduleName = "source",
+                        importable = false,
+                        resultType = type,
+                    )
+                }
+        }.toList()
+    }
+
+    private fun matchingCloseParenthesis(text: String, openOffset: Int): Int? {
+        var depth = 1
+        var cursor = openOffset + 1
+        while (cursor < text.length) {
+            when (text[cursor]) {
+                '(' -> depth++
+                ')' -> {
+                    depth--
+                    if (depth == 0) return cursor
+                }
+            }
+            cursor++
+        }
+        return null
+    }
+
+    private fun splitTopLevelParameters(text: String): List<String> {
+        val result = mutableListOf<String>()
+        var angleDepth = 0
+        var parenthesisDepth = 0
+        var bracketDepth = 0
+        var start = 0
+        text.forEachIndexed { index, ch ->
+            when (ch) {
+                '<' -> angleDepth++
+                '>' -> angleDepth = (angleDepth - 1).coerceAtLeast(0)
+                '(' -> parenthesisDepth++
+                ')' -> parenthesisDepth = (parenthesisDepth - 1).coerceAtLeast(0)
+                '[' -> bracketDepth++
+                ']' -> bracketDepth = (bracketDepth - 1).coerceAtLeast(0)
+                ',' -> if (angleDepth == 0 && parenthesisDepth == 0 && bracketDepth == 0) {
+                    text.substring(start, index).trim().takeIf { it.isNotBlank() }?.let(result::add)
+                    start = index + 1
+                }
+            }
+        }
+        text.substring(start).trim().takeIf { it.isNotBlank() }?.let(result::add)
+        return result
     }
 
     private fun receiverMatches(
@@ -935,6 +1098,22 @@ class CompletionService {
             normalizedReceiverShort == normalizedShort ||
             (normalizedReceiverFqName != null && normalizedReceiverFqName in hierarchy.fqNames) ||
             (normalizedReceiverShort != null && normalizedReceiverShort in hierarchy.shortNames)
+    }
+
+    private fun typeSymbolMatches(
+        symbol: IndexedSymbol,
+        receiverShortName: String,
+        receiverFqName: String?,
+        hierarchy: ReceiverTypeHierarchy,
+    ): Boolean {
+        val normalizedShort = normalizeTypeShortName(receiverShortName)
+        val normalizedFqName = receiverFqName?.let(::normalizeTypeFqName)
+        val symbolShort = normalizeTypeShortName(symbol.fqName ?: symbol.name)
+        val symbolFqName = normalizeTypeFqName(symbol.fqName)
+        return symbolShort == normalizedShort ||
+            symbolShort in hierarchy.shortNames ||
+            (normalizedFqName != null && symbolFqName == normalizedFqName) ||
+            (symbolFqName != null && symbolFqName in hierarchy.fqNames)
     }
 
     private fun receiverTypeHierarchy(
@@ -1390,6 +1569,7 @@ class CompletionService {
 
         inferDeclaredLocalType(text, symbolName, searchOffset)?.let { return it }
         inferLocalDeclarationType(index, path, text, symbolName, searchOffset, visitedSymbols + symbolName)?.let { return it }
+        inferImplicitLambdaItType(index, path, text, symbolName, searchOffset, visitedSymbols + symbolName)?.let { return it }
 
         SourceIndexLookup.imports(text)
             .firstOrNull { it.visibleName == symbolName }
@@ -1406,6 +1586,63 @@ class CompletionService {
             .filter { it.importable }
             .mapNotNull { symbol -> symbol.resultType ?: symbol.fqName }
             .firstOrNull()
+    }
+
+    private fun inferImplicitLambdaItType(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        symbolName: String,
+        searchOffset: Int,
+        visitedSymbols: Set<String>,
+    ): String? {
+        if (symbolName != "it") return null
+        val lambdaStart = nearestOpenBraceBefore(text, searchOffset) ?: return null
+        val lambdaPrefix = text.substring((lambdaStart + 1).coerceAtMost(text.length), searchOffset.coerceIn(0, text.length))
+        if ("->" in lambdaPrefix) return null
+        val callOpen = enclosingCallParenthesis(text, lambdaStart)
+        val call = callOpen?.let { callExpressionBeforeParenthesis(text, it) }
+            ?: callExpressionBeforeTrailingLambda(text, lambdaStart)
+            ?: return null
+        if (call.name in DIRECT_IMPLICIT_IT_ELEMENT_CALLS) {
+            receiverElementType(index, path, text, call, searchOffset, visitedSymbols)?.let { return it }
+        }
+        if (call.name in COMPARATOR_IMPLICIT_IT_CALLS) {
+            comparatorContextElementType(index, path, text, call, searchOffset, visitedSymbols)?.let { return it }
+        }
+        return null
+    }
+
+    private fun comparatorContextElementType(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        comparatorCall: CallExpressionContext,
+        searchOffset: Int,
+        visitedSymbols: Set<String>,
+    ): String? {
+        comparatorCall.receiverChain
+            ?.let { chain -> inferExpressionChainType(index, path, text, chain, searchOffset, visitedSymbols) }
+            ?.let(::comparatorElementType)
+            ?.let { return it }
+        val outerCallOpen = enclosingCallParenthesis(text, comparatorCall.openParenthesis) ?: return null
+        val outerCall = callExpressionBeforeParenthesis(text, outerCallOpen) ?: return null
+        if (outerCall.name !in COMPARATOR_CONTEXT_CALLS) return null
+        return receiverElementType(index, path, text, outerCall, searchOffset, visitedSymbols)
+    }
+
+    private fun receiverElementType(
+        index: WorkspaceIndex,
+        path: Path,
+        text: String,
+        call: CallExpressionContext,
+        searchOffset: Int,
+        visitedSymbols: Set<String>,
+    ): String? {
+        val receiverChain = call.receiverChain ?: return null
+        val receiverType = inferExpressionChainType(index, path, text, receiverChain, searchOffset, visitedSymbols)
+            ?: return null
+        return collectionElementType(receiverType)
     }
 
     private fun inferDeclaredLocalType(
@@ -1489,6 +1726,108 @@ class CompletionService {
         return segments.takeIf { it.isNotEmpty() }
     }
 
+    private fun callExpressionBeforeParenthesis(
+        text: String,
+        parenthesisOffset: Int,
+    ): CallExpressionContext? {
+        var cursor = parenthesisOffset - 1
+        while (cursor >= 0 && text[cursor].isWhitespace()) {
+            cursor--
+        }
+        while (cursor >= 0 && text[cursor] == '>') {
+            cursor = skipTypeArgumentsBackward(text, cursor)
+            while (cursor >= 0 && text[cursor].isWhitespace()) {
+                cursor--
+            }
+        }
+        if (cursor < 0 || !text[cursor].isJavaIdentifierPart()) return null
+        val nameEnd = cursor + 1
+        var nameStart = cursor
+        while (nameStart > 0 && text[nameStart - 1].isJavaIdentifierPart()) {
+            nameStart--
+        }
+        val receiverChain = receiverChainBeforeName(text, nameStart)
+        return CallExpressionContext(
+            name = text.substring(nameStart, nameEnd),
+            nameStart = nameStart,
+            openParenthesis = parenthesisOffset,
+            receiverChain = receiverChain,
+        )
+    }
+
+    private fun callExpressionBeforeTrailingLambda(
+        text: String,
+        lambdaStart: Int,
+    ): CallExpressionContext? {
+        var cursor = lambdaStart - 1
+        while (cursor >= 0 && text[cursor].isWhitespace()) {
+            cursor--
+        }
+        if (cursor >= 0 && text[cursor] == ')') {
+            return matchingOpenParenthesis(text, cursor)?.let { callExpressionBeforeParenthesis(text, it) }
+        }
+        if (cursor < 0 || !text[cursor].isJavaIdentifierPart()) return null
+        val nameEnd = cursor + 1
+        var nameStart = cursor
+        while (nameStart > 0 && text[nameStart - 1].isJavaIdentifierPart()) {
+            nameStart--
+        }
+        return CallExpressionContext(
+            name = text.substring(nameStart, nameEnd),
+            nameStart = nameStart,
+            openParenthesis = -1,
+            receiverChain = receiverChainBeforeName(text, nameStart),
+        )
+    }
+
+    private fun receiverChainBeforeName(text: String, nameStart: Int): List<String>? {
+        var cursor = nameStart - 1
+        while (cursor >= 0 && text[cursor].isWhitespace()) {
+            cursor--
+        }
+        if (cursor < 0 || text[cursor] != '.') return null
+        val receiverExpression = text.substring(0, cursor)
+            .takeLastWhile { candidate ->
+                candidate != '\n' &&
+                    candidate != '\r' &&
+                    candidate != ';' &&
+                    candidate != '{' &&
+                    candidate != '}' &&
+                    candidate != '='
+            }
+            .trim()
+        return expressionAccessChain(receiverExpression)
+    }
+
+    private fun skipTypeArgumentsBackward(text: String, closingOffset: Int): Int {
+        var depth = 1
+        var cursor = closingOffset - 1
+        while (cursor >= 0 && depth > 0) {
+            when (text[cursor]) {
+                '>' -> depth++
+                '<' -> depth--
+            }
+            cursor--
+        }
+        return cursor
+    }
+
+    private fun matchingOpenParenthesis(text: String, closingOffset: Int): Int? {
+        var depth = 1
+        var cursor = closingOffset - 1
+        while (cursor >= 0) {
+            when (text[cursor]) {
+                ')' -> depth++
+                '(' -> {
+                    depth--
+                    if (depth == 0) return cursor
+                }
+            }
+            cursor--
+        }
+        return null
+    }
+
     private fun inferExpressionChainType(
         index: WorkspaceIndex,
         path: Path,
@@ -1530,6 +1869,20 @@ class CompletionService {
         memberName: String,
     ): String? {
         val normalized = normalizeTypeShortName(receiverType) ?: return null
+        val typeArguments = typeArguments(receiverType)
+        if (normalized in setOf("Map", "MutableMap")) {
+            return when (memberName) {
+                "keys" -> typeArguments.getOrNull(0)?.let { "kotlin.collections.Set<$it>" }
+                "values" -> typeArguments.getOrNull(1)?.let { "kotlin.collections.Collection<$it>" }
+                "entries" -> if (typeArguments.size >= 2) {
+                    "kotlin.collections.Set<kotlin.collections.Map.Entry<${typeArguments[0]}, ${typeArguments[1]}>>"
+                } else {
+                    null
+                }
+
+                else -> null
+            }
+        }
         return when (normalized) {
             "IntSize", "IntOffset", "IntRect" -> when (memberName) {
                 "width", "height", "x", "y", "left", "right", "top", "bottom" -> "kotlin.Int"
@@ -1548,6 +1901,62 @@ class CompletionService {
 
             else -> null
         }
+    }
+
+    private fun collectionElementType(typeText: String): String? {
+        val normalized = normalizeTypeShortName(typeText) ?: return null
+        val typeArguments = typeArguments(typeText)
+        return when (normalized) {
+            "Array",
+            "Collection",
+            "Iterable",
+            "List",
+            "MutableCollection",
+            "MutableIterable",
+            "MutableList",
+            "MutableSet",
+            "Sequence",
+            "Set",
+            -> typeArguments.firstOrNull()
+
+            else -> null
+        }
+    }
+
+    private fun comparatorElementType(typeText: String): String? {
+        val normalized = normalizeTypeShortName(typeText) ?: return null
+        return when (normalized) {
+            "Comparator" -> typeArguments(typeText).firstOrNull()
+            else -> null
+        }
+    }
+
+    private fun typeArguments(typeText: String): List<String> {
+        val start = typeText.indexOf('<')
+        if (start == -1) return emptyList()
+        var depth = 0
+        var argumentStart = start + 1
+        val arguments = mutableListOf<String>()
+        var cursor = start + 1
+        while (cursor < typeText.length) {
+            when (typeText[cursor]) {
+                '<' -> depth++
+                '>' -> {
+                    if (depth == 0) {
+                        typeText.substring(argumentStart, cursor).trim().takeIf { it.isNotBlank() }?.let(arguments::add)
+                        return arguments
+                    }
+                    depth--
+                }
+
+                ',' -> if (depth == 0) {
+                    typeText.substring(argumentStart, cursor).trim().takeIf { it.isNotBlank() }?.let(arguments::add)
+                    argumentStart = cursor + 1
+                }
+            }
+            cursor++
+        }
+        return emptyList()
     }
 
     private fun primitiveConversionCandidates(receiverType: String): List<String> =
@@ -1848,7 +2257,7 @@ class CompletionService {
         val callInfo = callee?.let { snapshot.bindingContext[BindingContext.CALL, it] }
             ?: snapshot.bindingContext[BindingContext.CALL, call]
             ?: return null
-        return snapshot.bindingContext[BindingContext.RESOLVED_CALL, callInfo]?.resultingDescriptor as? CallableDescriptor
+        return snapshot.bindingContext[BindingContext.RESOLVED_CALL, callInfo]?.resultingDescriptor
     }
 
     private fun enclosingCallParenthesis(
@@ -2058,6 +2467,85 @@ class CompletionService {
         return segments
     }
 
+    private fun nearestOpenBraceBefore(text: String, offset: Int): Int? {
+        val openBraces = ArrayDeque<Int>()
+        var cursor = 0
+        val limit = offset.coerceIn(0, text.length)
+        while (cursor < limit) {
+            val current = text[cursor]
+            val next = text.getOrNull(cursor + 1)
+            when {
+                current == '/' && next == '/' -> {
+                    cursor += 2
+                    while (cursor < limit && text[cursor] != '\n') {
+                        cursor++
+                    }
+                }
+
+                current == '/' && next == '*' -> {
+                    cursor += 2
+                    while (cursor + 1 < limit && !(text[cursor] == '*' && text[cursor + 1] == '/')) {
+                        cursor++
+                    }
+                    if (cursor + 1 < limit) {
+                        cursor += 2
+                    }
+                }
+
+                current == '"' && text.startsWith("\"\"\"", cursor) -> {
+                    cursor += 3
+                    while (cursor + 2 < limit && !text.startsWith("\"\"\"", cursor)) {
+                        cursor++
+                    }
+                    if (cursor + 2 < limit) {
+                        cursor += 3
+                    }
+                }
+
+                current == '"' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < limit) {
+                        val ch = text[cursor]
+                        if (ch == '"' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                current == '\'' -> {
+                    cursor++
+                    var escaped = false
+                    while (cursor < limit) {
+                        val ch = text[cursor]
+                        if (ch == '\'' && !escaped) {
+                            cursor++
+                            break
+                        }
+                        escaped = ch == '\\' && !escaped
+                        if (ch != '\\') escaped = false
+                        cursor++
+                    }
+                }
+
+                else -> {
+                    when (current) {
+                        '{' -> openBraces.addLast(cursor)
+                        '}' -> if (openBraces.isNotEmpty()) {
+                            openBraces.removeLast()
+                        }
+                    }
+                    cursor++
+                }
+            }
+        }
+        return openBraces.lastOrNull()
+    }
+
     private fun structuralContext(text: String, limit: Int): StructuralContext {
         var parenthesisDepth = 0
         var braceDepth = 0
@@ -2194,6 +2682,13 @@ class CompletionService {
         val usedParameterNames: Set<String>,
     )
 
+    private data class CallExpressionContext(
+        val name: String,
+        val nameStart: Int,
+        val openParenthesis: Int,
+        val receiverChain: List<String>?,
+    )
+
     private fun acquireJetBrainsBridge(projectRoot: Path): JetBrainsCompletionBridge? {
         jetBrainsBridge?.let { return it }
         return synchronized(this) {
@@ -2212,6 +2707,39 @@ class CompletionService {
             """\bwhen\s*\([^)]*\)\s*\{[\s\S]*\bis\s+[A-Za-z_][A-Za-z0-9_.<>?]*\s*->[\s\S]*$""",
             setOf(RegexOption.DOT_MATCHES_ALL),
         )
+        val DIRECT_IMPLICIT_IT_ELEMENT_CALLS = setOf(
+            "all",
+            "any",
+            "associateBy",
+            "count",
+            "filter",
+            "find",
+            "first",
+            "firstOrNull",
+            "flatMap",
+            "forEach",
+            "groupBy",
+            "last",
+            "lastOrNull",
+            "map",
+            "mapNotNull",
+            "maxBy",
+            "maxByOrNull",
+            "minBy",
+            "minByOrNull",
+            "none",
+            "onEach",
+            "partition",
+            "sortedBy",
+            "sortedByDescending",
+        )
+        val COMPARATOR_IMPLICIT_IT_CALLS = setOf(
+            "compareBy",
+            "compareByDescending",
+            "thenBy",
+            "thenByDescending",
+        )
+        val COMPARATOR_CONTEXT_CALLS = setOf("sortedWith", "sortWith")
     }
 }
 
